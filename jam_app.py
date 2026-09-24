@@ -2850,6 +2850,33 @@ def api_analyze_mix(segment_id: int) -> Response:
     })
 
 
+@app.get("/api/mix-plan-status/<int:segment_id>")
+def api_mix_plan_status(segment_id: int) -> Response:
+    """Report whether the frozen per-song DSP plan is usable for Render.
+
+    This is deliberately read-only: Render may ask whether preparation is
+    required, but it must never start Analyze implicitly in the worker.
+    """
+    try:
+        state = load_render_state()
+    except RuntimeError as exc:
+        return jsonify({"valid": False, "song_id": segment_id, "reason": str(exc)}), 200
+    if not 1 <= int(segment_id) <= len(state.get("segments", [])):
+        return jsonify({"valid": False, "song_id": segment_id, "reason": "song not found"}), 200
+    plan = load_mix_plan(segment_id, state_snapshot=state)
+    if not isinstance(plan, dict):
+        return jsonify({
+            "valid": False,
+            "song_id": segment_id,
+            "reason": "Analyze required: the Auto-Mix plan is missing or stale.",
+        }), 200
+    return jsonify({
+        "valid": True,
+        "song_id": segment_id,
+        "effective_dsp_plan_hash": plan.get("effective_dsp_plan_hash"),
+    })
+
+
 @app.post("/api/settings")
 def api_settings() -> Response:
     global pipeline_state, pipeline_state_signature

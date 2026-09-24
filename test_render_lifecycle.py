@@ -84,6 +84,21 @@ class RenderLifecycleTest(unittest.TestCase):
         self.assertIn("stderr_tail = tail_text(stderr_path)", source)
         self.assertIn('stage_detail="see details"', source)
 
+    def test_missing_mix_plan_has_explicit_read_only_preflight(self):
+        backend = (ROOT / "jam_app.py").read_text(encoding="utf-8")
+        frontend = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('@app.get("/api/mix-plan-status/<int:segment_id>")', backend)
+        self.assertIn("async function ensureRenderPlans(songIds)", frontend)
+        self.assertIn("await ensureRenderPlans(requestedSongs)", frontend)
+        self.assertIn("Analyze required", frontend)
+
+    def test_partial_failure_exposes_batch_error_and_worker_identity(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("function jobErrorText(job)", source)
+        self.assertIn("job.batch_errors", source)
+        self.assertIn("PID ${workerPid}", source)
+        self.assertIn('job.status === "partial_failed"', source)
+
     def test_terminal_job_releases_render_controls_in_frontend(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn('if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status))', source)

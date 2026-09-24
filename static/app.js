@@ -2554,12 +2554,48 @@ async function waitForRenderJob(jobId) {
     const jobs = await pollJobs();
     const job = jobs.find((item) => String(item.id) === String(jobId));
     if (job && ["done", "partial_failed", "error", "cancelled"].includes(job.status)) {
-      if (job.status !== "done") throw new Error(job.error || `Render ${job.status}`);
+      if (job.status !== "done") throw new Error(jobErrorText(job) || `Render ${job.status}`);
       return job;
     }
     await new Promise((resolve) => setTimeout(resolve, 800));
   }
   throw new Error(`Render job ${jobId} timed out after 2 hours.`);
+}
+
+function jobErrorText(job) {
+  if (!job) return "";
+  const parts = [];
+  if (job.error) parts.push(String(job.error));
+  if (Array.isArray(job.batch_errors)) {
+    job.batch_errors.forEach((item) => {
+      const detail = item && (item.error || item.message);
+      if (detail && !parts.some((part) => part.includes(String(detail)))) {
+        parts.push(`song ${item.segment_id ?? item.song ?? "?"}: ${detail}`);
+      }
+    });
+  }
+  if (job.stderr_tail) parts.push(String(job.stderr_tail));
+  return parts.join("\n\n");
+}
+
+async function ensureRenderPlans(songIds) {
+  const missing = [];
+  for (const songId of songIds) {
+    const response = await fetch(`/api/mix-plan-status/${songId}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Could not inspect DSP plan for song ${songId}.`);
+    if (!data.valid) missing.push({ songId, reason: data.reason || "Analyze required." });
+  }
+  if (!missing.length) return;
+  for (let index = 0; index < missing.length; index += 1) {
+    const { songId } = missing[index];
+    setRenderControlsBusy(true, `Preparing DSP plan ${index + 1}/${missing.length}…`);
+    const response = await fetch(`/api/analyze-mix/${songId}`, { method: "POST" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || `Analyze required for song ${songId}.`);
+    }
+  }
 }
 
 async function ensureMixParamsForSong(songId) {
@@ -2618,6 +2654,9 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     if (renderTargetDir === false) return;
     console.info("RENDER DESTINATION request_target", renderTargetDir);
     await prepareOverridesForRender();
+    // A Render click may prepare a missing/stale frozen plan, but this is an
+    // explicit, visible preflight. The worker itself never runs Analyze.
+    await ensureRenderPlans(requestedSongs);
     const overridesSnapshot = cloneOverridesPayload();
     const url = singleSong != null ? `/api/render/${singleSong}` : "/api/render";
     const body = singleSong != null
@@ -2643,7 +2682,12 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     await waitForRenderJob(jobId);
   } catch (error) {
     console.error("[render] failed", error);
-    showToast(`Render failed: ${error.message || error}`);
+    const message = error.message || error;
+    showToast(`Render failed: ${message}`);
+    const status = document.querySelector("#currentWork");
+    if (status) status.textContent = `Render failed: ${message}`;
+    const detail = document.querySelector("#queuePosition");
+    if (detail) detail.textContent = message;
   } finally {
     activeRenderJobId = null;
     setRenderControlsBusy(false);
@@ -2732,7 +2776,8 @@ function renderJobs(items) {
     const position = active.current ? (active.done_count || 0) + 1 : (active.done_count || 0);
     const elapsed = shortElapsed(active.started);
     const detail = active.stage_detail || "working";
-    $("#queuePosition").textContent = `${detail} · ${position} of ${total} · ${active.song_progress || 0}% · ${elapsed || "0:00"} elapsed · ${formatRemaining(active.eta_seconds)}`;
+    const workerPid = active.child_pid || active.pid || active.launch_pid || "pending";
+    $("#queuePosition").textContent = `${detail} · PID ${workerPid} · ${position} of ${total} · ${active.song_progress || 0}% · ${elapsed || "0:00"} elapsed · ${formatRemaining(active.eta_seconds)}`;
     $("#progressFill").style.width = `${active.song_progress || 0}%`;
     const messages = {
       scanning: ["Checking the room mics...", "Reading the session clock..."],
@@ -2753,21 +2798,31 @@ function renderJobs(items) {
       stall.textContent = stale ? "This phase is still active — reading or processing a large file can keep the percentage steady for a while." : "";
     }
   } else {
-    $("#currentWork").textContent = "Nothing mixing right now";
-    $("#queuePosition").textContent = "Ready";
+    const terminal = [...items].reverse().find((job) => ["partial_failed", "error", "cancelled"].includes(job.status));
+    const terminalError = terminal ? jobErrorText(terminal) : "";
+    if (terminal) {
+      const label = terminal.status === "partial_failed" ? "Render partially failed" : terminal.status === "cancelled" ? "Render cancelled" : "Render failed";
+      $("#currentWork").textContent = `${label} · ${terminal.id}`;
+      $("#queuePosition").textContent = `${terminalError || terminal.stage_detail || "see job details"} · PID ${terminal.child_pid || terminal.pid || terminal.launch_pid || "unknown"}`;
+    } else {
+      $("#currentWork").textContent = "Nothing mixing right now";
+      $("#queuePosition").textContent = "Ready";
+    }
     $("#progressFill").style.width = "0%";
     $("#progressFun").textContent = "";
     $("#progressStall").hidden = true;
   }
   items.slice(-5).reverse().forEach((job) => {
     const el = document.createElement("div");
-    el.className = `job ${job.status === "error" ? "error" : ""}`;
-    const errorText = job.error ? `<pre class="copyable-error">${esc(job.error)}</pre><button class="copy-error" data-copy-error="${esc(job.id)}">Copy error</button>` : "";
+    el.className = `job ${["error", "partial_failed"].includes(job.status) ? "error" : ""}`;
+    const fullError = jobErrorText(job);
+    const errorText = fullError ? `<pre class="copyable-error">${esc(fullError)}</pre><button class="copy-error" data-copy-error="${esc(job.id)}">Copy error</button>` : "";
     el.innerHTML = `
       <div>
         <strong>${friendlyStatus(job)}</strong>
         <p>${job.current ? `Song ${String(job.current).padStart(2, "0")}` : `${job.songs.length} songs`}${job.current_stage ? ` · ${job.current_stage}` : ""}</p>
         ${errorText}
+        <small>PID ${job.child_pid || job.pid || job.launch_pid || "—"}${job.exit_code != null ? ` · exit ${job.exit_code}` : ""}${job.termination ? ` · ${esc(job.termination)}` : ""}</small>
       </div>
       <span>${job.progress || 0}%</span>
     `;
@@ -2775,13 +2830,13 @@ function renderJobs(items) {
     const copyButton = el.querySelector("[data-copy-error]");
     if (copyButton) copyButton.addEventListener("click", async () => {
       try {
-        await navigator.clipboard.writeText(String(job.error || ""));
+        await navigator.clipboard.writeText(fullError);
         copyButton.textContent = "Copied";
       } catch (_err) {
         showToast("Could not copy the error text.");
       }
     });
-    if (job.status === "error") showToast(`Song ${String(job.current || "").padStart(2, "0")} failed — see details`);
+    if (["error", "partial_failed"].includes(job.status)) showToast(`${friendlyStatus(job)} — see details`);
   });
 }
 
@@ -2791,6 +2846,7 @@ function friendlyStatus(job) {
   if (job.status === "stopping") return "Stopping";
   if (job.status === "cancelled") return "Cancelled";
   if (job.status === "error") return "Needs attention";
+  if (job.status === "partial_failed") return "Partial failure";
   return "Finished";
 }
 
