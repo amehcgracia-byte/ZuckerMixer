@@ -71,6 +71,19 @@ class RenderLifecycleTest(unittest.TestCase):
             jam_app.jobs = original_jobs
             jam_app.ffmpeg_status = original_ffmpeg
 
+    def test_child_batch_failure_cannot_be_reported_as_success(self):
+        source = (ROOT / "jam_app.py").read_text(encoding="utf-8")
+        failure_block = source.split("if batch_errors:", 1)[1].split("if len(rows) != len(songs):", 1)[0]
+        self.assertIn('lifecycle_log(\n            "render_failed"', failure_block)
+        self.assertIn("return 1", failure_block)
+        self.assertIn('lifecycle_log("render_completed"', source)
+
+    def test_worker_failure_is_visible_to_the_parent(self):
+        source = (ROOT / "jam_app.py").read_text(encoding="utf-8")
+        self.assertIn('error = f"worker exited with code {code}"', source)
+        self.assertIn("stderr_tail = tail_text(stderr_path)", source)
+        self.assertIn('stage_detail="see details"', source)
+
     def test_fader_conversion_is_monotonic_and_single_db_conversion(self):
         source = (ROOT / "jam_mix_pipeline.py").read_text(encoding="utf-8")
         self.assertIn("y *= db_to_amp(level_gain_db)", source)

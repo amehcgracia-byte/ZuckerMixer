@@ -2298,6 +2298,51 @@ def _run_child_job(job_path: Path) -> int:
         )
     if rows:
         pipeline.write_report(out_dir(), rows, state["segments"])
+    # A child render is successful only when every requested song produced a
+    # promoted result.  Previously batch_errors were reported through the
+    # progress file but the child still returned zero, so the parent worker
+    # overwrote the visible error with `done` and the UI appeared idle.
+    if batch_errors:
+        failure_text = "; ".join(
+            f"song {item.get('song')}: {item.get('error')}" for item in batch_errors
+        )
+        lifecycle_log(
+            "render_failed",
+            job_id,
+            batch_errors=batch_errors,
+            stage="render",
+        )
+        app_progress(
+            {
+                "status": "error",
+                "current": None,
+                "progress": 100,
+                "song_progress": 100,
+                "current_stage": "error",
+                "stage_detail": failure_text,
+                "error": failure_text,
+                "batch_errors": batch_errors,
+                "heartbeat": time.time(),
+                "done_count": len(rows),
+                "total_count": len(songs),
+            }
+        )
+        return 1
+    if len(rows) != len(songs):
+        error_text = f"Render completed without all requested outputs ({len(rows)}/{len(songs)})."
+        lifecycle_log("render_failed", job_id, error=error_text, stage="artifact_validation")
+        app_progress({
+            "status": "error",
+            "current": None,
+            "current_stage": "error",
+            "stage_detail": error_text,
+            "error": error_text,
+            "heartbeat": time.time(),
+            "done_count": len(rows),
+            "total_count": len(songs),
+        })
+        return 1
+    lifecycle_log("render_completed", job_id, songs=len(rows), stage="artifact_validation")
     app_progress(
         {
             "status": "error" if batch_errors else "done",
