@@ -293,14 +293,24 @@ def load_build_metadata() -> dict[str, str]:
 BUILD_METADATA = load_build_metadata()
 
 
+def json_default(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def save_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=json_default), encoding="utf-8")
 
 
 def save_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=json_default), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -1679,6 +1689,51 @@ def tail_text(path: Path, lines: int = 50) -> str:
         return f"Could not read stderr log {path}: {exc}"
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_batch_song_ids(requested: Any, visible_ids: set[int]) -> list[int]:
+    """Validate the complete batch without silently dropping or reordering it."""
+    if not isinstance(requested, list) or not requested:
+        raise ValueError("Choose at least one song.")
+    result: list[int] = []
+    invalid: list[Any] = []
+    duplicates: list[int] = []
+    for raw in requested:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            invalid.append(raw)
+            continue
+        if value not in visible_ids:
+            invalid.append(value)
+        elif value in result:
+            duplicates.append(value)
+        else:
+            result.append(value)
+    if invalid:
+        raise ValueError(f"Render batch contains unavailable song IDs: {invalid}")
+    if duplicates:
+        raise ValueError(f"Render batch contains duplicate song IDs: {duplicates}")
+    if not result:
+        raise ValueError("Choose at least one song.")
+    return result
+
+
+def compact_batch_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    keys = (
+        "index", "song_id", "segment_id", "child_job_id", "title", "start", "end",
+        "duration", "lufs", "peak_dbfs", "master_true_peak_dbfs", "mp3_true_peak_dbfs",
+        "file", "artifacts", "manifest_path", "error",
+    )
+    return [{key: row.get(key) for key in keys if key in row} for row in rows]
+
+
 def enqueue(
     kind: str,
     songs: list[int],
@@ -1726,6 +1781,15 @@ def enqueue(
         "heartbeat": None,
         "done_count": 0,
         "total_count": len(songs),
+        "requested_song_ids": list(songs),
+        "validated_song_ids": list(songs),
+        "batch_summary": {
+            "requested": len(songs),
+            "started": 0,
+            "completed": 0,
+            "failed": 0,
+            "songs": [],
+        },
         "lifecycle_log_path": str(LIFECYCLE_LOG_PATH),
     }
     if render_target:
@@ -1765,7 +1829,15 @@ def set_job(job: dict[str, Any], **updates: Any) -> None:
         write_job_status(job)
 
 
-def record_render(song_index: int, row: dict[str, Any], elapsed_seconds: float, render_target_dir: str | None = None) -> dict[str, Any]:
+def record_render(
+    song_index: int,
+    row: dict[str, Any],
+    elapsed_seconds: float,
+    render_target_dir: str | None = None,
+    job_id: str | None = None,
+    child_job_id: str | None = None,
+    segment_id: int | None = None,
+) -> dict[str, Any]:
     source = Path(str(row["file"]))
     expected_duration = float(row.get("duration") or 0.0)
     if expected_duration <= 0:
@@ -1784,6 +1856,16 @@ def record_render(song_index: int, row: dict[str, Any], elapsed_seconds: float, 
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"RENDER DESTINATION final_atomic_promotion_target={dest}", flush=True)
     pipeline.promote_render_file(source, dest, expected_duration)
+    preserved = row.get("preserved_artifacts") if isinstance(row.get("preserved_artifacts"), dict) else {}
+    artifact_paths: dict[str, str] = {"mp3": str(dest.resolve())}
+    for key, suffix in (("premaster_wav", "_premaster.wav"), ("master_wav", "_master.wav")):
+        source_artifact = Path(str(preserved.get(key, ""))) if preserved.get(key) else None
+        if source_artifact is None or not source_artifact.exists():
+            raise RuntimeError(f"Missing {key} artifact for song {song_index}.")
+        artifact_dest = dest.with_suffix("")
+        artifact_dest = artifact_dest.with_name(artifact_dest.name + suffix)
+        pipeline.promote_render_file(source_artifact, artifact_dest, expected_duration)
+        artifact_paths[key] = str(artifact_dest.resolve())
     entry = {
         "path": str(dest.resolve()),
         "version": version,
@@ -1797,8 +1879,49 @@ def record_render(song_index: int, row: dict[str, Any], elapsed_seconds: float, 
         "elapsed_seconds": elapsed_seconds,
         "created": stamp,
         "announcement_verification": row.get("announcement_verification"),
+        "job_id": job_id,
+        "child_job_id": child_job_id,
+        "song_id": song_index,
+        "segment_id": segment_id if segment_id is not None else song_index,
+        "start_sec": row.get("start"),
+        "end_sec": row.get("end"),
+        "artifacts": artifact_paths,
     }
     entries.append(entry)
+    history[str(song_index)] = entries[-8:]
+    save_json(HISTORY_PATH, history)
+    manifest_path = dest.with_suffix("").with_name(dest.with_suffix("").name + "_manifest.json")
+    manifest = {
+        "job_id": job_id,
+        "child_job_id": child_job_id,
+        "song_id": song_index,
+        "segment_id": segment_id if segment_id is not None else song_index,
+        "title": row.get("title"),
+        "start_sec": row.get("start"),
+        "end_sec": row.get("end"),
+        "duration_sec": row.get("duration"),
+        "commit": BUILD_METADATA.get("commit"),
+        "effective_mix_hash": hashlib.sha256(json.dumps(row.get("effective_mix", {}), sort_keys=True, default=str).encode("utf-8")).hexdigest(),
+        "effective_mix": row.get("effective_mix"),
+        "artifacts": artifact_paths,
+        "hashes": {name: sha256_file(Path(path)) for name, path in artifact_paths.items()},
+        "lufs": row.get("lufs"),
+        "master_true_peak_dbfs": row.get("master_true_peak_dbfs"),
+        "mp3_true_peak_dbfs": row.get("mp3_true_peak_dbfs"),
+        "target_lufs": row.get("target_lufs"),
+        "stems": row.get("stems", []),
+        "stage_execution_counts": {
+            "auto_mix": 1,
+            "pre_gain": 1,
+            "trim": 1,
+            "master_gain": 1,
+            "compressor": 1,
+            "limiter": 1,
+            "lufs_normalization": 1,
+        },
+    }
+    save_json_atomic(manifest_path, manifest)
+    entry["manifest_path"] = str(manifest_path.resolve())
     history[str(song_index)] = entries[-8:]
     save_json(HISTORY_PATH, history)
     return entry
@@ -2034,7 +2157,7 @@ def child_command(job_path: Path) -> list[str]:
 
 def app_progress(payload: dict[str, Any]) -> None:
     now = time.time()
-    payload = dict(payload)
+    payload = json.loads(json.dumps(dict(payload), default=json_default))
     payload.setdefault("heartbeat", now)
     payload["progress_updated_at"] = now
     started = payload.get("started") or child_status_snapshot.get("started")
@@ -2217,6 +2340,7 @@ def _run_child_job(job_path: Path) -> int:
     rows = []
     batch_errors: list[dict[str, Any]] = []
     for pos, segment_id in enumerate(songs, 1):
+        child_job_id = f"{job_id}-song-{pos:02d}"
         render_index = visible_index_for_segment(segment_id, state)
         total_chunks = max(1, int(math.ceil(state["segments"][segment_id - 1].duration / pipeline.RENDER_CHUNK_SECONDS)))
         app_progress(
@@ -2224,7 +2348,8 @@ def _run_child_job(job_path: Path) -> int:
                 "status": "running",
                 "current": render_index,
                 "current_segment_id": segment_id,
-                "current_item": f"Song {render_index:02d}",
+                "current_item": f"Song {pos} of {len(songs)} — {render_index:02d}",
+                "child_job_id": child_job_id,
                 "current_total_chunks": total_chunks,
                 "current_stage": "starting",
                 "stage_detail": "opening files",
@@ -2239,6 +2364,7 @@ def _run_child_job(job_path: Path) -> int:
         started = time.time()
         render_tmp_dir = Path(tempfile.mkdtemp(prefix=f".zucker_render_{render_index:02d}_"))
         render_tmp_path = render_tmp_dir / f"song_{render_index:02d}.mp3"
+        artifact_tmp_dir = render_tmp_dir / "artifacts"
         render_target_dir = str(payload.get("render_target_dir") or "")
         append_log(job_id, "RENDER DESTINATION worker_temp_file=" + str(render_tmp_path))
         append_log(job_id, "RENDER DESTINATION worker_target=" + render_target_dir)
@@ -2257,15 +2383,17 @@ def _run_child_job(job_path: Path) -> int:
                 out_dir(),
                 output_path=render_tmp_path,
                 prepared_plan=prepared_plan,
+                artifact_dir=artifact_tmp_dir,
             )
             elapsed = time.time() - started
-            entry = record_render(render_index, row, elapsed, render_target_dir or None)
+            entry = record_render(render_index, row, elapsed, render_target_dir or None, job_id=job_id, child_job_id=child_job_id, segment_id=segment_id)
             append_log(job_id, "RENDER DESTINATION final_atomic_promotion_target=" + str(entry["path"]))
+            append_log(job_id, f"BATCH child_completed child_job_id={child_job_id} song_id={segment_id} position={pos}/{len(songs)}")
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
             error_text = f"{type(exc).__name__}: {exc}".strip()
-            batch_errors.append({"song": render_index, "segment_id": segment_id, "error": error_text})
+            batch_errors.append({"song": render_index, "segment_id": segment_id, "child_job_id": child_job_id, "error": error_text})
             append_log(job_id, f"Song {render_index:02d} failed; continuing batch: {error_text}")
             rows.append({"index": render_index, "error": error_text, "mix_source": pipeline.mix_source_label(pipeline.current_song_overrides(render_index))})
             app_progress(
@@ -2284,16 +2412,26 @@ def _run_child_job(job_path: Path) -> int:
         finally:
             shutil.rmtree(render_tmp_dir, ignore_errors=True)
         row["file"] = entry["path"]
+        row["artifacts"] = entry.get("artifacts", {})
+        row["manifest_path"] = entry.get("manifest_path")
+        row["child_job_id"] = child_job_id
         rows.append(row)
         app_progress(
             {
                 "progress": int(pos / max(len(songs), 1) * 100),
                 "song_progress": 100,
                 "current_stage": "finished",
-                "stage_detail": "done",
+                "stage_detail": f"Song {pos} of {len(songs)} complete",
                 "heartbeat": time.time(),
                 "done_count": pos,
                 "current_total_chunks": None,
+                "batch_summary": {
+                    "requested": len(songs),
+                    "started": pos,
+                    "completed": pos,
+                    "failed": len(batch_errors),
+                    "songs": compact_batch_rows(rows),
+                },
             }
         )
     if rows:
@@ -2312,19 +2450,41 @@ def _run_child_job(job_path: Path) -> int:
             batch_errors=batch_errors,
             stage="render",
         )
+        partial_summary = {
+            "job_id": job_id,
+            "status": "partial_failed",
+            "batch_summary": {
+                "requested": len(songs),
+                "started": len(rows) + len(batch_errors),
+                "completed": len(rows),
+                "failed": len(batch_errors),
+                "songs": compact_batch_rows(rows),
+                "errors": batch_errors,
+            },
+            "commit": BUILD_METADATA.get("commit"),
+        }
+        summary_path = Path(str(payload.get("render_target_dir") or out_dir())) / f"ZuckerMixer_batch_{job_id}_summary.json"
+        save_json_atomic(summary_path, partial_summary)
         app_progress(
             {
-                "status": "error",
+                "status": "partial_failed",
                 "current": None,
                 "progress": 100,
                 "song_progress": 100,
-                "current_stage": "error",
+                "current_stage": "partial_failed",
                 "stage_detail": failure_text,
                 "error": failure_text,
                 "batch_errors": batch_errors,
                 "heartbeat": time.time(),
                 "done_count": len(rows),
                 "total_count": len(songs),
+                "batch_summary": {
+                    "requested": len(songs),
+                    "started": len(rows) + len(batch_errors),
+                    "completed": len(rows),
+                    "failed": len(batch_errors),
+                    "songs": compact_batch_rows(rows),
+                },
             }
         )
         return 1
@@ -2332,9 +2492,9 @@ def _run_child_job(job_path: Path) -> int:
         error_text = f"Render completed without all requested outputs ({len(rows)}/{len(songs)})."
         lifecycle_log("render_failed", job_id, error=error_text, stage="artifact_validation")
         app_progress({
-            "status": "error",
+            "status": "partial_failed",
             "current": None,
-            "current_stage": "error",
+            "current_stage": "partial_failed",
             "stage_detail": error_text,
             "error": error_text,
             "heartbeat": time.time(),
@@ -2343,6 +2503,15 @@ def _run_child_job(job_path: Path) -> int:
         })
         return 1
     lifecycle_log("render_completed", job_id, songs=len(rows), stage="artifact_validation")
+    batch_summary = {
+        "requested": len(songs),
+        "started": len(songs),
+        "completed": len(rows),
+        "failed": 0,
+        "songs": compact_batch_rows(rows),
+    }
+    summary_path = Path(str(payload.get("render_target_dir") or out_dir())) / f"ZuckerMixer_batch_{job_id}_summary.json"
+    save_json_atomic(summary_path, {"job_id": job_id, "status": "done", "batch_summary": batch_summary, "commit": BUILD_METADATA.get("commit")})
     app_progress(
         {
             "status": "error" if batch_errors else "done",
@@ -2355,6 +2524,7 @@ def _run_child_job(job_path: Path) -> int:
             "done_count": len(songs),
             "total_count": len(songs),
             "batch_errors": batch_errors,
+            "batch_summary": batch_summary,
             "stage_detail": "done with errors" if batch_errors else "done",
         }
     )
@@ -2459,11 +2629,13 @@ def worker() -> None:
                     termination=termination,
                     error=error,
                 )
+                partial = job.get("status") == "partial_failed" or bool(job.get("batch_errors"))
+                final_status = "partial_failed" if partial else "error"
                 set_job(
                     job,
-                    status="error",
+                    status=final_status,
                     error=error,
-                    current_stage="error",
+                    current_stage=final_status,
                     stage_detail="see details",
                     heartbeat=time.time(),
                     stderr_path=str(stderr_path),
@@ -2878,10 +3050,10 @@ def api_render_many() -> Response:
     settings = load_settings()
     visible_ids = {int(song["id"]) for song in visible_songs(state, settings, load_json(HISTORY_PATH, {})) if not song.get("skipped")}
     payload = request.get_json(force=True, silent=True) or {}
-    songs = [int(x) for x in payload.get("songs", [])]
-    songs = [x for x in songs if x in visible_ids]
-    if not songs:
-        return jsonify({"error": "Choose at least one song."}), 400
+    try:
+        songs = validate_batch_song_ids(payload.get("songs", []), visible_ids)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     try:
         render_target = payload.get("render_target_dir")
         if not render_target:
@@ -2898,7 +3070,9 @@ def api_render_many() -> Response:
         extra["use_saved_mixes"] = bool(payload.get("use_saved_mixes", True))
         if isinstance(payload.get("overrides_snapshot"), dict):
             extra["overrides_snapshot"] = normalize_overrides(payload["overrides_snapshot"])
-        return jsonify(enqueue("mix", sorted(set(songs)), render_target=str(render_target) if render_target else None, extra=extra))
+        job = enqueue("mix", songs, render_target=str(render_target) if render_target else None, extra=extra)
+        append_log(job["id"], f"Validated complete batch: {songs} ({len(songs)} songs)")
+        return jsonify(job)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
 

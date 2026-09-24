@@ -2549,7 +2549,7 @@ async function waitForRenderJob(jobId) {
   while (Date.now() < deadline) {
     const jobs = await pollJobs();
     const job = jobs.find((item) => String(item.id) === String(jobId));
-    if (job && ["done", "error", "cancelled"].includes(job.status)) {
+    if (job && ["done", "partial_failed", "error", "cancelled"].includes(job.status)) {
       if (job.status !== "done") throw new Error(job.error || `Render ${job.status}`);
       return job;
     }
@@ -2577,6 +2577,11 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
   }
   if (renderInProgress) {
     showToast(activeRenderJobId ? `Render already in progress (${activeRenderJobId}).` : "Render already in progress.");
+    return;
+  }
+  const requestedSongs = songs.map((songId) => Number(songId));
+  if (new Set(requestedSongs).size !== requestedSongs.length) {
+    showToast("The batch contains duplicate songs.");
     return;
   }
   setRenderControlsBusy(true, "Preparing render…");
@@ -2613,7 +2618,7 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     const url = singleSong != null ? `/api/render/${singleSong}` : "/api/render";
     const body = singleSong != null
       ? { render_target_dir: renderTargetDir || undefined, render_destination_trace: { save_dialog_return: renderTargetDir }, use_saved_mixes: useSavedMixes, preview_effective_mix: previewEffectiveMix, overrides_snapshot: overridesSnapshot }
-      : { songs, render_target_dir: renderTargetDir || undefined, render_destination_trace: { save_dialog_return: renderTargetDir }, use_saved_mixes: useSavedMixes, overrides_snapshot: overridesSnapshot };
+      : { songs: requestedSongs, requested_song_ids: requestedSongs, expected_song_count: requestedSongs.length, render_target_dir: renderTargetDir || undefined, render_destination_trace: { save_dialog_return: renderTargetDir }, use_saved_mixes: useSavedMixes, overrides_snapshot: overridesSnapshot };
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2623,6 +2628,12 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     if (!res.ok) throw new Error(data.error || "Could not create render job.");
     if (!data.id) throw new Error("Render request returned no job id.");
     jobId = data.id;
+    if (isBatchAction) {
+      const accepted = (data.validated_song_ids || data.songs || []).map((value) => Number(value));
+      if (accepted.length !== requestedSongs.length || accepted.some((value, index) => value !== requestedSongs[index])) {
+        throw new Error("The backend did not preserve the complete requested song list.");
+      }
+    }
     activeRenderJobId = jobId;
     setRenderControlsBusy(true, `Rendering ${jobId}…`);
     await waitForRenderJob(jobId);
@@ -2637,7 +2648,13 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
 }
 
 function mixEverything() {
-  mixSongs(visibleSongs().map((song) => song.id), true, true);
+  const songs = visibleSongs().map((song) => Number(song.id));
+  if (!songs.length) {
+    showToast("No valid songs are available for Mix everything.");
+    return;
+  }
+  console.info("[batch] Mix everything requested", songs);
+  mixSongs(songs, true, songs.length > 1);
 }
 
 function chooseMixSource() {
@@ -2791,8 +2808,8 @@ async function pollJobs() {
   // the UI can remain stuck on "Rendering…" even though the worker stopped.
   if (activeRenderJobId) {
     const tracked = jobs.find((job) => String(job.id) === String(activeRenderJobId));
-    if (tracked && ["done", "error", "cancelled"].includes(tracked.status)) {
-      const terminalMessage = tracked.status === "error"
+    if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status)) {
+      const terminalMessage = tracked.status === "error" || tracked.status === "partial_failed"
         ? `Render failed: ${tracked.error || "see job details"}`
         : tracked.status === "cancelled" ? "Render cancelled." : "Render completed.";
       activeRenderJobId = null;

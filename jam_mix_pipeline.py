@@ -5740,6 +5740,7 @@ def render_segment(
     output_path: Path | None = None,
     verify_announcement: bool = True,
     prepared_plan: dict[str, object] | None = None,
+    artifact_dir: Path | None = None,
 ) -> dict[str, object]:
     render_t0 = time.perf_counter()
     song_overrides = current_song_overrides(index)
@@ -6569,6 +6570,19 @@ def render_segment(
                 )
                 print(f"  Announcement verification warning for song {index}: {announcement_verification['verification_warning']}", flush=True)
 
+        preserved_artifacts: dict[str, str] = {}
+        if artifact_dir is not None:
+            artifact_root = Path(artifact_dir)
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            premaster_artifact = artifact_root / f"song_{index:02d}_premaster.wav"
+            master_artifact = artifact_root / f"song_{index:02d}_master.wav"
+            shutil.copy2(premaster_path, premaster_artifact)
+            shutil.copy2(master_path, master_artifact)
+            preserved_artifacts = {
+                "premaster_wav": str(premaster_artifact),
+                "master_wav": str(master_artifact),
+            }
+
     total_seconds = time.perf_counter() - render_t0
     print(
         f"  timing totals: scan={scan_seconds:.2f}s mix={mix_seconds:.2f}s "
@@ -6625,6 +6639,7 @@ def render_segment(
         "vocal_bus_db": vocal_bus_trim_db,
         "stage_metrics": stage_meters_final,
         "premaster_headroom_db": PREMASTER_HEADROOM_DB,
+        "preserved_artifacts": preserved_artifacts,
     }
 
 

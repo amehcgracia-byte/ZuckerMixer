@@ -86,7 +86,7 @@ class RenderLifecycleTest(unittest.TestCase):
 
     def test_terminal_job_releases_render_controls_in_frontend(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn('if (tracked && ["done", "error", "cancelled"].includes(tracked.status))', source)
+        self.assertIn('if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status))', source)
         self.assertIn("setRenderControlsBusy(false)", source)
         self.assertIn("Render failed:", source)
 
