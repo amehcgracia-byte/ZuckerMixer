@@ -2431,6 +2431,7 @@ def worker() -> None:
                 append_log(job["id"], "Mixing stopped.")
             elif code == 0:
                 song_count = len(job.get("songs", []))
+                lifecycle_log("render_completed", job["id"], parent_pid=os.getpid(), child_pid=proc.pid, songs=song_count)
                 set_job(
                     job,
                     status="done",
@@ -2449,6 +2450,15 @@ def worker() -> None:
                 error = f"worker exited with code {code}"
                 if stderr_tail:
                     error = f"{error}\n\n{stderr_tail}"
+                lifecycle_log(
+                    "render_failed",
+                    job["id"],
+                    parent_pid=os.getpid(),
+                    child_pid=proc.pid,
+                    exit_code=code,
+                    termination=termination,
+                    error=error,
+                )
                 set_job(
                     job,
                     status="error",

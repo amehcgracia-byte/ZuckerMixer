@@ -2764,6 +2764,20 @@ async function pollJobs() {
   // The live job poll starts before the initial state request. Do not let a
   // fast /api/jobs response dereference the not-yet-hydrated state object.
   if (!appState) return jobs;
+  // A native save-dialog callback can interrupt the original promise chain.
+  // Always release the controls when the tracked job is terminal, otherwise
+  // the UI can remain stuck on "Rendering…" even though the worker stopped.
+  if (activeRenderJobId) {
+    const tracked = jobs.find((job) => String(job.id) === String(activeRenderJobId));
+    if (tracked && ["done", "error", "cancelled"].includes(tracked.status)) {
+      const terminalMessage = tracked.status === "error"
+        ? `Render failed: ${tracked.error || "see job details"}`
+        : tracked.status === "cancelled" ? "Render cancelled." : "Render completed.";
+      activeRenderJobId = null;
+      setRenderControlsBusy(false);
+      if (tracked.status !== "done") showToast(terminalMessage);
+    }
+  }
   appState.jobs = jobs;
   renderJobs(jobs);
   Object.entries(realPreviewJobs).forEach(([songId, jobId]) => {

@@ -84,6 +84,12 @@ class RenderLifecycleTest(unittest.TestCase):
         self.assertIn("stderr_tail = tail_text(stderr_path)", source)
         self.assertIn('stage_detail="see details"', source)
 
+    def test_terminal_job_releases_render_controls_in_frontend(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('if (tracked && ["done", "error", "cancelled"].includes(tracked.status))', source)
+        self.assertIn("setRenderControlsBusy(false)", source)
+        self.assertIn("Render failed:", source)
+
     def test_fader_conversion_is_monotonic_and_single_db_conversion(self):
         source = (ROOT / "jam_mix_pipeline.py").read_text(encoding="utf-8")
         self.assertIn("y *= db_to_amp(level_gain_db)", source)
