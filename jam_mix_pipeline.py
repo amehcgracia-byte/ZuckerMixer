@@ -5252,6 +5252,41 @@ def measure_encoded_lufs(path: Path) -> float:
     return float(pyln.Meter(sample_rate).integrated_loudness(audio))
 
 
+def measure_true_peak_db(path: Path) -> float:
+    """Measure the delivered file with ffmpeg's independent true-peak meter."""
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for independent true-peak validation")
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true", "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"true-peak measurement failed for {path}: {(result.stderr or '').strip()}")
+    matches = re.findall(r"Peak:\s*([-+]?\d+(?:\.\d+)?)\s*dBFS", result.stderr or "")
+    if not matches:
+        raise RuntimeError(f"ffmpeg did not return a true-peak value for {path}")
+    return float(matches[-1])
+
+
+def attenuate_wav_in_place(path: Path, attenuation_db: float) -> None:
+    """Apply an explicit, logged safety trim to a temporary master WAV."""
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for true-peak safety trim")
+    temporary = Path(tempfile.mkstemp(prefix="zucker_safe_master_", suffix=".wav")[1])
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+             "-af", f"volume={float(attenuation_db):.6f}dB", "-c:a", "pcm_f32le", str(temporary)],
+            check=True,
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def analyze_volume_anomalies(path: Path, sr: int, window_seconds: float = 3.0, jump_db: float = 6.0) -> list[tuple[float, float]]:
     window = max(1, int(round(window_seconds * sr)))
     levels: list[float] = []
@@ -6451,6 +6486,26 @@ def render_segment(
         stage_meters_final["vocal_bus_safety_reduction_db"] = max(0.0, vocal_trim_peak - vocal_safe_peak)
         post_master_rms, post_master_peak = measure_stream_rms_lufs(master_path)
         stage_meters_final["post_master"] = {"peak_dbfs": post_master_peak, "rms_dbfs": post_master_rms}
+        wav_true_peak_dbfs = measure_true_peak_db(master_path)
+        codec_safety_trim_db = 0.0
+        if wav_true_peak_dbfs > TRUE_PEAK_CEILING_DBFS:
+            codec_safety_trim_db = float(TRUE_PEAK_CEILING_DBFS - wav_true_peak_dbfs - 0.2)
+            attenuate_wav_in_place(master_path, codec_safety_trim_db)
+            post_master_rms, post_master_peak = measure_stream_rms_lufs(master_path)
+            wav_true_peak_dbfs = measure_true_peak_db(master_path)
+        if wav_true_peak_dbfs > TRUE_PEAK_CEILING_DBFS:
+            raise RuntimeError(
+                f"Master WAV true peak {wav_true_peak_dbfs:.2f} dBFS exceeds "
+                f"the configured ceiling {TRUE_PEAK_CEILING_DBFS:.2f} dBFS"
+            )
+        stage_meters_final["post_master"] = {
+            "peak_dbfs": post_master_peak,
+            "rms_dbfs": post_master_rms,
+            "true_peak_dbfs": wav_true_peak_dbfs,
+            "true_peak_tool": "ffmpeg ebur128=peak=true",
+            "safety_trim_db": codec_safety_trim_db,
+        }
+        final_peak = post_master_peak
         print("STAGE METRICS " + json.dumps(stage_meters_final, sort_keys=True), flush=True)
         master_seconds = time.perf_counter() - master_t0
         title_probe = read_title_probe(master_path, sr)
@@ -6477,7 +6532,27 @@ def render_segment(
         )
         print("  stage encoding")
         encode_t0 = time.perf_counter()
-        encode_mp3(master_path, mp3_path, numbered_title)
+        mp3_true_peak_dbfs = float("nan")
+        mp3_codec_trim_db = 0.0
+        for encode_attempt in range(1, 4):
+            encode_mp3(master_path, mp3_path, numbered_title)
+            mp3_true_peak_dbfs = measure_true_peak_db(mp3_path)
+            if mp3_true_peak_dbfs <= TRUE_PEAK_CEILING_DBFS:
+                break
+            if encode_attempt >= 3:
+                raise RuntimeError(
+                    f"MP3 true peak {mp3_true_peak_dbfs:.2f} dBFS exceeds "
+                    f"the configured ceiling {TRUE_PEAK_CEILING_DBFS:.2f} dBFS after {encode_attempt} attempts"
+                )
+            trim_db = float(TRUE_PEAK_CEILING_DBFS - mp3_true_peak_dbfs - 0.2)
+            mp3_codec_trim_db += trim_db
+            attenuate_wav_in_place(master_path, trim_db)
+            wav_true_peak_dbfs = measure_true_peak_db(master_path)
+            print(
+                f"MP3 TRUE-PEAK SAFETY attempt={encode_attempt} "
+                f"mp3_peak={mp3_true_peak_dbfs:.2f} dBFS trim={trim_db:+.2f} dB",
+                flush=True,
+            )
         encode_seconds = time.perf_counter() - encode_t0
         encoded_lufs = measure_encoded_lufs(mp3_path)
         if np.isfinite(encoded_lufs):
@@ -6528,6 +6603,11 @@ def render_segment(
         "mood": mood,
         "lufs": final_lufs,
         "peak_dbfs": final_peak,
+        "master_true_peak_dbfs": wav_true_peak_dbfs,
+        "master_true_peak_tool": "ffmpeg ebur128=peak=true",
+        "mp3_true_peak_dbfs": mp3_true_peak_dbfs,
+        "mp3_true_peak_tool": "ffmpeg ebur128=peak=true",
+        "mp3_codec_safety_trim_db": mp3_codec_trim_db,
         "file": str(mp3_path),
         "stems": used,
         "missing_stems": [
