@@ -1,0 +1,10 @@
+.buildenv/
+build/pyinstaller/
+build/*.json
+build/*.icns
+build/*.png
+build/*.iconset/
+dist/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,2 @@
+# Installed in the separate Python 3.13 runtime used by offline detection.
+faster-whisper>=1.2,<2
