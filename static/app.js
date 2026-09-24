@@ -2657,6 +2657,11 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     // A Render click may prepare a missing/stale frozen plan, but this is an
     // explicit, visible preflight. The worker itself never runs Analyze.
     await ensureRenderPlans(requestedSongs);
+    // Analyze may have normalized and persisted automatic stem parameters.
+    // Refresh the authoritative state before freezing the job payload; using
+    // the pre-Analyze in-memory snapshot makes the worker reject otherwise
+    // valid plans as stale for later songs in a batch.
+    await refreshState({ renderLarge: false });
     const overridesSnapshot = cloneOverridesPayload();
     const url = singleSong != null ? `/api/render/${singleSong}` : "/api/render";
     const body = singleSong != null

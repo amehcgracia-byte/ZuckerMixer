@@ -90,6 +90,7 @@ class RenderLifecycleTest(unittest.TestCase):
         self.assertIn('@app.get("/api/mix-plan-status/<int:segment_id>")', backend)
         self.assertIn("async function ensureRenderPlans(songIds)", frontend)
         self.assertIn("await ensureRenderPlans(requestedSongs)", frontend)
+        self.assertIn("await refreshState({ renderLarge: false })", frontend)
         self.assertIn("Analyze required", frontend)
 
     def test_partial_failure_exposes_batch_error_and_worker_identity(self):
