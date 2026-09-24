@@ -989,12 +989,13 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     snapshot = None if pipeline.DETECTION_RESCAN_MODE else load_detection_snapshot(signature)
     if snapshot is not None:
         snapshot_segments = snapshot.get("segments", []) if isinstance(snapshot, dict) else []
-        invalid_snapshot_durations = [
-            round(float(item.get("end", 0.0)) - float(item.get("start", 0.0)), 3)
-            for item in snapshot_segments
-            if isinstance(item, dict)
-            and not pipeline.HARD_MIN_SONG_SECONDS <= (float(item.get("end", 0.0)) - float(item.get("start", 0.0))) <= pipeline.HARD_MAX_SONG_SECONDS
-        ]
+        invalid_snapshot_durations = []
+        for item in snapshot_segments:
+            start = float(item.get("start", 0.0)) if isinstance(item, dict) else float(getattr(item, "start", 0.0))
+            end = float(item.get("end", 0.0)) if isinstance(item, dict) else float(getattr(item, "end", 0.0))
+            duration = end - start
+            if not pipeline.HARD_MIN_SONG_SECONDS <= duration <= pipeline.HARD_MAX_SONG_SECONDS:
+                invalid_snapshot_durations.append(round(duration, 3))
         if invalid_snapshot_durations:
             print(
                 "DETECTION SNAPSHOT: ignored invalid persisted windows "
