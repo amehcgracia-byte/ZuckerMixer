@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 APP_NAME="Momo García Mixer"
-APP_VERSION="2.0.16"
+APP_VERSION="2.0.17"
 APP_BUNDLE="$ROOT/dist/${APP_NAME}.app"
 DMG_ROOT="$ROOT/dist/dmg_root"
 DMG_PATH="$ROOT/dist/${APP_NAME}.dmg"
