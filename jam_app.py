@@ -8,6 +8,7 @@ import json
 import math
 import mimetypes
 import os
+import pickle
 import queue
 import re
 import shutil
@@ -43,6 +44,7 @@ SETTINGS_PATH = STATE_ROOT / "app_settings.json"
 MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"
 SEGMENT_SELECTIONS_PATH = ACTIVE_SOURCE_STATE_ROOT / "segment_selections.json"
 WAVEFORM_CACHE_PATH = ACTIVE_SOURCE_STATE_ROOT / "waveform_cache.json"
+MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
 SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
 DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerPreviewCache"
@@ -329,6 +331,79 @@ def active_stems_for_segment(stems: list[pipeline.Stem], segment: pipeline.Segme
     ]
 
 
+MIX_PLAN_VERSION = 2
+
+
+def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
+    payload = {
+        "version": MIX_PLAN_VERSION,
+        "song_id": int(segment_id),
+        "start_sec": round(float(segment.start), 6),
+        "end_sec": round(float(segment.end), 6),
+        "overrides": song_overrides,
+        "dsp_revision": BUILD_METADATA.get("source_revision", "development"),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def load_mix_plan(
+    segment_id: int,
+    *,
+    require_current: bool = True,
+    overrides_snapshot: dict[str, Any] | None = None,
+    state_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    payload = load_json(MIX_PLANS_PATH, {})
+    entry = payload.get(str(segment_id)) if isinstance(payload, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    if int(entry.get("version", 0)) != MIX_PLAN_VERSION:
+        return None
+    if not require_current:
+        return entry.get("plan") if isinstance(entry.get("plan"), dict) else None
+    state = state_snapshot if isinstance(state_snapshot, dict) else load_render_state()
+    if not 1 <= segment_id <= len(state["segments"]):
+        return None
+    overrides = normalize_overrides(
+        overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}})
+    )
+    song_overrides = overrides.get("songs", {}).get(str(segment_id), {})
+    expected = mix_plan_signature(segment_id, state["segments"][segment_id - 1], song_overrides)
+    if entry.get("signature") != expected:
+        return None
+    plan = entry.get("plan")
+    return plan if isinstance(plan, dict) else None
+
+
+def save_mix_plan(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any], plan: dict[str, Any]) -> None:
+    payload = load_json(MIX_PLANS_PATH, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload[str(segment_id)] = {
+        "version": MIX_PLAN_VERSION,
+        "signature": mix_plan_signature(segment_id, segment, song_overrides),
+        "created_at": time.time(),
+        "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
+        "plan": plan,
+    }
+    save_json_atomic(MIX_PLANS_PATH, payload)
+
+
+def load_render_state() -> dict[str, Any]:
+    """Load Analyze output for a worker without running detection again."""
+    settings = load_settings()
+    configure_source_folder(settings.get("source_folder") or pipeline.SOURCE_DIR)
+    signature = detection_state_signature()
+    snapshot = load_detection_snapshot(signature)
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("Analyze required: no current detection snapshot exists for this source.")
+    segments = list(snapshot.get("segments", []))
+    # Manual Select Cuts is authoritative and is applied to the persisted
+    # detection state without invoking Whisper, thresholds, or stem scans.
+    snapshot["segments"] = apply_saved_segment_selections(segments)
+    return snapshot
+
+
 def stem_is_active_for_preview(
     stem: pipeline.Stem,
     rms_values_db: dict[str, float],
@@ -358,9 +433,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         state["active_stems_detection_version"] = ACTIVE_STEM_DETECTION_VERSION
     cache = state.setdefault("active_stems_by_song", {})
     key = str(segment_id)
-    if key not in cache:
-        cache[key] = active_stems_for_segment(state["stems"], state["segments"][segment_id - 1])
-    active_files = set(cache[key])
+    active_files: set[str] = set()
     overrides = normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}}))
     songs_payload = overrides.setdefault("songs", {})
     stale_song_ids = []
@@ -387,7 +460,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     segment = state["segments"][segment_id - 1]
     musician_labels = dict(segment.musician_labels)
     sr = state["stems"][0].samplerate
-    rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, _segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr)
+    rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr)
     role_norms_db = pipeline.role_norms_from_detection_cache(state["stems"])
     mix_controls = pipeline.analyze_song_mix_controls(state["stems"], segment, sr, rms_values_db, role_norms_db)
     effective_roles = mix_controls["effective_roles"]
@@ -401,6 +474,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         for name in [stem.path.name]
         if stem_is_active_for_preview(stem, rms_values_db, has_audio, dynamic_spread_db, loudest_db, segment_envelopes)
     }
+    active_files = set(active_names)
+    cache[key] = sorted(active_files)
     active_energies = [energies[name] for name in active_names]
     median_energy = float(np.median(active_energies)) if active_energies else 0.0
     active_levels_db = {
@@ -413,6 +488,25 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         if effective_roles.get(name, "") not in {"vocal", "room"}
     ]
     accompaniment_reference_db = float(np.median(accompaniment_levels)) if accompaniment_levels else None
+    # The expensive Analyze-only products are persisted as one immutable
+    # per-song snapshot. Render consumes this snapshot and never recomputes
+    # thresholds, Whisper, activity, or Auto-Mix from the source files.
+    analysis_cache = {
+        "version": 1,
+        "song_id": int(segment_id),
+        "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
+        "rms_values_db": rms_values_db,
+        "energies": energies,
+        "has_audio": has_audio,
+        "dynamic_spread_db": dynamic_spread_db,
+        "segment_envelopes": segment_envelopes,
+        "segment_peaks_db": segment_peaks,
+        "role_norms_db": role_norms_db,
+        "mix_controls": mix_controls,
+        "noise_diagnostics": pipeline.classify_noise_stems(state["stems"], segment, sr),
+        "flattening": pipeline.build_per_song_flattening(segment_envelopes),
+        "drum_bpm": pipeline.estimate_segment_drum_bpm(state["stems"], segment, sr),
+    }
     initialized_makeup_names: set[str] = set()
     solo_files = {
         stem.path.name
@@ -570,7 +664,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     if changed:
         overrides["_write_trace"] = override_write_trace(overrides)
         save_json(OVERRIDES_PATH, overrides)
-    return {
+    plan = {
         "song": segment_id,
         "mix_source": pipeline.mix_source_label(song_overrides),
         "active_stems": cache[key],
@@ -580,6 +674,16 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "mastering_intensity": str(song_overrides.get("mastering_intensity", "natural") if isinstance(song_overrides, dict) else "natural"),
         "stems": stem_params,
     }
+    plan_signature = mix_plan_signature(segment_id, segment, song_overrides)
+    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"mix_analysis_{segment_id}_{plan_signature}.pkl"
+    with cache_path.open("wb") as cache_file:
+        pickle.dump(analysis_cache, cache_file, protocol=pickle.HIGHEST_PROTOCOL)
+    plan["analysis_cache_path"] = str(cache_path)
+    plan["analysis_cache_signature"] = plan_signature
+    plan["analysis_cache_version"] = 1
+    plan["effective_dsp_plan_hash"] = plan_signature
+    save_mix_plan(segment_id, segment, song_overrides, plan)
+    return plan
 
 
 def override_value_snapshot(settings: Any) -> dict[str, Any]:
@@ -666,7 +770,7 @@ def save_manual_splits(values: list[float]) -> None:
 
 
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, PREVIEW_DIR
+    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, PREVIEW_DIR
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.configure_detection_cache(source, STATE_ROOT)
@@ -678,6 +782,7 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"
     SEGMENT_SELECTIONS_PATH = ACTIVE_SOURCE_STATE_ROOT / "segment_selections.json"
     WAVEFORM_CACHE_PATH = ACTIVE_SOURCE_STATE_ROOT / "waveform_cache.json"
+    MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
     SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
     DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
     PREVIEW_DIR = PREVIEW_CACHE_ROOT / source_key
@@ -686,7 +791,12 @@ def configure_source_folder(source_folder: str | Path) -> Path:
 
 def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> dict[str, Any] | None:
     payload = load_json(DETECTION_STATE_PATH, None)
-    if not isinstance(payload, dict) or payload.get("source_signature") != [signature[0], signature[1], [list(item) for item in signature[2]]]:
+    expected_signature = [
+        signature[0],
+        [signature[1][0], signature[1][1]] if isinstance(signature[1], tuple) else signature[1],
+        [list(item) for item in signature[2]],
+    ]
+    if not isinstance(payload, dict) or payload.get("source_signature") != expected_signature:
         return None
     try:
         stems = [pipeline.Stem(path=Path(item["path"]), **{key: item[key] for key in ("name", "role", "samplerate", "channels", "frames", "duration", "timeline_frames", "offset_seconds", "offset_source")}) for item in payload["stems"]]
@@ -1694,8 +1804,8 @@ def record_render(song_index: int, row: dict[str, Any], elapsed_seconds: float, 
     return entry
 
 
-def visible_index_for_segment(segment_id: int) -> int:
-    state = ensure_pipeline_state()
+def visible_index_for_segment(segment_id: int, state_snapshot: dict[str, Any] | None = None) -> int:
+    state = state_snapshot if isinstance(state_snapshot, dict) else ensure_pipeline_state()
     songs = visible_songs(state, load_settings(), load_json(HISTORY_PATH, {}))
     for song in songs:
         if int(song["id"]) == int(segment_id):
@@ -1765,13 +1875,19 @@ def apply_overrides_for_song(
     render_index: int,
     use_saved_mixes: bool = True,
     overrides_snapshot: dict[str, Any] | None = None,
-) -> None:
-    prepared_mix = canonical_mix_params_for_song(segment_id)
+    state_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state = state_snapshot if isinstance(state_snapshot, dict) else load_render_state()
+    prepared_mix = load_mix_plan(segment_id, overrides_snapshot=overrides_snapshot, state_snapshot=state)
+    if not isinstance(prepared_mix, dict):
+        raise RuntimeError(
+            f"Analyze required: the Auto-Mix plan for song {segment_id} is missing or stale. "
+            "Analyze the jam again before rendering."
+        )
     disk_payload = overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}})
     write_trace = disk_payload.get("_write_trace", {}) if isinstance(disk_payload, dict) else {}
     overrides = normalize_overrides(disk_payload)
     source_song = overrides.get("songs", {}).get(str(segment_id), {}) if use_saved_mixes else {}
-    state = ensure_pipeline_state()
     if 1 <= int(segment_id) <= len(state["raw_songs"]):
         custom_name = song_name_for(state["raw_songs"][int(segment_id) - 1], load_song_names())
         if custom_name:
@@ -1853,6 +1969,7 @@ def apply_overrides_for_song(
             "warning": "Matchering reference is configured but unavailable; render will fail rather than silently use fallback.",
             "heartbeat": time.time(),
         })
+    return prepared_mix
 
 
 def normalize_overrides(payload: Any) -> dict[str, Any]:
@@ -2019,7 +2136,7 @@ def _run_child_job(job_path: Path) -> int:
     job_id = str(payload.get("id", "child"))
     lifecycle_log("child_started", job_id, argv=sys.argv, job_path=str(job_path), status_path=str(child_status_path))
     if kind == "real-preview":
-        state = ensure_pipeline_state()
+        state = load_render_state()
         song_id = int(payload["preview_song_id"])
         preview_start = float(payload["preview_start"])
         preview_duration = float(payload["preview_duration"])
@@ -2035,7 +2152,7 @@ def _run_child_job(job_path: Path) -> int:
             "started": time.time(),
             "heartbeat": time.time(),
         })
-        apply_overrides_for_song(song_id, song_id)
+        prepared_plan = apply_overrides_for_song(song_id, song_id, state_snapshot=state)
         render_started = time.perf_counter()
         pipeline.render_segment(
             state["stems"],
@@ -2044,6 +2161,7 @@ def _run_child_job(job_path: Path) -> int:
             PREVIEW_DIR,
             output_path=Path(str(payload["preview_path"])),
             verify_announcement=False,
+            prepared_plan=prepared_plan,
         )
         elapsed = time.perf_counter() - render_started
         app_progress({
@@ -2087,11 +2205,11 @@ def _run_child_job(job_path: Path) -> int:
         )
         return 0
 
-    state = ensure_pipeline_state()
+    state = load_render_state()
     # Last safety gate: validate every selected cut against the source stems
     # immediately before rendering. A rejection aborts the whole job.
     selected_segments = [state["segments"][segment_id - 1] for segment_id in songs]
-    selected_numbers = [visible_index_for_segment(segment_id) for segment_id in songs]
+    selected_numbers = [visible_index_for_segment(segment_id, state) for segment_id in songs]
     final_cut_audit = pipeline.validate_final_render_boundaries(state["stems"], selected_segments, selected_numbers)
     pipeline.DETECTION_STRATEGY["final_render_boundary_audit"] = final_cut_audit
     append_log(job_id, f"Final cut gate passed for {len(final_cut_audit)} selected song(s)")
@@ -2099,7 +2217,7 @@ def _run_child_job(job_path: Path) -> int:
     rows = []
     batch_errors: list[dict[str, Any]] = []
     for pos, segment_id in enumerate(songs, 1):
-        render_index = visible_index_for_segment(segment_id)
+        render_index = visible_index_for_segment(segment_id, state)
         total_chunks = max(1, int(math.ceil(state["segments"][segment_id - 1].duration / pipeline.RENDER_CHUNK_SECONDS)))
         app_progress(
             {
@@ -2125,11 +2243,12 @@ def _run_child_job(job_path: Path) -> int:
         append_log(job_id, "RENDER DESTINATION worker_temp_file=" + str(render_tmp_path))
         append_log(job_id, "RENDER DESTINATION worker_target=" + render_target_dir)
         try:
-            apply_overrides_for_song(
+            prepared_plan = apply_overrides_for_song(
                 segment_id,
                 render_index,
                 bool(payload.get("use_saved_mixes", True)),
                 payload.get("overrides_snapshot") if isinstance(payload.get("overrides_snapshot"), dict) else None,
+                state,
             )
             row = pipeline.render_segment(
                 state["stems"],
@@ -2137,6 +2256,7 @@ def _run_child_job(job_path: Path) -> int:
                 render_index,
                 out_dir(),
                 output_path=render_tmp_path,
+                prepared_plan=prepared_plan,
             )
             elapsed = time.time() - started
             entry = record_render(render_index, row, elapsed, render_target_dir or None)
@@ -2442,6 +2562,24 @@ def api_overrides() -> Response:
     return jsonify({"ok": True, "accepted": accepted, "ignored": ignored})
 
 
+@app.post("/api/analyze-mix/<int:segment_id>")
+def api_analyze_mix(segment_id: int) -> Response:
+    """Explicit Analyze action: create the frozen per-song DSP snapshot."""
+    try:
+        plan = canonical_mix_params_for_song(segment_id)
+    except IndexError:
+        return jsonify({"error": "song not found"}), 404
+    except Exception as exc:
+        append_log("ui", f"Analyze failed for song {segment_id}: {type(exc).__name__}: {exc}")
+        return jsonify({"error": f"Analyze failed: {type(exc).__name__}: {exc}"}), 500
+    return jsonify({
+        "ok": True,
+        "song_id": segment_id,
+        "effective_dsp_plan_hash": plan.get("effective_dsp_plan_hash"),
+        "analysis_cache_path": plan.get("analysis_cache_path"),
+    })
+
+
 @app.post("/api/settings")
 def api_settings() -> Response:
     global pipeline_state, pipeline_state_signature
@@ -2568,7 +2706,10 @@ def api_redetect() -> Response:
 
 @app.post("/api/render/<int:song_index>")
 def api_render_song(song_index: int) -> Response:
-    state = ensure_pipeline_state()
+    try:
+        state = load_render_state()
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
     visible_ids = {
         int(song["id"])
         for song in visible_songs(state, load_settings(), load_json(HISTORY_PATH, {}))
@@ -2675,7 +2816,10 @@ def real_preview_audio(song_index: int, filename: str) -> Response:
 
 @app.post("/api/render")
 def api_render_many() -> Response:
-    state = ensure_pipeline_state()
+    try:
+        state = load_render_state()
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
     settings = load_settings()
     visible_ids = {int(song["id"]) for song in visible_songs(state, settings, load_json(HISTORY_PATH, {})) if not song.get("skipped")}
     payload = request.get_json(force=True, silent=True) or {}

@@ -424,6 +424,7 @@ function markOverrideSequence(songIndex) {
 
 async function postOverrides(reason = "manual") {
   const payload = cloneOverridesPayload();
+  const planSongs = [...pendingOverrideSongs];
   const postedSeqs = Object.fromEntries(Object.entries(payload.songs || {}).map(([songId, song]) => [songId, Number(song?._seq || 0)]));
   console.log("[mix-preview overrides post]", {
     reason,
@@ -449,6 +450,15 @@ async function postOverrides(reason = "manual") {
       }
     });
     if (!pendingOverrideSongs.size) pendingOverrideReasons.clear();
+    // Changing confirmed Fine Tune parameters invalidates the frozen plan.
+    // Rebuild it as an explicit Analyze step, never from inside Render.
+    if (!String(reason).includes("before-render")) {
+      for (const songId of planSongs) {
+        const planRes = await fetch(`/api/analyze-mix/${songId}`, { method: "POST" });
+        const planData = await planRes.json().catch(() => ({}));
+        if (!planRes.ok) throw new Error(planData.error || `Analyze required for song ${songId}`);
+      }
+    }
     return data;
   } finally {
     overrideWritesInFlight = Math.max(0, overrideWritesInFlight - 1);
@@ -868,7 +878,7 @@ function installCutDrag(element, mode) {
 function wireCutSelector(ui) {
   installCutDrag(ui.dialog.querySelector(".cut-handle.left"), "left"); installCutDrag(ui.dialog.querySelector(".cut-handle.right"), "right"); installCutDrag(ui.dialog.querySelector(".cut-center"), "center");
   [ui.start, ui.end].forEach((input) => input.addEventListener("input", () => { ui.startValue = Number(ui.start.value); ui.endValue = Number(ui.end.value); drawCutEditor(); }));
-  ui.dialog.querySelector("#cutApply").addEventListener("click", async () => { const response = await fetch(`/api/segment-selection/${ui.songId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_sec: ui.startValue, end_sec: ui.endValue }) }); const result = await response.json(); if (!response.ok) return showToast(result.error || "Could not save selection."); ui.dialog.close("saved"); await refreshState({ renderLarge: true }); showToast(`Saved cut ${cutTime(result.start_sec)}–${cutTime(result.end_sec)}. A new render plan will be used.`); });
+  ui.dialog.querySelector("#cutApply").addEventListener("click", async () => { const response = await fetch(`/api/segment-selection/${ui.songId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_sec: ui.startValue, end_sec: ui.endValue }) }); const result = await response.json(); if (!response.ok) return showToast(result.error || "Could not save selection."); const planResponse = await fetch(`/api/analyze-mix/${ui.songId}`, { method: "POST" }); const planResult = await planResponse.json().catch(() => ({})); if (!planResponse.ok) return showToast(planResult.error || "Analyze required before rendering."); ui.dialog.close("saved"); await refreshState({ renderLarge: true }); showToast(`Saved cut ${cutTime(result.start_sec)}–${cutTime(result.end_sec)}. Analyze plan ready.`); });
 }
 
 function fineTuneHtml(song) {

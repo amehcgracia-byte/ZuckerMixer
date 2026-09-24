@@ -23,6 +23,7 @@ import tempfile
 import time
 import hashlib
 import io
+import pickle
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -5703,6 +5704,7 @@ def render_segment(
     out_dir: Path,
     output_path: Path | None = None,
     verify_announcement: bool = True,
+    prepared_plan: dict[str, object] | None = None,
 ) -> dict[str, object]:
     render_t0 = time.perf_counter()
     song_overrides = current_song_overrides(index)
@@ -5732,11 +5734,42 @@ def render_segment(
             }
         )
 
-    rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks_db = scan_segment_activity(
-        stems, segment, sr, progress_callback=report_scan_progress
-    )
-    role_norms_db = role_norms_from_detection_cache(stems)
-    noise_diagnostics = classify_noise_stems(stems, segment, sr)
+    if not isinstance(prepared_plan, dict):
+        raise RuntimeError("Analyze required: Render did not receive a frozen DSP plan.")
+    cache_path_value = prepared_plan.get("analysis_cache_path")
+    cache_signature = prepared_plan.get("analysis_cache_signature")
+    if not cache_path_value or not cache_signature:
+        raise RuntimeError("Analyze required: the DSP plan has no analysis snapshot.")
+    cache_path = Path(str(cache_path_value))
+    try:
+        with cache_path.open("rb") as cache_file:
+            analysis_cache = pickle.load(cache_file)
+    except Exception as exc:
+        raise RuntimeError(f"Analyze required: analysis snapshot is unavailable: {exc}") from exc
+    if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 1:
+        raise RuntimeError("Analyze required: analysis snapshot version is unsupported.")
+    cached_selection = analysis_cache.get("selection", {})
+    if (
+        int(analysis_cache.get("song_id", index)) != int(index)
+        or abs(float(cached_selection.get("start_sec", -1.0)) - float(segment.start)) > 1e-6
+        or abs(float(cached_selection.get("end_sec", -1.0)) - float(segment.end)) > 1e-6
+    ):
+        raise RuntimeError("Analyze required: analysis snapshot does not match the selected song window.")
+    rms_values_db = analysis_cache.get("rms_values_db", {})
+    energies = analysis_cache.get("energies", {})
+    has_audio = analysis_cache.get("has_audio", {})
+    dynamic_spread_db = analysis_cache.get("dynamic_spread_db", {})
+    segment_envelopes = analysis_cache.get("segment_envelopes", {})
+    segment_peaks_db = analysis_cache.get("segment_peaks_db", {})
+    role_norms_db = analysis_cache.get("role_norms_db", {})
+    mix_controls = analysis_cache.get("mix_controls", {})
+    noise_diagnostics = analysis_cache.get("noise_diagnostics", {})
+    flattening = analysis_cache.get("flattening", {})
+    drum_bpm, drum_bpm_confidence = analysis_cache.get("drum_bpm", (0.0, 0.0))
+    if not isinstance(mix_controls, dict):
+        raise RuntimeError("Analyze required: Auto-Mix analysis snapshot is incomplete.")
+    if not isinstance(noise_diagnostics, dict):
+        noise_diagnostics = {}
     noise_names = [name for name, info in noise_diagnostics.items() if info.get("case") == "B"]
     if noise_names:
         print(f"NOISE DETECTION song={index}: empty noisy inputs muted: {', '.join(noise_names)}", flush=True)
@@ -5747,10 +5780,7 @@ def render_segment(
             default=lambda value: "<profile>" if isinstance(value, np.ndarray) else value,
             sort_keys=True,
         ), flush=True)
-    flattening = build_per_song_flattening(segment_envelopes)
-    print("PER-SONG DYNAMICS FLATTENING:", flush=True)
-    for name, info in flattening.items():
-        print(f"  {name}: smoothing range {float(info['range_db']):.1f} dB, reference {float(info['reference_db']):.1f} dBFS", flush=True)
+    print("RENDER ANALYSIS CACHE: using frozen per-song snapshot; no source analysis", flush=True)
     scan_seconds = time.perf_counter() - scan_t0
     loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
     activity_decisions: dict[str, tuple[bool, str]] = {
@@ -5771,8 +5801,6 @@ def render_segment(
     if not active_energies:
         raise RuntimeError(f"No musically active stems in segment {index:02d}")
     median_energy = np.median(active_energies)
-    drum_bpm, drum_bpm_confidence = estimate_segment_drum_bpm(stems, segment, sr)
-    mix_controls = analyze_song_mix_controls(stems, segment, sr, rms_values_db, role_norms_db)
     effective_roles = mix_controls["effective_roles"]
     rhythm_controls = mix_controls["rhythm"]
     harmonic_controls = mix_controls["harmonic"]
