@@ -513,6 +513,21 @@ async function flushOverrideSaveVisible(songIndex, reason) {
   }
 }
 
+async function waitForOverrideWrites() {
+  while (overrideWritesInFlight > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+async function prepareOverridesForRender() {
+  // A render must not create a new override revision merely because the
+  // render button was pressed. Only genuine pending edits may invalidate the
+  // frozen DSP plan; those edits are persisted and analyzed explicitly here.
+  await waitForOverrideWrites();
+  if (!pendingOverrideSongs.size) return;
+  await postOverrides("render-preflight");
+}
+
 function currentOverrideSnapshot(songIndex) {
   return JSON.parse(JSON.stringify(livePreviewOverrides[String(songIndex)] || songOverrides(songIndex)));
 }
@@ -2572,10 +2587,17 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     if (useBatchMaster) {
       const batchMaster = $("#batchMaster")?.value || "natural";
       songs.forEach((songId) => {
-        songOverrides(songId).mastering_intensity = batchMaster;
-        songOverrides(songId).target_lufs = batchMaster === "loud" ? -9.5 : -14;
+        const nextTarget = batchMaster === "loud" ? -9.5 : -14;
+        const current = songOverrides(songId);
+        const changed = current.mastering_intensity !== batchMaster || Number(current.target_lufs) !== nextTarget;
+        current.mastering_intensity = batchMaster;
+        current.target_lufs = nextTarget;
         livePreviewSongOverrides(songId).mastering_intensity = batchMaster;
-        livePreviewSongOverrides(songId).target_lufs = batchMaster === "loud" ? -9.5 : -14;
+        livePreviewSongOverrides(songId).target_lufs = nextTarget;
+        if (changed) {
+          markOverrideSequence(songId);
+          pendingOverrideReasons.add("batch-master");
+        }
       });
     }
     const singleSong = songs.length === 1 ? songs[0] : null;
@@ -2586,7 +2608,7 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     const renderTargetDir = await chooseRenderFolder();
     if (renderTargetDir === false) return;
     console.info("RENDER DESTINATION request_target", renderTargetDir);
-    await saveOverrides({ songIndexes: songs, reason: "before-render" });
+    await prepareOverridesForRender();
     const overridesSnapshot = cloneOverridesPayload();
     const url = singleSong != null ? `/api/render/${singleSong}` : "/api/render";
     const body = singleSong != null
