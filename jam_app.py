@@ -422,6 +422,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         role_norm_db = role_norms_db.get(mix_role)
         computed_gain_before_lift_db = pipeline.automatic_makeup_gain_db(raw_rms_db, mix_role, include_vocal_mic_lift=False, role_norm_db=role_norm_db)
         computed_gain_db = pipeline.automatic_makeup_gain_db(raw_rms_db, mix_role, role_norm_db=role_norm_db) + rhythm_adjustment_db + priority_adjustment_db
+        computed_gain_db = min(computed_gain_db, pipeline.AUTO_MIX_MAX_BOOST_DB)
         lead_bonus = 1.5 if energies.get(stem.path.name, 0.0) > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
         if "makeup_gain_db" not in stem_ov and "gain_db" in stem_ov:
             stem_ov["makeup_gain_db"] = float(stem_ov.get("gain_db", computed_gain_db) or 0.0)
@@ -1645,7 +1646,7 @@ def apply_overrides_for_song(
     use_saved_mixes: bool = True,
     overrides_snapshot: dict[str, Any] | None = None,
 ) -> None:
-    canonical_mix_params_for_song(segment_id)
+    prepared_mix = canonical_mix_params_for_song(segment_id)
     disk_payload = overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}})
     write_trace = disk_payload.get("_write_trace", {}) if isinstance(disk_payload, dict) else {}
     overrides = normalize_overrides(disk_payload)
@@ -1669,6 +1670,12 @@ def apply_overrides_for_song(
         for stem_name, settings in stems.items():
             if not isinstance(settings, dict):
                 continue
+            prepared_stem = (prepared_mix.get("stems", {}) or {}).get(stem_name, {})
+            if isinstance(prepared_stem, dict) and not bool(settings.get("manual_makeup_gain_db", False)):
+                prepared_gain = prepared_stem.get("makeup_gain_db")
+                if prepared_gain is not None:
+                    settings["auto_mix_gain_db"] = float(prepared_gain)
+                    settings["makeup_gain_db"] = float(prepared_gain)
             worker_read = override_value_snapshot(settings)
             file_write = (
                 override_value_snapshot(write_song_trace.get(stem_name, {}))

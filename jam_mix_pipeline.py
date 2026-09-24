@@ -147,6 +147,9 @@ STEM_ACTIVITY_ROLE_OVERRIDES = {
 }
 MAX_TRACK_MAKEUP_GAIN_DB = 30.0
 MAX_DRUM_MAKEUP_GAIN_DB = 36.0
+# Automatic mixing establishes relative balance only. It may attenuate a
+# stem, but it must never boost a source without an explicit user value.
+AUTO_MIX_MAX_BOOST_DB = 0.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
 # a capture-role lift rather than a vocal-content detector.
@@ -5790,7 +5793,12 @@ def render_segment(
             gain_level_db = vocal_gain_reference_db(raw_rms_db, segment_envelopes.get(stem.path.name)) if mix_role == "vocal" else raw_rms_db
             computed_makeup_gain_before_lift_db = automatic_makeup_gain_db(gain_level_db, mix_role, include_vocal_mic_lift=False, role_norm_db=role_norm_db)
             computed_makeup_gain_db = automatic_makeup_gain_db(gain_level_db, mix_role, role_norm_db=role_norm_db) + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db
-            makeup_gain_db = override_float(overrides.get("makeup_gain_db"), computed_makeup_gain_db) if override_bool(overrides.get("manual_makeup_gain_db"), False) else computed_makeup_gain_db
+            computed_makeup_gain_db = min(computed_makeup_gain_db, AUTO_MIX_MAX_BOOST_DB)
+            if override_bool(overrides.get("manual_makeup_gain_db"), False):
+                makeup_gain_db = override_float(overrides.get("makeup_gain_db"), 0.0)
+            else:
+                makeup_gain_db = override_float(overrides.get("auto_mix_gain_db", overrides.get("makeup_gain_db")), computed_makeup_gain_db)
+                makeup_gain_db = min(makeup_gain_db, AUTO_MIX_MAX_BOOST_DB)
             user_gain_db = override_float(overrides.get("gain_db"), 0.0)
             eq_settings = {
                 "eq_low_cut_hz": override_float(overrides.get("eq_low_cut_hz"), eq_defaults["eq_low_cut_hz"]),
@@ -5865,11 +5873,16 @@ def render_segment(
         gain_level_db = vocal_gain_reference_db(raw_rms_db, segment_envelopes.get(stem.path.name)) if mix_role == "vocal" else raw_rms_db
         computed_makeup_gain_before_lift_db = automatic_makeup_gain_db(gain_level_db, mix_role, include_vocal_mic_lift=False, role_norm_db=role_norm_db)
         computed_makeup_gain_db = automatic_makeup_gain_db(gain_level_db, mix_role, role_norm_db=role_norm_db) + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db
+        computed_makeup_gain_db = min(computed_makeup_gain_db, AUTO_MIX_MAX_BOOST_DB)
         if not override_bool(overrides.get("manual_makeup_gain_db"), False):
             computed_makeup_gain_db = automatic_drum_peak_guard_gain_db(
                 mix_role, computed_makeup_gain_db, segment_peaks_db.get(stem.path.name, -120.0)
             )
-        makeup_gain_db = override_float(overrides.get("makeup_gain_db"), computed_makeup_gain_db) if override_bool(overrides.get("manual_makeup_gain_db"), False) else computed_makeup_gain_db
+        if override_bool(overrides.get("manual_makeup_gain_db"), False):
+            makeup_gain_db = override_float(overrides.get("makeup_gain_db"), 0.0)
+        else:
+            makeup_gain_db = override_float(overrides.get("auto_mix_gain_db", overrides.get("makeup_gain_db")), computed_makeup_gain_db)
+            makeup_gain_db = min(makeup_gain_db, AUTO_MIX_MAX_BOOST_DB)
         user_gain_db = override_float(overrides.get("gain_db"), 0.0)
         lead_bonus = 1.5 if energies[stem.path.name] > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
         fader_gain_db = override_float(overrides.get("fader_db"), 0.0)

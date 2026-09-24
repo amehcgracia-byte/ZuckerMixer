@@ -9,6 +9,21 @@ ROOT = Path(__file__).resolve().parent
 
 
 class RenderLifecycleTest(unittest.TestCase):
+    def test_canonical_identity_and_original_controls_are_preserved(self):
+        html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        build = (ROOT / "build_app.sh").read_text(encoding="utf-8")
+        spec = (ROOT / "zucker_mixer.spec").read_text(encoding="utf-8")
+        self.assertIn('APP_NAME="ZuckerMixer"', build)
+        self.assertIn('name="ZuckerMixer.app"', spec)
+        self.assertIn("<title>ZuckerMixer</title>", html)
+        for label in ("Mix this one", "Mix selected", "Mix everything", "Fine-tune", "Mix with these settings"):
+            self.assertIn(label, html + (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
+
+    def test_automatic_gain_is_explicit_and_capped(self):
+        source = (ROOT / "jam_mix_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn("AUTO_MIX_MAX_BOOST_DB = 0.0", source)
+        self.assertIn('overrides.get("auto_mix_gain_db", overrides.get("makeup_gain_db"))', source)
+
     def test_frontend_has_one_guarded_render_path_and_snapshot(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertEqual(source.count("async function mixSongs("), 1)

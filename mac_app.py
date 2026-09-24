@@ -109,7 +109,7 @@ def main() -> None:
         raise SystemExit(jam_app.run_child_job(Path(sys.argv[2])))
     url, _server = jam_app.start_server()
     window = webview.create_window(
-        "Momo García Mixer",
+        "ZuckerMixer",
         url,
         width=1200,
         height=800,
@@ -122,7 +122,7 @@ def main() -> None:
         if not pipeline.resolve_ffmpeg():
             window.create_confirmation_dialog(
                 "ffmpeg is missing",
-                "Momo García Mixer needs ffmpeg to create MP3 files.\n\nInstall it in Terminal with:\n\nbrew install ffmpeg",
+                "ZuckerMixer needs ffmpeg to create MP3 files.\n\nInstall it in Terminal with:\n\nbrew install ffmpeg",
             )
 
     def on_closing() -> None:

@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-APP_NAME="Momo García Mixer"
-APP_VERSION="2.0.17"
+APP_NAME="ZuckerMixer"
+APP_VERSION="2.0.18"
 APP_BUNDLE="$ROOT/dist/${APP_NAME}.app"
 DMG_ROOT="$ROOT/dist/dmg_root"
 DMG_PATH="$ROOT/dist/${APP_NAME}.dmg"
@@ -30,7 +30,7 @@ if [[ "$#" -ne 0 ]]; then
   die "Unknown argument. Use --dmg-only to reuse the existing app bundle."
 fi
 
-echo "== Momo García Mixer macOS build =="
+echo "== ZuckerMixer macOS build =="
 
 if [[ "$DMG_ONLY" -eq 1 ]]; then
   SKIP_APP_BUILD=1
@@ -238,10 +238,10 @@ try:
     text_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 18)
 except Exception:
     title_font = text_font = None
-draw.text((190, 55), "Momo García Mixer", fill="#f4ead7", font=title_font)
+draw.text((190, 55), "ZuckerMixer", fill="#f4ead7", font=title_font)
 lines = [
     "Drag the app to Applications.",
-    "First launch: right-click Momo García Mixer.app, then Open.",
+    "First launch: right-click ZuckerMixer.app, then Open.",
     "If MP3 mixing says ffmpeg is missing:",
     "brew install ffmpeg",
 ]
@@ -313,4 +313,4 @@ echo "  App bundle (project): $APP_BUNDLE"
 echo "  App copy: $APP_BUNDLE"
 echo "  DMG: $DMG_PATH"
 echo
-echo "Unsigned app note: on first launch, right-click Momo García Mixer.app and choose Open."
+echo "Unsigned app note: on first launch, right-click ZuckerMixer.app and choose Open."

@@ -39,6 +39,11 @@ class MixInvariantTest(unittest.TestCase):
         result = pipeline.apply_spoken_number_structure(segments, [], 120.0, stems=stems, timelines=timelines)
         self.assertEqual([s.assigned_song_number for s in result], [1])
 
+    def test_auto_mix_never_boosts_without_explicit_user_control(self):
+        requested = pipeline.automatic_makeup_gain_db(-48.0, "keys")
+        self.assertLessEqual(min(requested, pipeline.AUTO_MIX_MAX_BOOST_DB), 0.0)
+        self.assertEqual(pipeline.AUTO_MIX_MAX_BOOST_DB, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
