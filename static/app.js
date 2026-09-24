@@ -11,6 +11,8 @@ const previewNodeIds = new WeakMap();
 let overrideWriteSeq = 1;
 let overrideSaveTimer = null;
 let overrideWritesInFlight = 0;
+let renderInProgress = false;
+let activeRenderJobId = null;
 const pendingOverrideSongs = new Set();
 const pendingOverrideReasons = new Set();
 const activeStemLoadPromises = {};
@@ -40,8 +42,9 @@ function renderBuildInfo() {
   const build = appState?.build || {};
   const timestamp = build.build_timestamp || "development build";
   const revision = build.source_revision || "unbuilt";
+  const version = build.app_version || "development";
   const node = $("#buildInfo");
-  if (node) node.textContent = `${timestamp} · ${revision}`;
+  if (node) node.textContent = `${version} · ${revision} · ${timestamp}`;
 }
 
 const names = {
@@ -490,6 +493,16 @@ async function flushOverrideSave(songIndex, reason) {
   return postOverrides(`flush:${reason}`);
 }
 
+async function flushOverrideSaveVisible(songIndex, reason) {
+  try {
+    return await flushOverrideSave(songIndex, reason);
+  } catch (error) {
+    console.error("[mix-preview override save failed]", { songIndex, reason, error });
+    showToast(`Could not save settings: ${error.message || error}`);
+    throw error;
+  }
+}
+
 function currentOverrideSnapshot(songIndex) {
   return JSON.parse(JSON.stringify(livePreviewOverrides[String(songIndex)] || songOverrides(songIndex)));
 }
@@ -760,7 +773,7 @@ function renderSongs() {
       else checkedSongs.delete(song.id);
       updateSelectedButton();
     });
-    card.querySelector("[data-mix-one]").addEventListener("click", () => mixSongs([song.id]));
+    card.querySelector("[data-mix-one]").addEventListener("click", () => mixSongs([song.id]).catch((error) => showToast(`Render failed: ${error.message || error}`)));
     card.querySelector("[data-reset-auto]").addEventListener("click", () => resetSongToAutomatic(song.id));
     card.querySelector("[data-skip]").addEventListener("change", (event) => setSkipped(song.id, event.target.checked));
     card.querySelector("[data-name-input]").addEventListener("change", (event) => saveSongName(song.id, event.target.value));
@@ -941,7 +954,7 @@ function renderFaders(root, songIndex) {
       linked.forEach((item) => applyLivePreGain(songIndex, item, liveGainDb, "gain:direct-input"));
       persistPreviewChange(songIndex, `gain:${stem.file}`);
     });
-    gainSlider.addEventListener("change", () => flushOverrideSave(songIndex, `gain:${stem.file}`));
+    gainSlider.addEventListener("change", () => flushOverrideSaveVisible(songIndex, `gain:${stem.file}`).catch(() => {}));
     slider.addEventListener("input", () => {
       const mix = previewMixFor(songIndex);
       const liveNode = faderGainNode(mix, stem.file);
@@ -982,7 +995,7 @@ function renderFaders(root, songIndex) {
         faderGainNodeId: previewNodeId(liveNode),
         currentAudioParamValue: liveNode?.gain ? liveNode.gain.value : null,
       });
-      flushOverrideSave(songIndex, `fader:${stem.file}`);
+      flushOverrideSaveVisible(songIndex, `fader:${stem.file}`).catch(() => {});
     });
     const panSlider = strip.querySelector("[data-pan]");
     const panLabel = strip.querySelector(".pan-control span");
@@ -995,7 +1008,7 @@ function renderFaders(root, songIndex) {
         updatePreviewPan(songIndex, stem.file);
         persistPreviewChange(songIndex, `pan:${stem.file}`);
       });
-      panSlider.addEventListener("change", () => flushOverrideSave(songIndex, `pan:${stem.file}`));
+      panSlider.addEventListener("change", () => flushOverrideSaveVisible(songIndex, `pan:${stem.file}`).catch(() => {}));
     }
     strip.querySelectorAll("[data-eq]").forEach((eqSlider) => {
       const key = eqSlider.dataset.eq;
@@ -1007,21 +1020,21 @@ function renderFaders(root, songIndex) {
         updatePreviewEq(songIndex, stem.file, key);
         persistPreviewChange(songIndex, `${key}:${stem.file}`);
       });
-      eqSlider.addEventListener("change", () => flushOverrideSave(songIndex, `${key}:${stem.file}`));
+      eqSlider.addEventListener("change", () => flushOverrideSaveVisible(songIndex, `${key}:${stem.file}`).catch(() => {}));
     });
     strip.querySelector("[data-mute]").addEventListener("click", async (event) => {
       ov.mute = !ov.mute;
       setLinkedOverride(songIndex, linked, "mute", ov.mute);
       event.currentTarget.classList.toggle("active", ov.mute);
       linked.forEach((item) => updatePreviewGains(songIndex, item.file, "mute"));
-      await flushOverrideSave(songIndex, `mute:${stem.file}`);
+      await flushOverrideSaveVisible(songIndex, `mute:${stem.file}`);
     });
     strip.querySelector("[data-solo]").addEventListener("click", async (event) => {
       ov.solo = !ov.solo;
       setLinkedOverride(songIndex, linked, "solo", ov.solo);
       event.currentTarget.classList.toggle("active", ov.solo);
       linked.forEach((item) => updatePreviewGains(songIndex, item.file, "solo"));
-      await flushOverrideSave(songIndex, `solo:${stem.file}`);
+      await flushOverrideSaveVisible(songIndex, `solo:${stem.file}`);
     });
     strip.querySelector("[data-fx-toggle]").addEventListener("click", async (event) => {
       ov.fx_enabled = !(ov.fx_enabled === true);
@@ -1030,7 +1043,7 @@ function renderFaders(root, songIndex) {
       event.currentTarget.textContent = ov.fx_enabled ? "FX ON" : "FX OFF";
       linked.forEach((item) => reconnectPreviewStemFx(previewMixFor(songIndex), songIndex, item, ov.fx_enabled));
       persistPreviewChange(songIndex, `fx:${stem.file}`);
-      await flushOverrideSave(songIndex, `fx:${stem.file}`);
+      await flushOverrideSaveVisible(songIndex, `fx:${stem.file}`);
       logPreviewGraphIntegrity(songIndex, "fx-toggle");
     });
     strip.querySelectorAll("[data-effect]").forEach((button) => {
@@ -1046,7 +1059,7 @@ function renderFaders(root, songIndex) {
         if (key === "space_enabled" || key === "echo_enabled") updatePreviewSends(songIndex, key);
         if (key === "gate_enabled") linked.forEach((item) => reconnectPreviewStemFx(previewMixFor(songIndex), songIndex, item, previewFxEnabled(songIndex, item)));
         persistPreviewChange(songIndex, `${key}:${stem.file}`);
-        await flushOverrideSave(songIndex, `${key}:${stem.file}`);
+        await flushOverrideSaveVisible(songIndex, `${key}:${stem.file}`);
         logPreviewGraphIntegrity(songIndex, `${key}:${stem.file}`);
       });
     });
@@ -1069,7 +1082,7 @@ function wireFineTuneControls(root, songIndex) {
       updatePreviewSends(songIndex, key);
       persistPreviewChange(songIndex, key);
     });
-    input.addEventListener("change", () => flushOverrideSave(songIndex, key));
+    input.addEventListener("change", () => flushOverrideSaveVisible(songIndex, key).catch(() => {}));
   });
 
   root.querySelectorAll("[data-song]").forEach((input) => {
@@ -1084,7 +1097,7 @@ function wireFineTuneControls(root, songIndex) {
       updatePreviewBusGains(songIndex, key);
       persistPreviewChange(songIndex, key);
     });
-    input.addEventListener("change", () => flushOverrideSave(songIndex, key));
+    input.addEventListener("change", () => flushOverrideSaveVisible(songIndex, key).catch(() => {}));
   });
 
   const mastering = root.querySelector(`[data-mastering="${songIndex}"]`);
@@ -1101,11 +1114,11 @@ function wireFineTuneControls(root, songIndex) {
         loudness.nextElementSibling.textContent = loudnessText(loudness.value);
       }
       updatePreviewBusGains(songIndex, "target_lufs");
-      await flushOverrideSave(songIndex, "mastering_intensity");
+      await flushOverrideSaveVisible(songIndex, "mastering_intensity");
     });
   }
 
-  root.querySelector("[data-mix-settings]").addEventListener("click", () => mixSongs([songIndex], false, false));
+  root.querySelector("[data-mix-settings]").addEventListener("click", () => mixSongs([songIndex], false, false).catch((error) => showToast(`Render failed: ${error.message || error}`)));
   const renderPreviewButton = root.querySelector(`[data-preview-render="${songIndex}"]`);
   const quickControls = root.querySelector(`[data-quick-controls="${songIndex}"]`);
   const realControls = root.querySelector(`[data-real-controls="${songIndex}"]`);
@@ -2392,6 +2405,46 @@ async function chooseRenderFolder() {
   return result.folder;
 }
 
+function setRenderControlsBusy(busy, detail = "") {
+  renderInProgress = Boolean(busy);
+  const selectors = [
+    "#mixSelected",
+    "#mixAll",
+    "[data-mix-one]",
+    "[data-mix-settings]",
+  ];
+  document.querySelectorAll(selectors.join(",")).forEach((button) => {
+    if (busy) {
+      if (!button.dataset.renderWasDisabled) button.dataset.renderWasDisabled = button.disabled ? "1" : "0";
+      button.disabled = true;
+      if (button.matches("#mixSelected, #mixAll, [data-mix-settings]")) button.dataset.renderOriginalText ||= button.textContent;
+      if (button.matches("#mixSelected, #mixAll, [data-mix-settings]")) button.textContent = detail || "Mixing…";
+    } else {
+      const wasDisabled = button.dataset.renderWasDisabled === "1";
+      button.disabled = wasDisabled || (button.id === "mixSelected" && checkedSongs.size === 0);
+      if (button.dataset.renderOriginalText) button.textContent = button.dataset.renderOriginalText;
+      delete button.dataset.renderWasDisabled;
+      delete button.dataset.renderOriginalText;
+    }
+  });
+  const status = document.querySelector("#currentWork");
+  if (status && busy) status.textContent = detail || "Preparing render…";
+}
+
+async function waitForRenderJob(jobId) {
+  const deadline = Date.now() + 2 * 60 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const jobs = await pollJobs();
+    const job = jobs.find((item) => String(item.id) === String(jobId));
+    if (job && ["done", "error", "cancelled"].includes(job.status)) {
+      if (job.status !== "done") throw new Error(job.error || `Render ${job.status}`);
+      return job;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 800));
+  }
+  throw new Error(`Render job ${jobId} timed out after 2 hours.`);
+}
+
 async function ensureMixParamsForSong(songId) {
   const song = appState.songs.find((item) => Number(item.id) === Number(songId));
   if (song?.active_stems?.length && song?.mix_params?.stems) return;
@@ -2409,44 +2462,56 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     showToast("Choose at least one song.");
     return;
   }
-  const useSavedMixes = isBatchAction ? await chooseMixSource() : true;
-  if (useSavedMixes == null) return;
-  if (useBatchMaster) {
-    const batchMaster = $("#batchMaster")?.value || "natural";
-    songs.forEach((songId) => {
-      songOverrides(songId).mastering_intensity = batchMaster;
-      songOverrides(songId).target_lufs = batchMaster === "loud" ? -9.5 : -14;
-    });
-  }
-  const singleSong = songs.length === 1 ? songs[0] : null;
-  if (singleSong != null) {
-    try {
-      await ensureMixParamsForSong(singleSong);
-    } catch (_err) {
-      showToast("Could not load mix parameters for this song.");
-      return;
-    }
-  }
-  const previewEffectiveMix = singleSong != null ? effectiveMixDump(singleSong, "before-render-click") : null;
-  const renderTargetDir = await chooseRenderFolder();
-  if (renderTargetDir === false) return;
-  console.info("RENDER DESTINATION request_target", renderTargetDir);
-  await saveOverrides({ songIndexes: songs, reason: "before-render" });
-  const url = singleSong != null ? `/api/render/${singleSong}` : "/api/render";
-  const body = singleSong != null
-    ? { render_target_dir: renderTargetDir || undefined, render_destination_trace: { save_dialog_return: renderTargetDir }, use_saved_mixes: useSavedMixes, preview_effective_mix: previewEffectiveMix }
-    : { songs, render_target_dir: renderTargetDir || undefined, render_destination_trace: { save_dialog_return: renderTargetDir }, use_saved_mixes: useSavedMixes };
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    showToast(data.error || "Choose at least one song.");
+  if (renderInProgress) {
+    showToast(activeRenderJobId ? `Render already in progress (${activeRenderJobId}).` : "Render already in progress.");
     return;
   }
-  await pollJobs();
+  setRenderControlsBusy(true, "Preparing render…");
+  let jobId = null;
+  try {
+    const useSavedMixes = isBatchAction ? await chooseMixSource() : true;
+    if (useSavedMixes == null) return;
+    if (useBatchMaster) {
+      const batchMaster = $("#batchMaster")?.value || "natural";
+      songs.forEach((songId) => {
+        songOverrides(songId).mastering_intensity = batchMaster;
+        songOverrides(songId).target_lufs = batchMaster === "loud" ? -9.5 : -14;
+        livePreviewSongOverrides(songId).mastering_intensity = batchMaster;
+        livePreviewSongOverrides(songId).target_lufs = batchMaster === "loud" ? -9.5 : -14;
+      });
+    }
+    const singleSong = songs.length === 1 ? songs[0] : null;
+    if (singleSong != null) await ensureMixParamsForSong(singleSong);
+    const previewEffectiveMix = singleSong != null ? effectiveMixDump(singleSong, "before-render-click") : null;
+    const renderTargetDir = await chooseRenderFolder();
+    if (renderTargetDir === false) return;
+    console.info("RENDER DESTINATION request_target", renderTargetDir);
+    await saveOverrides({ songIndexes: songs, reason: "before-render" });
+    const overridesSnapshot = cloneOverridesPayload();
+    const url = singleSong != null ? `/api/render/${singleSong}` : "/api/render";
+    const body = singleSong != null
+      ? { render_target_dir: renderTargetDir || undefined, render_destination_trace: { save_dialog_return: renderTargetDir }, use_saved_mixes: useSavedMixes, preview_effective_mix: previewEffectiveMix, overrides_snapshot: overridesSnapshot }
+      : { songs, render_target_dir: renderTargetDir || undefined, render_destination_trace: { save_dialog_return: renderTargetDir }, use_saved_mixes: useSavedMixes, overrides_snapshot: overridesSnapshot };
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Could not create render job.");
+    if (!data.id) throw new Error("Render request returned no job id.");
+    jobId = data.id;
+    activeRenderJobId = jobId;
+    setRenderControlsBusy(true, `Rendering ${jobId}…`);
+    await waitForRenderJob(jobId);
+  } catch (error) {
+    console.error("[render] failed", error);
+    showToast(`Render failed: ${error.message || error}`);
+  } finally {
+    activeRenderJobId = null;
+    setRenderControlsBusy(false);
+    await pollJobs().catch(() => {});
+  }
 }
 
 function mixEverything() {
@@ -2487,6 +2552,11 @@ function renderJobs(items) {
   // was reporting real progress.
   const active = [...items].reverse().find((job) => ["running", "stopping"].includes(job.status))
     || [...items].reverse().find((job) => job.status === "queued");
+  const activeRender = active && ["render", "mix"].includes(active.kind) ? active : null;
+  if (!renderInProgress && activeRender) {
+    activeRenderJobId = activeRender.id;
+    setRenderControlsBusy(true, `Rendering ${activeRender.id}…`);
+  }
   const redetectButton = $("#redetectSongs");
   if (redetectButton) {
     redetectButton.disabled = items.some((job) => job.kind === "redetect" && ["queued", "running", "stopping"].includes(job.status));
@@ -2649,8 +2719,8 @@ async function pollingLoop() {
 }
 
 if (typeof document !== "undefined") {
-  $("#mixSelected").addEventListener("click", () => mixSongs([...checkedSongs], true, true));
-  $("#mixAll").addEventListener("click", mixEverything);
+  $("#mixSelected").addEventListener("click", () => mixSongs([...checkedSongs], true, true).catch((error) => showToast(`Render failed: ${error.message || error}`)));
+  $("#mixAll").addEventListener("click", () => mixEverything());
   $("#cancelJob").addEventListener("click", () => {
     if (!window.confirm("Are you sure you want to cancel?")) return;
     fetch("/api/cancel", { method: "POST" }).then(pollJobs);

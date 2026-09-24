@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-APP_NAME="Zucker Mixer"
+APP_NAME="Momo García Mixer"
+APP_VERSION="2.0.16"
 APP_BUNDLE="$ROOT/dist/${APP_NAME}.app"
 DMG_ROOT="$ROOT/dist/dmg_root"
 DMG_PATH="$ROOT/dist/${APP_NAME}.dmg"
@@ -29,7 +30,7 @@ if [[ "$#" -ne 0 ]]; then
   die "Unknown argument. Use --dmg-only to reuse the existing app bundle."
 fi
 
-echo "== Zucker Mixer macOS build =="
+echo "== Momo García Mixer macOS build =="
 
 if [[ "$DMG_ONLY" -eq 1 ]]; then
   SKIP_APP_BUILD=1
@@ -147,7 +148,7 @@ EOF
   BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   SOURCE_REVISION="nogit"
   if git rev-parse --show-toplevel >/dev/null 2>&1; then
-    SOURCE_REVISION="$(git rev-parse --short HEAD)"
+    SOURCE_REVISION="$(git rev-parse HEAD)"
     if ! git diff --quiet -- . ':!build' ':!dist'; then
       SOURCE_REVISION+="-dirty"
     fi
@@ -174,6 +175,9 @@ print("source-" + digest.hexdigest()[:12])
 PY
     )"
   fi
+  export ZUCKER_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
+  export ZUCKER_SOURCE_REVISION="$SOURCE_REVISION"
+  export ZUCKER_APP_VERSION="$APP_VERSION"
   "$BUILD_PY" - "$BUILD_TIMESTAMP" "$SOURCE_REVISION" "$BUILD_METADATA" <<'PY'
 import json
 import sys
@@ -185,6 +189,7 @@ path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(
     json.dumps(
         {
+            "app_version": os.environ.get("ZUCKER_APP_VERSION", "development"),
             "build_timestamp": timestamp,
             "source_revision": revision,
         },
@@ -195,8 +200,6 @@ path.write_text(
     encoding="utf-8",
 )
 PY
-  export ZUCKER_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
-  export ZUCKER_SOURCE_REVISION="$SOURCE_REVISION"
   echo "Build metadata: timestamp=$BUILD_TIMESTAMP revision=$SOURCE_REVISION"
 
   rm -rf "$ICONSET"
@@ -234,10 +237,10 @@ try:
     text_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 18)
 except Exception:
     title_font = text_font = None
-draw.text((190, 55), "Zucker Mixer", fill="#f4ead7", font=title_font)
+draw.text((190, 55), "Momo García Mixer", fill="#f4ead7", font=title_font)
 lines = [
     "Drag the app to Applications.",
-    "First launch: right-click Zucker Mixer.app, then Open.",
+    "First launch: right-click Momo García Mixer.app, then Open.",
     "If MP3 mixing says ffmpeg is missing:",
     "brew install ffmpeg",
 ]
@@ -309,4 +312,4 @@ echo "  App bundle (project): $APP_BUNDLE"
 echo "  App copy: $APP_BUNDLE"
 echo "  DMG: $DMG_PATH"
 echo
-echo "Unsigned app note: on first launch, right-click Zucker Mixer.app and choose Open."
+echo "Unsigned app note: on first launch, right-click Momo García Mixer.app and choose Open."

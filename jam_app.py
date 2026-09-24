@@ -280,6 +280,7 @@ def load_build_metadata() -> dict[str, str]:
     if not isinstance(payload, dict):
         payload = {}
     return {
+        "app_version": str(payload.get("app_version") or "development"),
         "build_timestamp": str(payload.get("build_timestamp") or "development build"),
         "source_revision": str(payload.get("source_revision") or "unbuilt"),
     }
@@ -1456,6 +1457,27 @@ def enqueue(
 ) -> dict[str, Any]:
     if not ffmpeg_status()["ok"]:
         raise RuntimeError("ffmpeg is missing. Install it with: brew install ffmpeg")
+    with state_lock:
+        for existing in jobs:
+            if existing.get("kind") not in {"render", "mix"}:
+                continue
+            if existing.get("status") not in {"queued", "running", "stopping"}:
+                continue
+            existing_id = str(existing.get("id"))
+            if existing.get("status") == "running":
+                child = child_processes.get(existing_id)
+                heartbeat = float(existing.get("heartbeat") or existing.get("started") or existing.get("created") or 0)
+                if child is None and heartbeat and time.time() - heartbeat > ORPHANED_ACTIVE_JOB_SECONDS:
+                    set_job(
+                        existing,
+                        status="error",
+                        error="Render job was orphaned before a worker remained attached.",
+                        current_stage="error",
+                        stage_detail="orphaned render recovered",
+                        finished_at=time.time(),
+                    )
+                    continue
+            raise RuntimeError(f"Render already in progress ({existing_id}). Finish or cancel it before starting another render.")
     job_id = f"{int(time.time())}-{len(jobs) + 1}"
     job = {
         "id": job_id,
@@ -1617,9 +1639,14 @@ def parse_split_offset_seconds(value: Any) -> float | None:
         return None
 
 
-def apply_overrides_for_song(segment_id: int, render_index: int, use_saved_mixes: bool = True) -> None:
+def apply_overrides_for_song(
+    segment_id: int,
+    render_index: int,
+    use_saved_mixes: bool = True,
+    overrides_snapshot: dict[str, Any] | None = None,
+) -> None:
     canonical_mix_params_for_song(segment_id)
-    disk_payload = load_json(OVERRIDES_PATH, {"songs": {}})
+    disk_payload = overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}})
     write_trace = disk_payload.get("_write_trace", {}) if isinstance(disk_payload, dict) else {}
     overrides = normalize_overrides(disk_payload)
     source_song = overrides.get("songs", {}).get(str(segment_id), {}) if use_saved_mixes else {}
@@ -1744,7 +1771,7 @@ def normalize_overrides(payload: Any) -> dict[str, Any]:
                             clean_stem[key] = float(stem_payload[key])
                         except (TypeError, ValueError):
                             continue
-                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled"):
+                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "manual_makeup_gain_db"):
                     if isinstance(stem_payload.get(key), bool):
                         clean_stem[key] = stem_payload[key]
                 if clean_stem:
@@ -1971,7 +1998,12 @@ def _run_child_job(job_path: Path) -> int:
         append_log(job_id, "RENDER DESTINATION worker_temp_file=" + str(render_tmp_path))
         append_log(job_id, "RENDER DESTINATION worker_target=" + render_target_dir)
         try:
-            apply_overrides_for_song(segment_id, render_index, bool(payload.get("use_saved_mixes", True)))
+            apply_overrides_for_song(
+                segment_id,
+                render_index,
+                bool(payload.get("use_saved_mixes", True)),
+                payload.get("overrides_snapshot") if isinstance(payload.get("overrides_snapshot"), dict) else None,
+            )
             row = pipeline.render_segment(
                 state["stems"],
                 state["segments"][segment_id - 1],
@@ -2369,6 +2401,8 @@ def api_render_song(song_index: int) -> Response:
         trace = payload.get("render_destination_trace") if isinstance(payload.get("render_destination_trace"), dict) else None
         extra = {"render_destination_trace_request": trace} if trace else {}
         extra["use_saved_mixes"] = bool(payload.get("use_saved_mixes", True))
+        if isinstance(payload.get("overrides_snapshot"), dict):
+            extra["overrides_snapshot"] = normalize_overrides(payload["overrides_snapshot"])
         return jsonify(enqueue("render", [song_index], render_target=render_target, preview_effective_mix=preview_effective_mix, extra=extra))
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -2468,6 +2502,8 @@ def api_render_many() -> Response:
         trace = payload.get("render_destination_trace") if isinstance(payload.get("render_destination_trace"), dict) else None
         extra = {"render_destination_trace_request": trace} if trace else {}
         extra["use_saved_mixes"] = bool(payload.get("use_saved_mixes", True))
+        if isinstance(payload.get("overrides_snapshot"), dict):
+            extra["overrides_snapshot"] = normalize_overrides(payload["overrides_snapshot"])
         return jsonify(enqueue("mix", sorted(set(songs)), render_target=str(render_target) if render_target else None, extra=extra))
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
