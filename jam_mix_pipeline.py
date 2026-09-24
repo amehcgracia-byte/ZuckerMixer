@@ -150,6 +150,11 @@ MAX_DRUM_MAKEUP_GAIN_DB = 36.0
 # Automatic mixing establishes relative balance only. It may attenuate a
 # stem, but it must never boost a source without an explicit user value.
 AUTO_MIX_MAX_BOOST_DB = 0.0
+# Auto-Mix may make a small, explicit correction only for roles where a quiet
+# capture would otherwise disappear. All other roles can only be attenuated
+# automatically. These limits are per song, never session-global.
+AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0}
+AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
 # a capture-role lift rather than a vocal-content detector.
@@ -4672,6 +4677,36 @@ def vocal_gain_reference_db(raw_rms_db: float, envelope: np.ndarray | None) -> f
     return float(amp_to_db(float(np.percentile(active, 75))))
 
 
+def active_level_db(raw_rms_db: float, envelope: np.ndarray | None) -> float:
+    """Robust musical level for one stem inside one song window.
+
+    The upper active-envelope percentile ignores long silence and isolated
+    transients while retaining the sustained playing level. The raw RMS is
+    retained separately for diagnostics and is only the fallback when the
+    envelope has insufficient evidence.
+    """
+    if envelope is None:
+        return float(raw_rms_db)
+    values = np.asarray(envelope, dtype=np.float64)
+    active = values[np.isfinite(values) & (values > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))]
+    if active.size < 4:
+        return float(raw_rms_db)
+    return float(amp_to_db(float(np.percentile(active, 75))))
+
+
+def per_song_auto_mix_gain_db(
+    role: str,
+    stem_active_level_db: float,
+    accompaniment_reference_db: float | None,
+) -> float:
+    """Calculate a bounded balance correction for one stem in one song."""
+    reference = float(accompaniment_reference_db) if accompaniment_reference_db is not None else TARGET_TRACK_RMS_DBFS
+    target = reference + (2.0 if role == "vocal" else 0.5 if role == "bass" else 0.0)
+    requested = target - float(stem_active_level_db)
+    upper = float(AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(role, AUTO_MIX_MAX_BOOST_DB))
+    return float(np.clip(requested, AUTO_MIX_MAX_ATTENUATION_DB, upper))
+
+
 
 
 def role_norms_from_detection_cache(stems: list[Stem]) -> dict[str, float]:
@@ -5743,6 +5778,16 @@ def render_segment(
     harmonic_controls = mix_controls["harmonic"]
     vocal_priority = mix_controls["vocal_priority"]
     mic_content = mix_controls["mic_content"]
+    active_levels_db = {
+        name: active_level_db(rms_values_db.get(name, -120.0), segment_envelopes.get(name))
+        for name in active_names
+    }
+    accompaniment_levels = [
+        active_levels_db[name]
+        for name in active_names
+        if effective_roles.get(name, "") not in {"vocal", "room"}
+    ]
+    accompaniment_reference_db = float(np.median(accompaniment_levels)) if accompaniment_levels else None
     print("SONG_CONTENT_ANALYSIS " + json.dumps({
         "song": index,
         "bpm": mix_controls["bpm"],
@@ -5790,15 +5835,18 @@ def render_segment(
             requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
             makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
             role_norm_db = role_norms_db.get(mix_role)
-            gain_level_db = vocal_gain_reference_db(raw_rms_db, segment_envelopes.get(stem.path.name)) if mix_role == "vocal" else raw_rms_db
-            computed_makeup_gain_before_lift_db = automatic_makeup_gain_db(gain_level_db, mix_role, include_vocal_mic_lift=False, role_norm_db=role_norm_db)
-            computed_makeup_gain_db = automatic_makeup_gain_db(gain_level_db, mix_role, role_norm_db=role_norm_db) + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db
-            computed_makeup_gain_db = min(computed_makeup_gain_db, AUTO_MIX_MAX_BOOST_DB)
+            gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
+            computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
+            computed_makeup_gain_db = float(np.clip(
+                computed_makeup_gain_before_lift_db + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db,
+                AUTO_MIX_MAX_ATTENUATION_DB,
+                AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
+            ))
             if override_bool(overrides.get("manual_makeup_gain_db"), False):
                 makeup_gain_db = override_float(overrides.get("makeup_gain_db"), 0.0)
             else:
                 makeup_gain_db = override_float(overrides.get("auto_mix_gain_db", overrides.get("makeup_gain_db")), computed_makeup_gain_db)
-                makeup_gain_db = min(makeup_gain_db, AUTO_MIX_MAX_BOOST_DB)
+                makeup_gain_db = min(makeup_gain_db, AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB))
             user_gain_db = override_float(overrides.get("gain_db"), 0.0)
             eq_settings = {
                 "eq_low_cut_hz": override_float(overrides.get("eq_low_cut_hz"), eq_defaults["eq_low_cut_hz"]),
@@ -5828,6 +5876,9 @@ def render_segment(
                     "harmonic_attenuation_db": harmonic_adjustment_db,
                     "vocal_priority_attenuation_db": priority_adjustment_db,
                     "rms_dbfs": raw_rms_db,
+                    "active_level_db": gain_level_db,
+                    "accompaniment_reference_db": accompaniment_reference_db,
+                    "automatic_gain_reason": "per-song active-envelope balance",
                     "dynamic_spread_db": dynamic_spread,
                     "base_level_db": base_level_db(stem.role),
                     "lead_bonus_db": 0.0,
@@ -5870,10 +5921,13 @@ def render_segment(
         requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
         makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
         role_norm_db = role_norms_db.get(mix_role)
-        gain_level_db = vocal_gain_reference_db(raw_rms_db, segment_envelopes.get(stem.path.name)) if mix_role == "vocal" else raw_rms_db
-        computed_makeup_gain_before_lift_db = automatic_makeup_gain_db(gain_level_db, mix_role, include_vocal_mic_lift=False, role_norm_db=role_norm_db)
-        computed_makeup_gain_db = automatic_makeup_gain_db(gain_level_db, mix_role, role_norm_db=role_norm_db) + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db
-        computed_makeup_gain_db = min(computed_makeup_gain_db, AUTO_MIX_MAX_BOOST_DB)
+        gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
+        computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
+        computed_makeup_gain_db = float(np.clip(
+            computed_makeup_gain_before_lift_db + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db,
+            AUTO_MIX_MAX_ATTENUATION_DB,
+            AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
+        ))
         if not override_bool(overrides.get("manual_makeup_gain_db"), False):
             computed_makeup_gain_db = automatic_drum_peak_guard_gain_db(
                 mix_role, computed_makeup_gain_db, segment_peaks_db.get(stem.path.name, -120.0)
@@ -5882,7 +5936,7 @@ def render_segment(
             makeup_gain_db = override_float(overrides.get("makeup_gain_db"), 0.0)
         else:
             makeup_gain_db = override_float(overrides.get("auto_mix_gain_db", overrides.get("makeup_gain_db")), computed_makeup_gain_db)
-            makeup_gain_db = min(makeup_gain_db, AUTO_MIX_MAX_BOOST_DB)
+            makeup_gain_db = min(makeup_gain_db, AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB))
         user_gain_db = override_float(overrides.get("gain_db"), 0.0)
         lead_bonus = 1.5 if energies[stem.path.name] > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
         fader_gain_db = override_float(overrides.get("fader_db"), 0.0)
@@ -5945,6 +5999,9 @@ def render_segment(
                 "harmonic_attenuation_db": harmonic_adjustment_db,
                 "vocal_priority_attenuation_db": priority_adjustment_db,
                 "rms_dbfs": raw_rms_db,
+                "active_level_db": gain_level_db,
+                "accompaniment_reference_db": accompaniment_reference_db,
+                "automatic_gain_reason": "per-song active-envelope balance",
                 "dynamic_spread_db": dynamic_spread,
                 "base_level_db": base_level_db(stem.role),
                 "lead_bonus_db": lead_bonus,

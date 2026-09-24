@@ -403,6 +403,16 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     }
     active_energies = [energies[name] for name in active_names]
     median_energy = float(np.median(active_energies)) if active_energies else 0.0
+    active_levels_db = {
+        name: pipeline.active_level_db(rms_values_db.get(name, -120.0), segment_envelopes.get(name))
+        for name in active_names
+    }
+    accompaniment_levels = [
+        active_levels_db[name]
+        for name in active_names
+        if effective_roles.get(name, "") not in {"vocal", "room"}
+    ]
+    accompaniment_reference_db = float(np.median(accompaniment_levels)) if accompaniment_levels else None
     initialized_makeup_names: set[str] = set()
     solo_files = {
         stem.path.name
@@ -422,9 +432,14 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         eq_defaults = pipeline.role_eq_defaults(mix_role)
         raw_rms_db = rms_values_db.get(stem.path.name, -120.0)
         role_norm_db = role_norms_db.get(mix_role)
-        computed_gain_before_lift_db = pipeline.automatic_makeup_gain_db(raw_rms_db, mix_role, include_vocal_mic_lift=False, role_norm_db=role_norm_db)
-        computed_gain_db = pipeline.automatic_makeup_gain_db(raw_rms_db, mix_role, role_norm_db=role_norm_db) + rhythm_adjustment_db + priority_adjustment_db
-        computed_gain_db = min(computed_gain_db, pipeline.AUTO_MIX_MAX_BOOST_DB)
+        active_level = active_levels_db.get(stem.path.name, raw_rms_db)
+        computed_gain_before_lift_db = pipeline.per_song_auto_mix_gain_db(mix_role, active_level, accompaniment_reference_db)
+        computed_gain_db = computed_gain_before_lift_db + rhythm_adjustment_db + priority_adjustment_db
+        computed_gain_db = float(np.clip(
+            computed_gain_db,
+            pipeline.AUTO_MIX_MAX_ATTENUATION_DB,
+            pipeline.AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, pipeline.AUTO_MIX_MAX_BOOST_DB),
+        ))
         lead_bonus = 1.5 if energies.get(stem.path.name, 0.0) > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
         if "makeup_gain_db" not in stem_ov and "gain_db" in stem_ov:
             stem_ov["makeup_gain_db"] = float(stem_ov.get("gain_db", computed_gain_db) or 0.0)
@@ -491,6 +506,9 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "makeup_gain_db": makeup_gain_db,
             "gain_db": gain_db,
             "computed_gain_db": computed_gain_db,
+            "active_level_db": active_level,
+            "accompaniment_reference_db": accompaniment_reference_db,
+            "automatic_gain_reason": "per-song active-envelope balance",
             "automatic_fader_db": computed_gain_db,
             "automatic_gain_before_vocal_mic_lift_db": computed_gain_before_lift_db,
             "automatic_vocal_mic_lift_db": pipeline.AUTOMATIC_VOCAL_MIC_LIFT_DB if mix_role == "vocal" else 0.0,

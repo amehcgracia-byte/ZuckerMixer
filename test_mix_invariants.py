@@ -44,6 +44,18 @@ class MixInvariantTest(unittest.TestCase):
         self.assertLessEqual(min(requested, pipeline.AUTO_MIX_MAX_BOOST_DB), 0.0)
         self.assertEqual(pipeline.AUTO_MIX_MAX_BOOST_DB, 0.0)
 
+    def test_per_song_active_balance_allows_only_bounded_voice_and_bass_recovery(self):
+        self.assertAlmostEqual(pipeline.per_song_auto_mix_gain_db("vocal", -25.0, -18.0), 3.0)
+        self.assertAlmostEqual(pipeline.per_song_auto_mix_gain_db("bass", -25.0, -18.0), 3.0)
+        self.assertEqual(pipeline.per_song_auto_mix_gain_db("keys", -25.0, -18.0), 0.0)
+        self.assertEqual(pipeline.per_song_auto_mix_gain_db("guitar", -5.0, -18.0), -12.0)
+
+    def test_per_song_balance_changes_with_each_song_reference(self):
+        song_quiet = pipeline.per_song_auto_mix_gain_db("vocal", -30.0, -20.0)
+        song_balanced = pipeline.per_song_auto_mix_gain_db("vocal", -18.0, -20.0)
+        self.assertNotEqual(song_quiet, song_balanced)
+        self.assertLessEqual(song_quiet, 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()
