@@ -28,7 +28,8 @@ class RenderLifecycleTest(unittest.TestCase):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertEqual(source.count("async function mixSongs("), 1)
         self.assertIn("if (renderInProgress)", source)
-        self.assertIn("const overridesSnapshot = cloneOverridesPayload()", source)
+        self.assertIn("const overridesResponse = await fetch(\"/api/overrides\")", source)
+        self.assertIn("cloneOverridesPayload()", source)
         self.assertIn("await waitForRenderJob(jobId)", source)
         self.assertIn("finally {", source)
         render_body = source.split("async function mixSongs(", 1)[1].split("\nfunction mixEverything", 1)[0]

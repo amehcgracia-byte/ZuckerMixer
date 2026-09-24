@@ -1766,6 +1766,7 @@ def enqueue(
     preview_effective_mix: dict[str, Any] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    global cancel_requested
     if not ffmpeg_status()["ok"]:
         raise RuntimeError("ffmpeg is missing. Install it with: brew install ffmpeg")
     with state_lock:
@@ -1789,6 +1790,9 @@ def enqueue(
                     )
                     continue
             raise RuntimeError(f"Render already in progress ({existing_id}). Finish or cancel it before starting another render.")
+        # A prior explicit Cancel can leave the process-wide flag set after
+        # its job is already terminal. Do not let it cancel a new job.
+        cancel_requested = False
     job_id = f"{int(time.time())}-{len(jobs) + 1}"
     job = {
         "id": job_id,
@@ -2830,6 +2834,12 @@ def api_overrides() -> Response:
             active.append(f"song {song_id}: {len(touched)} stem overrides")
     append_log("ui", "Saved mix settings: " + ("; ".join(active) if active else "no fader/mute changes"))
     return jsonify({"ok": True, "accepted": accepted, "ignored": ignored})
+
+
+@app.get("/api/overrides")
+def api_get_overrides() -> Response:
+    """Return the authoritative persisted override snapshot for Render."""
+    return jsonify(normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}})))
 
 
 @app.post("/api/analyze-mix/<int:segment_id>")

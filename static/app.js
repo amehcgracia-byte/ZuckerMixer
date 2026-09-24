@@ -2662,7 +2662,14 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     // the pre-Analyze in-memory snapshot makes the worker reject otherwise
     // valid plans as stale for later songs in a batch.
     await refreshState({ renderLarge: false });
-    const overridesSnapshot = cloneOverridesPayload();
+    // The state response can intentionally preserve live preview overrides,
+    // but Render must freeze the server's persisted post-Analyze snapshot.
+    // Fetch it explicitly so generated per-song Auto-Mix stem values are not
+    // lost when the batch contains songs that were not open in the UI.
+    const overridesResponse = await fetch("/api/overrides");
+    const overridesSnapshot = overridesResponse.ok
+      ? await overridesResponse.json()
+      : cloneOverridesPayload();
     const url = singleSong != null ? `/api/render/${singleSong}` : "/api/render";
     const body = singleSong != null
       ? { render_target_dir: renderTargetDir || undefined, render_destination_trace: { save_dialog_return: renderTargetDir }, use_saved_mixes: useSavedMixes, preview_effective_mix: previewEffectiveMix, overrides_snapshot: overridesSnapshot }
