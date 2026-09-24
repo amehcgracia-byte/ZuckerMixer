@@ -41,6 +41,7 @@ OVERRIDES_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_overrides.json"
 HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
 SETTINGS_PATH = STATE_ROOT / "app_settings.json"
 MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"
+SEGMENT_SELECTIONS_PATH = ACTIVE_SOURCE_STATE_ROOT / "segment_selections.json"
 SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
 DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerPreviewCache"
@@ -646,7 +647,7 @@ def save_manual_splits(values: list[float]) -> None:
 
 
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, PREVIEW_DIR
+    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, PREVIEW_DIR
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.configure_detection_cache(source, STATE_ROOT)
@@ -656,6 +657,7 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     OVERRIDES_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_overrides.json"
     HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
     MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"
+    SEGMENT_SELECTIONS_PATH = ACTIVE_SOURCE_STATE_ROOT / "segment_selections.json"
     SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
     DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
     PREVIEW_DIR = PREVIEW_CACHE_ROOT / source_key
@@ -703,7 +705,7 @@ def save_detection_snapshot(state: dict[str, Any], signature: tuple[str, float |
 
 
 def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int, int], ...]]:
-    mtime = MANUAL_SPLITS_PATH.stat().st_mtime if MANUAL_SPLITS_PATH.exists() else None
+    mtimes = [path.stat().st_mtime if path.exists() else None for path in (MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH)]
     source = Path(pipeline.SOURCE_DIR)
     files: list[tuple[str, int, int]] = []
     if source.is_dir():
@@ -714,7 +716,40 @@ def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int
                     files.append((path.name, stat.st_size, stat.st_mtime_ns))
                 except OSError:
                     continue
-    return (str(source), mtime, tuple(files))
+    return (str(source), tuple(mtimes), tuple(files))
+
+
+def apply_saved_segment_selections(segments: list[pipeline.Segment]) -> list[pipeline.Segment]:
+    """Apply explicit timeline selections without reusing invalid windows."""
+    payload = load_json(SEGMENT_SELECTIONS_PATH, {})
+    saved = payload.get("segments", {}) if isinstance(payload, dict) else {}
+    if not isinstance(saved, dict):
+        return segments
+    result = list(segments)
+    for raw_id, selection in saved.items():
+        try:
+            index = int(raw_id) - 1
+            start = float(selection["start_sec"])
+            end = float(selection["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not 0 <= index < len(result):
+            continue
+        if not pipeline.HARD_MIN_SONG_SECONDS <= end - start <= pipeline.HARD_MAX_SONG_SECONDS:
+            continue
+        original = result[index]
+        result[index] = replace(
+            original,
+            start=start,
+            end=end,
+            core_start=start,
+            core_end=end,
+            nominal_end=end,
+            boundary_source="manual-selection",
+            boundary_validation="manual-selection",
+            boundary_validation_reason="user timeline selection",
+        )
+    return result
 
 
 def load_song_names() -> dict[str, Any]:
@@ -1015,6 +1050,7 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
         stems = pipeline.inspect_stems(pipeline.SOURCE_DIR)
         segments, _ = pipeline.detect_segments(stems)
         segments = apply_manual_splits(segments, load_manual_splits())
+        segments = apply_saved_segment_selections(segments)
         # Public numbering is the stable session order. When the detector has
         # identified leading recorded material as SONG 0, expose that number
         # and continue 1, 2, 3... through the app and exported filenames.
