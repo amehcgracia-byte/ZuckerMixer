@@ -33,3 +33,25 @@ def test_per_song_artifacts_and_manifest_are_promoted():
     assert '"master_wav": str(master_artifact)' in pipeline
     assert '"manifest_path"' in source
     assert '"stage_execution_counts"' in source
+    assert 'RENDER_DIAGNOSTICS_ROOT' in source
+    assert 'final_destination_contains_only' in source
+    assert 'diagnostics_dir=diagnostic_job_dir' in source
+    assert 'summary_path = diagnostic_job_dir' in source
+
+
+def test_mix_everything_uses_all_visible_songs_and_shows_count():
+    frontend = Path(__file__).with_name("static").joinpath("app.js").read_text(encoding="utf-8")
+    start = frontend.index("function mixEverything()")
+    end = frontend.index("function chooseMixSource()", start)
+    block = frontend[start:end]
+    assert "renderableSongs().map" in block
+    assert "Se van a exportar ${songs.length} canciones" in block
+    assert "[1, 2, 3]" not in block
+
+
+def test_render_valid_contract_excludes_out_of_range_windows():
+    source = Path(__file__).with_name("jam_app.py").read_text(encoding="utf-8")
+    assert "MIN_RENDER_DURATION_SECONDS = 480.0" in source
+    assert "MAX_RENDER_DURATION_SECONDS = 780.0" in source
+    assert '"render_valid"' in source
+    assert 'if song.get("render_valid")' in source

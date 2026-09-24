@@ -52,11 +52,15 @@ PREVIEW_DIR = PREVIEW_CACHE_ROOT / "default"
 JOB_STATUS_DIR = STATE_ROOT / "job_status"
 JOB_STATUS_DIR.mkdir(parents=True, exist_ok=True)
 LIFECYCLE_LOG_PATH = STATE_ROOT / "redetect_worker_lifecycle.jsonl"
+RENDER_DIAGNOSTICS_ROOT = STATE_ROOT / "render_diagnostics"
+RENDER_DIAGNOSTICS_ROOT.mkdir(parents=True, exist_ok=True)
 ORPHANED_ACTIVE_JOB_SECONDS = 90.0
 ACTIVE_STEM_DETECTION_VERSION = 4
 BUILD_METADATA_PATH = RESOURCE_ROOT / "build" / "build_metadata.json"
 HOST = "127.0.0.1"
 DEFAULT_TARGET_LUFS = pipeline.TARGET_LUFS
+MIN_RENDER_DURATION_SECONDS = 480.0
+MAX_RENDER_DURATION_SECONDS = 780.0
 
 pipeline.SOURCE_DIR = Path.home() / "Music" / "JamStems"
 pipeline.OUTPUT_ROOT = Path.home() / "Music" / "JamMixes"
@@ -726,6 +730,17 @@ def out_dir() -> Path:
     return pipeline.OUTPUT_ROOT / pipeline.SESSION_DATE
 
 
+def render_diagnostics_dir(job_id: str) -> Path:
+    """Return the private per-job directory for verification artifacts.
+
+    The user-selected directory is deliberately reserved for final MP3 files.
+    WAVs, manifests and batch summaries remain outside it for traceability.
+    """
+    path = RENDER_DIAGNOSTICS_ROOT / pipeline.sanitize_filename(str(job_id))
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def validate_render_target(path_value: str | Path) -> Path:
     """Require a user-selected destination outside app resources and state."""
     candidate = Path(path_value).expanduser().resolve()
@@ -1383,6 +1398,16 @@ def visible_songs(
         user_skipped = segment_id in skipped
         item["skipped"] = bool(user_skipped)
         item["skip_reason"] = "skipped" if user_skipped else ""
+        duration = float(item.get("duration") or 0.0)
+        item["render_valid"] = (
+            not user_skipped
+            and MIN_RENDER_DURATION_SECONDS <= duration <= MAX_RENDER_DURATION_SECONDS
+        )
+        item["render_validation"] = (
+            "valid"
+            if item["render_valid"]
+            else ("skipped" if user_skipped else f"duration_out_of_range:{duration:.3f}s")
+        )
         if str(segment_id) in state.get("active_stems_by_song", {}):
             item["active_stems"] = state["active_stems_by_song"][str(segment_id)]
         if not item["skipped"]:
@@ -1837,6 +1862,7 @@ def record_render(
     job_id: str | None = None,
     child_job_id: str | None = None,
     segment_id: int | None = None,
+    diagnostics_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     source = Path(str(row["file"]))
     expected_duration = float(row.get("duration") or 0.0)
@@ -1846,6 +1872,10 @@ def record_render(
         raise RuntimeError("Choose a destination folder before rendering.")
     render_dir = validate_render_target(render_target_dir)
     render_dir.mkdir(parents=True, exist_ok=True)
+    if not job_id:
+        raise RuntimeError("render is missing its job id")
+    diagnostic_root = Path(diagnostics_dir) if diagnostics_dir else render_diagnostics_dir(job_id)
+    diagnostic_root.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     history = load_json(HISTORY_PATH, {})
     entries = history.setdefault(str(song_index), [])
@@ -1862,8 +1892,7 @@ def record_render(
         source_artifact = Path(str(preserved.get(key, ""))) if preserved.get(key) else None
         if source_artifact is None or not source_artifact.exists():
             raise RuntimeError(f"Missing {key} artifact for song {song_index}.")
-        artifact_dest = dest.with_suffix("")
-        artifact_dest = artifact_dest.with_name(artifact_dest.name + suffix)
+        artifact_dest = diagnostic_root / f"{dest.stem}{suffix}"
         pipeline.promote_render_file(source_artifact, artifact_dest, expected_duration)
         artifact_paths[key] = str(artifact_dest.resolve())
     entry = {
@@ -1890,7 +1919,7 @@ def record_render(
     entries.append(entry)
     history[str(song_index)] = entries[-8:]
     save_json(HISTORY_PATH, history)
-    manifest_path = dest.with_suffix("").with_name(dest.with_suffix("").name + "_manifest.json")
+    manifest_path = diagnostic_root / f"{dest.stem}_manifest.json"
     manifest = {
         "job_id": job_id,
         "child_job_id": child_job_id,
@@ -1904,6 +1933,8 @@ def record_render(
         "effective_mix_hash": hashlib.sha256(json.dumps(row.get("effective_mix", {}), sort_keys=True, default=str).encode("utf-8")).hexdigest(),
         "effective_mix": row.get("effective_mix"),
         "artifacts": artifact_paths,
+        "diagnostics_dir": str(diagnostic_root.resolve()),
+        "final_destination_contains_only": "mp3",
         "hashes": {name: sha256_file(Path(path)) for name, path in artifact_paths.items()},
         "lufs": row.get("lufs"),
         "master_true_peak_dbfs": row.get("master_true_peak_dbfs"),
@@ -2337,6 +2368,8 @@ def _run_child_job(job_path: Path) -> int:
     pipeline.DETECTION_STRATEGY["final_render_boundary_audit"] = final_cut_audit
     append_log(job_id, f"Final cut gate passed for {len(final_cut_audit)} selected song(s)")
     out_dir().mkdir(parents=True, exist_ok=True)
+    diagnostic_job_dir = render_diagnostics_dir(job_id)
+    append_log(job_id, "RENDER DIAGNOSTICS directory=" + str(diagnostic_job_dir))
     rows = []
     batch_errors: list[dict[str, Any]] = []
     for pos, segment_id in enumerate(songs, 1):
@@ -2386,7 +2419,16 @@ def _run_child_job(job_path: Path) -> int:
                 artifact_dir=artifact_tmp_dir,
             )
             elapsed = time.time() - started
-            entry = record_render(render_index, row, elapsed, render_target_dir or None, job_id=job_id, child_job_id=child_job_id, segment_id=segment_id)
+            entry = record_render(
+                render_index,
+                row,
+                elapsed,
+                render_target_dir or None,
+                job_id=job_id,
+                child_job_id=child_job_id,
+                segment_id=segment_id,
+                diagnostics_dir=diagnostic_job_dir,
+            )
             append_log(job_id, "RENDER DESTINATION final_atomic_promotion_target=" + str(entry["path"]))
             append_log(job_id, f"BATCH child_completed child_job_id={child_job_id} song_id={segment_id} position={pos}/{len(songs)}")
         except (KeyboardInterrupt, SystemExit):
@@ -2450,20 +2492,21 @@ def _run_child_job(job_path: Path) -> int:
             batch_errors=batch_errors,
             stage="render",
         )
+        successful_rows = [row for row in rows if not row.get("error")]
         partial_summary = {
             "job_id": job_id,
             "status": "partial_failed",
             "batch_summary": {
                 "requested": len(songs),
                 "started": len(rows) + len(batch_errors),
-                "completed": len(rows),
+                "completed": len(successful_rows),
                 "failed": len(batch_errors),
-                "songs": compact_batch_rows(rows),
+                "songs": compact_batch_rows(successful_rows),
                 "errors": batch_errors,
             },
             "commit": BUILD_METADATA.get("commit"),
         }
-        summary_path = Path(str(payload.get("render_target_dir") or out_dir())) / f"ZuckerMixer_batch_{job_id}_summary.json"
+        summary_path = diagnostic_job_dir / f"ZuckerMixer_batch_{job_id}_summary.json"
         save_json_atomic(summary_path, partial_summary)
         app_progress(
             {
@@ -2481,9 +2524,9 @@ def _run_child_job(job_path: Path) -> int:
                 "batch_summary": {
                     "requested": len(songs),
                     "started": len(rows) + len(batch_errors),
-                    "completed": len(rows),
+                    "completed": len(successful_rows),
                     "failed": len(batch_errors),
-                    "songs": compact_batch_rows(rows),
+                    "songs": compact_batch_rows(successful_rows),
                 },
             }
         )
@@ -2510,7 +2553,7 @@ def _run_child_job(job_path: Path) -> int:
         "failed": 0,
         "songs": compact_batch_rows(rows),
     }
-    summary_path = Path(str(payload.get("render_target_dir") or out_dir())) / f"ZuckerMixer_batch_{job_id}_summary.json"
+    summary_path = diagnostic_job_dir / f"ZuckerMixer_batch_{job_id}_summary.json"
     save_json_atomic(summary_path, {"job_id": job_id, "status": "done", "batch_summary": batch_summary, "commit": BUILD_METADATA.get("commit")})
     app_progress(
         {
@@ -2940,7 +2983,7 @@ def api_render_song(song_index: int) -> Response:
     visible_ids = {
         int(song["id"])
         for song in visible_songs(state, load_settings(), load_json(HISTORY_PATH, {}))
-        if not song.get("skipped")
+        if song.get("render_valid")
     }
     if song_index not in visible_ids:
         return jsonify({"error": "song not found"}), 404
@@ -3048,7 +3091,7 @@ def api_render_many() -> Response:
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
     settings = load_settings()
-    visible_ids = {int(song["id"]) for song in visible_songs(state, settings, load_json(HISTORY_PATH, {})) if not song.get("skipped")}
+    visible_ids = {int(song["id"]) for song in visible_songs(state, settings, load_json(HISTORY_PATH, {})) if song.get("render_valid")}
     payload = request.get_json(force=True, silent=True) or {}
     try:
         songs = validate_batch_song_ids(payload.get("songs", []), visible_ids)

@@ -550,7 +550,7 @@ async function loadState() {
   appState = await res.json();
   renderBuildInfo();
   syncOverrideSequenceFromState();
-  $("#songCount").textContent = `${visibleSongs().length} songs ready`;
+  $("#songCount").textContent = `${renderableSongs().length} valid songs ready (${visibleSongs().length} detected)`;
   if (appState.ffmpeg && !appState.ffmpeg.ok) {
     showToast("ffmpeg is missing. Install it with Homebrew: brew install ffmpeg");
   }
@@ -565,6 +565,10 @@ async function loadState() {
 
 function visibleSongs() {
   return appState.songs.filter((song) => !song.skipped);
+}
+
+function renderableSongs() {
+  return visibleSongs().filter((song) => song.render_valid !== false && Number(song.duration || 0) >= 480 && Number(song.duration || 0) <= 780);
 }
 
 function formatTime(seconds) {
@@ -2470,7 +2474,7 @@ async function refreshState(options = {}) {
   renderBuildInfo();
   syncOverrideSequenceFromState();
   checkedSongs = new Set([...checkedSongs].filter((id) => appState.songs.some((song) => song.id === id && !song.skipped)));
-  $("#songCount").textContent = `${visibleSongs().length} songs ready`;
+  $("#songCount").textContent = `${renderableSongs().length} valid songs ready (${visibleSongs().length} detected)`;
   if (renderLarge) {
     renderCutTools();
     renderSongs();
@@ -2570,7 +2574,7 @@ async function ensureMixParamsForSong(songId) {
   }
 }
 
-async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.length > 1) {
+async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.length > 1, preflightLabel = "") {
   if (!songs.length) {
     showToast("Choose at least one song.");
     return;
@@ -2584,7 +2588,7 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     showToast("The batch contains duplicate songs.");
     return;
   }
-  setRenderControlsBusy(true, "Preparing render…");
+  setRenderControlsBusy(true, preflightLabel || "Preparing render…");
   let jobId = null;
   try {
     const useSavedMixes = isBatchAction ? await chooseMixSource() : true;
@@ -2648,13 +2652,17 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
 }
 
 function mixEverything() {
-  const songs = visibleSongs().map((song) => Number(song.id));
+  const songs = renderableSongs().map((song) => Number(song.id));
   if (!songs.length) {
     showToast("No valid songs are available for Mix everything.");
     return;
   }
-  console.info("[batch] Mix everything requested", songs);
-  mixSongs(songs, true, songs.length > 1);
+  const preflight = `Se van a exportar ${songs.length} canciones`;
+  const currentWork = document.querySelector("#currentWork");
+  if (currentWork) currentWork.textContent = preflight;
+  showToast(preflight);
+  console.info("[batch] Mix everything requested", { count: songs.length, song_ids: songs });
+  mixSongs(songs, true, songs.length > 1, preflight);
 }
 
 function chooseMixSource() {
