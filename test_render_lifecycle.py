@@ -16,6 +16,8 @@ class RenderLifecycleTest(unittest.TestCase):
         self.assertIn("const overridesSnapshot = cloneOverridesPayload()", source)
         self.assertIn("await waitForRenderJob(jobId)", source)
         self.assertIn("finally {", source)
+        render_body = source.split("async function mixSongs(", 1)[1].split("\nfunction mixEverything", 1)[0]
+        self.assertNotIn("ensureMixParamsForSong", render_body)
 
     def test_frontend_exposes_all_mix_actions_through_mix_songs(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")

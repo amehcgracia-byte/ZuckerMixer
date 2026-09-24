@@ -2481,7 +2481,9 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
       });
     }
     const singleSong = songs.length === 1 ? songs[0] : null;
-    if (singleSong != null) await ensureMixParamsForSong(singleSong);
+    // Rendering must never start a new detection/mix-parameter analysis. Fine
+    // Tune and Analyze prepare that state explicitly; the worker receives the
+    // current snapshot below and either renders it or reports a visible error.
     const previewEffectiveMix = singleSong != null ? effectiveMixDump(singleSong, "before-render-click") : null;
     const renderTargetDir = await chooseRenderFolder();
     if (renderTargetDir === false) return;
