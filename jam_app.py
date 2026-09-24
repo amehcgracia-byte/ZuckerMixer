@@ -42,6 +42,7 @@ HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
 SETTINGS_PATH = STATE_ROOT / "app_settings.json"
 MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"
 SEGMENT_SELECTIONS_PATH = ACTIVE_SOURCE_STATE_ROOT / "segment_selections.json"
+WAVEFORM_CACHE_PATH = ACTIVE_SOURCE_STATE_ROOT / "waveform_cache.json"
 SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
 DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerPreviewCache"
@@ -647,7 +648,7 @@ def save_manual_splits(values: list[float]) -> None:
 
 
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, PREVIEW_DIR
+    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, PREVIEW_DIR
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.configure_detection_cache(source, STATE_ROOT)
@@ -658,6 +659,7 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
     MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"
     SEGMENT_SELECTIONS_PATH = ACTIVE_SOURCE_STATE_ROOT / "segment_selections.json"
+    WAVEFORM_CACHE_PATH = ACTIVE_SOURCE_STATE_ROOT / "waveform_cache.json"
     SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
     DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
     PREVIEW_DIR = PREVIEW_CACHE_ROOT / source_key
@@ -749,6 +751,53 @@ def apply_saved_segment_selections(segments: list[pipeline.Segment]) -> list[pip
             boundary_validation="manual-selection",
             boundary_validation_reason="user timeline selection",
         )
+    return result
+
+
+def _waveform_identity() -> dict[str, Any]:
+    """Cheap source identity used to invalidate the low-resolution waveform cache."""
+    files = []
+    source = Path(pipeline.SOURCE_DIR)
+    for path in sorted(source.iterdir()) if source.is_dir() else []:
+        if path.is_file() and path.suffix.lower() in pipeline.ACCEPTED_AUDIO_EXTENSIONS:
+            try:
+                stat = path.stat()
+                files.append({"name": path.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+            except OSError:
+                continue
+    return {"source": str(source), "files": files, "version": 1, "points": 2400}
+
+
+def low_resolution_waveform() -> dict[str, Any]:
+    """Build/cache a visual envelope without invoking Whisper or thresholds."""
+    identity = _waveform_identity()
+    cached = load_json(WAVEFORM_CACHE_PATH, None)
+    if isinstance(cached, dict) and cached.get("identity") == identity:
+        cached["cached"] = True
+        return cached
+    state = ensure_pipeline_state()
+    stems = state["stems"]
+    duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in stems), default=0.0)
+    points = int(identity["points"])
+    envelope = np.zeros(points, dtype=np.float32)
+    # Read small windows at evenly spaced positions. This is intentionally a
+    # presentation cache and is never used to decide DSP gains or boundaries.
+    for stem in stems:
+        try:
+            with sf.SoundFile(str(stem.path)) as audio_file:
+                total = max(1, int(audio_file.frames))
+                for index in range(points):
+                    frame = min(total - 1, int(index / max(1, points - 1) * total))
+                    audio_file.seek(frame)
+                    block = audio_file.read(min(256, total - frame), dtype="float32", always_2d=True)
+                    if len(block):
+                        envelope[index] = max(envelope[index], float(np.max(np.abs(block))))
+        except (OSError, RuntimeError, ValueError):
+            continue
+    peak = float(np.max(envelope)) if len(envelope) else 0.0
+    values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
+    result = {"identity": identity, "duration_sec": duration, "peaks": values, "cached": False}
+    save_json_atomic(WAVEFORM_CACHE_PATH, result)
     return result
 
 
@@ -2251,6 +2300,74 @@ def favicon() -> Response:
 @app.get("/api/state")
 def api_state() -> Response:
     return jsonify(public_state())
+
+
+@app.get("/api/cuts/<int:song_id>")
+def api_cuts(song_id: int) -> Response:
+    """Return cached waveform plus automatic boundary evidence for Select Cuts."""
+    state = ensure_pipeline_state()
+    if song_id < 1 or song_id > len(state["segments"]):
+        return jsonify({"error": "song not found"}), 404
+    waveform = low_resolution_waveform()
+    markers = []
+    for index, segment in enumerate(state["segments"], 1):
+        markers.append({
+            "song_id": index,
+            "start_sec": float(segment.start),
+            "end_sec": float(segment.end),
+            "duration_sec": float(segment.duration),
+            "comment_start_sec": segment.mc_start,
+            "comment_end_sec": segment.mc_end,
+            "speech_text": segment.speech_text,
+            "boundary_source": segment.boundary_source,
+            "confidence": float(segment.speech_confidence or 0.0),
+            "status": "valid" if pipeline.HARD_MIN_SONG_SECONDS <= segment.duration <= pipeline.HARD_MAX_SONG_SECONDS else "needs_review",
+        })
+    selected = state["segments"][song_id - 1]
+    return jsonify({
+        "song_id": song_id,
+        "waveform": waveform,
+        "selection": {"start_sec": float(selected.start), "end_sec": float(selected.end)},
+        "markers": markers,
+        "bounds": {"min_sec": pipeline.HARD_MIN_SONG_SECONDS, "max_sec": pipeline.HARD_MAX_SONG_SECONDS},
+    })
+
+
+@app.post("/api/segment-selection/<int:song_id>")
+def api_segment_selection(song_id: int) -> Response:
+    """Persist the human selection; automatic detection remains untouched."""
+    state = ensure_pipeline_state()
+    if song_id < 1 or song_id > len(state["segments"]):
+        return jsonify({"error": "song not found"}), 404
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        start = float(payload["start_sec"])
+        end = float(payload["end_sec"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "start_sec and end_sec must be numbers"}), 400
+    duration = end - start
+    if not pipeline.HARD_MIN_SONG_SECONDS <= duration <= pipeline.HARD_MAX_SONG_SECONDS:
+        return jsonify({"error": f"Selection must be between 8:00 and 13:00 (received {duration:.2f}s)."}), 400
+    source_duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in state["stems"]), default=0.0)
+    if start < 0 or end > source_duration:
+        return jsonify({"error": "Selection is outside the source duration."}), 400
+    saved = load_json(SEGMENT_SELECTIONS_PATH, {"version": 1, "segments": {}})
+    if not isinstance(saved, dict):
+        saved = {"version": 1, "segments": {}}
+    saved["version"] = 1
+    saved.setdefault("segments", {})[str(song_id)] = {
+        "start_sec": start,
+        "end_sec": end,
+        "source": "manual",
+        "saved_at": time.time(),
+    }
+    save_json_atomic(SEGMENT_SELECTIONS_PATH, saved)
+    with state_lock:
+        global pipeline_state, pipeline_state_signature
+        pipeline_state = None
+        pipeline_state_signature = None
+    append_log("ui", f"Saved manual cut for song {song_id}: {start:.3f}-{end:.3f}s")
+    return jsonify({"ok": True, "song_id": song_id, "start_sec": start, "end_sec": end, "duration_sec": duration, "source": "manual"})
 
 
 @app.post("/api/overrides")

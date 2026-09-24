@@ -763,6 +763,7 @@ function renderSongs() {
         <div class="row-actions">
           <label class="skip-toggle"><input type="checkbox" data-skip="${song.id}" ${song.skipped ? "checked" : ""}> Skip this one</label>
           <button data-mix-one="${song.id}" class="accent" ${song.skipped ? "disabled" : ""}>Mix this one</button>
+          <button data-select-cuts="${song.id}" class="ghost" ${song.skipped ? "disabled" : ""}>Select Cuts</button>
           <button data-reset-auto="${song.id}" class="ghost">Reset to automatic mix</button>
         </div>
       </div>
@@ -774,6 +775,7 @@ function renderSongs() {
       updateSelectedButton();
     });
     card.querySelector("[data-mix-one]").addEventListener("click", () => mixSongs([song.id]).catch((error) => showToast(`Render failed: ${error.message || error}`)));
+    card.querySelector("[data-select-cuts]").addEventListener("click", () => openCutSelector(song.id));
     card.querySelector("[data-reset-auto]").addEventListener("click", () => resetSongToAutomatic(song.id));
     card.querySelector("[data-skip]").addEventListener("change", (event) => setSkipped(song.id, event.target.checked));
     card.querySelector("[data-name-input]").addEventListener("change", (event) => saveSongName(song.id, event.target.value));
@@ -781,6 +783,92 @@ function renderSongs() {
     wireFineTune(card, song.id);
   });
   updateSelectedButton();
+}
+
+let cutSelector = null;
+
+function cutTime(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  const minutes = Math.floor(total / 60);
+  return `${minutes}:${String(Math.floor(total % 60)).padStart(2, "0")}`;
+}
+
+function ensureCutSelector() {
+  if (cutSelector) return cutSelector;
+  const dialog = document.createElement("dialog");
+  dialog.id = "cutSelectorDialog";
+  dialog.innerHTML = `
+    <form method="dialog" class="cut-selector-shell">
+      <div class="cut-selector-header"><div><h2>Select Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><button value="cancel" class="ghost">Cancel</button></div>
+      <div class="cut-wave-wrap"><canvas id="cutWaveform" aria-label="Full jam waveform"></canvas><div id="cutMarkers" class="cut-markers"></div><div id="cutSelection" class="cut-selection"><button type="button" class="cut-handle left" aria-label="Move start"></button><button type="button" class="cut-center" aria-label="Move selection"></button><button type="button" class="cut-handle right" aria-label="Move end"></button></div></div>
+      <div class="cut-readout"><label>Start <input id="cutStart" type="number" step="0.1"></label><label>End <input id="cutEnd" type="number" step="0.1"></label><strong>Duration <span id="cutDuration">—</span></strong><span id="cutValidation" class="cut-validation"></span></div>
+      <div id="cutEvidence" class="cut-evidence"></div>
+      <div class="cut-selector-actions"><button id="cutApply" type="button" class="accent">Apply/Save</button><button id="cutCancel" type="button" class="ghost">Cancel</button></div>
+    </form>`;
+  document.body.appendChild(dialog);
+  dialog.querySelector("#cutCancel").addEventListener("click", () => dialog.close("cancel"));
+  cutSelector = { dialog, canvas: dialog.querySelector("#cutWaveform"), selection: dialog.querySelector("#cutSelection"), start: dialog.querySelector("#cutStart"), end: dialog.querySelector("#cutEnd") };
+  wireCutSelector(cutSelector);
+  return cutSelector;
+}
+
+async function openCutSelector(songId) {
+  const ui = ensureCutSelector();
+  const response = await fetch(`/api/cuts/${songId}`);
+  const data = await response.json();
+  if (!response.ok) return showToast(data.error || "Could not load cut editor.");
+  ui.songId = songId;
+  ui.data = data;
+  ui.duration = Number(data.waveform.duration_sec || 0);
+  ui.startValue = Number(data.selection.start_sec);
+  ui.endValue = Number(data.selection.end_sec);
+  ui.dialog.querySelector("#cutSelectorTitle").textContent = `Song ${String(songId).padStart(2, "0")} · waveform cache ${data.waveform.cached ? "hit" : "created"}`;
+  ui.dialog.querySelector("#cutEvidence").innerHTML = data.markers.map((marker) => `<span class="cut-evidence-item ${marker.status}">${cutTime(marker.start_sec)}–${cutTime(marker.end_sec)} · ${esc(marker.boundary_source || "automatic proposal")} · ${marker.confidence ? `${Math.round(marker.confidence * 100)}%` : "no confidence"}</span>`).join("");
+  drawCutEditor();
+  ui.dialog.showModal();
+}
+
+function drawCutEditor() {
+  const ui = cutSelector;
+  if (!ui?.data) return;
+  const canvas = ui.canvas;
+  const width = Math.max(700, canvas.clientWidth || 900);
+  const height = 190;
+  canvas.width = width * devicePixelRatio; canvas.height = height * devicePixelRatio;
+  canvas.style.height = `${height}px`;
+  const ctx = canvas.getContext("2d"); ctx.scale(devicePixelRatio, devicePixelRatio);
+  ctx.fillStyle = "#100e0c"; ctx.fillRect(0, 0, width, height);
+  const peaks = ui.data.waveform.peaks || [];
+  ctx.strokeStyle = "#eca35e"; ctx.globalAlpha = .8; ctx.beginPath();
+  peaks.forEach((value, index) => { const x = index / Math.max(1, peaks.length - 1) * width; const y = height / 2 - Number(value) * (height * .42); ctx.moveTo(x, height / 2 + Number(value) * (height * .42)); ctx.lineTo(x, y); }); ctx.stroke(); ctx.globalAlpha = 1;
+  const x = (seconds) => Math.max(0, Math.min(width, Number(seconds) / Math.max(.001, ui.duration) * width));
+  const sx = x(ui.startValue), ex = x(ui.endValue);
+  ctx.fillStyle = "rgba(200,111,47,.23)"; ctx.fillRect(sx, 0, Math.max(0, ex - sx), height);
+  ctx.strokeStyle = "#ffd08f"; ctx.lineWidth = 2; [sx, ex].forEach((point) => { ctx.beginPath(); ctx.moveTo(point, 0); ctx.lineTo(point, height); ctx.stroke(); });
+  ui.selection.style.left = `${sx / width * 100}%`; ui.selection.style.width = `${Math.max(0, (ex - sx) / width * 100)}%`;
+  ui.start.value = ui.startValue.toFixed(1); ui.end.value = ui.endValue.toFixed(1);
+  const duration = ui.endValue - ui.startValue;
+  ui.dialog.querySelector("#cutDuration").textContent = `${duration.toFixed(1)} s (${cutTime(duration)})`;
+  const valid = duration >= 480 && duration <= 780;
+  const validation = ui.dialog.querySelector("#cutValidation"); validation.textContent = valid ? "Valid selection" : "Selection must be between 8:00 and 13:00"; validation.className = `cut-validation ${valid ? "valid" : "invalid"}`;
+  ui.dialog.querySelector("#cutApply").disabled = !valid;
+  const markers = ui.dialog.querySelector("#cutMarkers"); markers.innerHTML = (ui.data.markers || []).flatMap((marker) => [marker.start_sec, marker.comment_start_sec]).filter((value) => Number.isFinite(Number(value))).map((value) => `<i style="left:${x(value) / width * 100}%" title="Comment/candidate ${cutTime(value)}"></i>`).join("");
+}
+
+function installCutDrag(element, mode) {
+  element.addEventListener("pointerdown", (event) => {
+    event.preventDefault(); const ui = cutSelector; const rect = ui.canvas.getBoundingClientRect(); const startX = event.clientX; const originalStart = ui.startValue; const originalEnd = ui.endValue;
+    element.setPointerCapture(event.pointerId);
+    const move = (current) => { const delta = (current.clientX - startX) / rect.width * ui.duration; if (mode === "left") ui.startValue = Math.max(0, Math.min(originalEnd - 480, originalStart + delta)); else if (mode === "right") ui.endValue = Math.min(ui.duration, Math.max(originalStart + 480, originalEnd + delta)); else { const span = originalEnd - originalStart; const next = Math.max(0, Math.min(ui.duration - span, originalStart + delta)); ui.startValue = next; ui.endValue = next + span; } drawCutEditor(); };
+    const onMove = (moveEvent) => move(moveEvent); const onUp = () => { element.removeEventListener("pointermove", onMove); element.removeEventListener("pointerup", onUp); };
+    element.addEventListener("pointermove", onMove); element.addEventListener("pointerup", onUp, { once: true });
+  });
+}
+
+function wireCutSelector(ui) {
+  installCutDrag(ui.dialog.querySelector(".cut-handle.left"), "left"); installCutDrag(ui.dialog.querySelector(".cut-handle.right"), "right"); installCutDrag(ui.dialog.querySelector(".cut-center"), "center");
+  [ui.start, ui.end].forEach((input) => input.addEventListener("input", () => { ui.startValue = Number(ui.start.value); ui.endValue = Number(ui.end.value); drawCutEditor(); }));
+  ui.dialog.querySelector("#cutApply").addEventListener("click", async () => { const response = await fetch(`/api/segment-selection/${ui.songId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_sec: ui.startValue, end_sec: ui.endValue }) }); const result = await response.json(); if (!response.ok) return showToast(result.error || "Could not save selection."); ui.dialog.close("saved"); await refreshState({ renderLarge: true }); showToast(`Saved cut ${cutTime(result.start_sec)}–${cutTime(result.end_sec)}. A new render plan will be used.`); });
 }
 
 function fineTuneHtml(song) {
