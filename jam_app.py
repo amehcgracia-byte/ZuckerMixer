@@ -988,6 +988,22 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
             return pipeline_state
     snapshot = None if pipeline.DETECTION_RESCAN_MODE else load_detection_snapshot(signature)
     if snapshot is not None:
+        snapshot_segments = snapshot.get("segments", []) if isinstance(snapshot, dict) else []
+        invalid_snapshot_durations = [
+            round(float(item.get("end", 0.0)) - float(item.get("start", 0.0)), 3)
+            for item in snapshot_segments
+            if isinstance(item, dict)
+            and not pipeline.HARD_MIN_SONG_SECONDS <= (float(item.get("end", 0.0)) - float(item.get("start", 0.0))) <= pipeline.HARD_MAX_SONG_SECONDS
+        ]
+        if invalid_snapshot_durations:
+            print(
+                "DETECTION SNAPSHOT: ignored invalid persisted windows "
+                + json.dumps(invalid_snapshot_durations)
+                + "; redetecting with the current 8–13 minute contract",
+                flush=True,
+            )
+            snapshot = None
+    if snapshot is not None:
         with state_lock:
             pipeline_state = snapshot
             pipeline_state_signature = signature
@@ -1033,7 +1049,7 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
                     "introduction_text": segment.speech_intro_text,
                     "boundary_source": segment.boundary_source,
                     "duration_rule": (
-                        "hard violation: >16 min / split required" if duration > pipeline.HARD_MAX_SONG_SECONDS
+                        "hard violation: >13 min / split required" if duration > pipeline.HARD_MAX_SONG_SECONDS
                         else "hard violation: <8 min / merge required" if duration < pipeline.HARD_MIN_SONG_SECONDS
                         else "normal duration"
                     ),
