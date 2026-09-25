@@ -31,6 +31,45 @@ class AutoMixVocalBalanceTests(unittest.TestCase):
         self.assertEqual(result["vocal_group_correction_db"], 0.0)
         self.assertEqual(result["harmonic_group_correction_db"], 0.0)
 
+    def test_role_corrections_are_per_song_and_only_for_overlapping_harmonics(self):
+        roles = {
+            "Vox L.wav": "vocal",
+            "Vox R.wav": "vocal",
+            "Guitar.wav": "guitar",
+            "Piano.wav": "keys",
+            "Bass.wav": "bass",
+        }
+        levels = {
+            "Vox L.wav": -24.0,
+            "Vox R.wav": -24.0,
+            "Guitar.wav": -14.0,
+            "Piano.wav": -18.0,
+            "Bass.wav": -20.0,
+        }
+        envelopes = {name: pipeline.np.ones(32, dtype=pipeline.np.float32) for name in roles}
+        result = pipeline.per_song_role_balance_corrections(roles, levels, envelopes)
+        self.assertEqual(result["vocal_pair_corrections_db"]["Vox L.wav"], 0.0)
+        self.assertEqual(result["vocal_pair_corrections_db"]["Vox R.wav"], 0.0)
+        self.assertEqual(result["role_corrections_db"]["Guitar.wav"], -6.0)
+        self.assertEqual(result["role_corrections_db"]["Piano.wav"], -3.0)
+        self.assertEqual(result["role_corrections_db"].get("Bass.wav", 0.0), 0.0)
+
+    def test_vocal_pair_is_equalized_from_active_level_per_song(self):
+        roles = {"Mic L.wav": "vocal", "Mic R.wav": "vocal", "Keys.wav": "keys"}
+        levels = {"Mic L.wav": -28.0, "Mic R.wav": -34.0, "Keys.wav": -24.0}
+        envelopes = {name: pipeline.np.ones(16, dtype=pipeline.np.float32) for name in roles}
+        result = pipeline.per_song_role_balance_corrections(roles, levels, envelopes)
+        self.assertAlmostEqual(result["vocal_pair_corrections_db"]["Mic L.wav"], -3.0)
+        self.assertAlmostEqual(result["vocal_pair_corrections_db"]["Mic R.wav"], 3.0)
+
+    def test_already_balanced_harmonics_are_not_trimmed(self):
+        roles = {"Vox.wav": "vocal", "Guitar.wav": "guitar", "Piano.wav": "keys"}
+        levels = {"Vox.wav": -16.0, "Guitar.wav": -20.0, "Piano.wav": -21.0}
+        envelopes = {name: pipeline.np.ones(16, dtype=pipeline.np.float32) for name in roles}
+        result = pipeline.per_song_role_balance_corrections(roles, levels, envelopes)
+        self.assertEqual(result["role_corrections_db"]["Guitar.wav"], 0.0)
+        self.assertEqual(result["role_corrections_db"]["Piano.wav"], 0.0)
+
     def test_pair_key_preserves_left_right_identity(self):
         self.assertEqual(pipeline.vocal_pair_key("vox L_1.wav"), "vocal_pair")
         self.assertEqual(pipeline.vocal_pair_key("vox R_1.wav"), "vocal_pair")

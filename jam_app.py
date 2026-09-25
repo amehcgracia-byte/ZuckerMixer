@@ -500,6 +500,10 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     rhythm_controls = mix_controls["rhythm"]
     vocal_priority = mix_controls["vocal_priority"]
     mic_content = mix_controls["mic_content"]
+    role_balance = mix_controls.get("role_balance", {}) if isinstance(mix_controls, dict) else {}
+    role_corrections = role_balance.get("role_corrections_db", {}) if isinstance(role_balance, dict) else {}
+    vocal_pair_corrections = role_balance.get("vocal_pair_corrections_db", {}) if isinstance(role_balance, dict) else {}
+    role_balance_reasons = role_balance.get("role_reasons", {}) if isinstance(role_balance, dict) else {}
     loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
     # All successfully decoded stems enter every song plan. Explicit mute and
     # solo overrides are applied later; low energy must not hide a track.
@@ -558,12 +562,14 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         rhythm_adjustment_db = float(rhythm_controls.get(stem.path.name, {}).get("attenuation_db", 0.0))
         priority_adjustment_db = float(vocal_priority.get(stem.path.name, 0.0))
         vocal_group_adjustment_db = float(mix_controls.get("vocal_group_gain", {}).get(stem.path.name, 0.0))
+        role_balance_adjustment_db = float(role_corrections.get(stem.path.name, 0.0))
+        vocal_pair_adjustment_db = float(vocal_pair_corrections.get(stem.path.name, 0.0))
         eq_defaults = pipeline.role_eq_defaults(mix_role)
         raw_rms_db = rms_values_db.get(stem.path.name, -120.0)
         role_norm_db = role_norms_db.get(mix_role)
         active_level = active_levels_db.get(stem.path.name, raw_rms_db)
         computed_gain_before_lift_db = pipeline.per_song_auto_mix_gain_db(mix_role, active_level, accompaniment_reference_db)
-        computed_gain_db = computed_gain_before_lift_db + rhythm_adjustment_db + priority_adjustment_db + vocal_group_adjustment_db
+        computed_gain_db = computed_gain_before_lift_db + rhythm_adjustment_db + priority_adjustment_db + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db
         computed_gain_db = float(np.clip(
             computed_gain_db,
             pipeline.AUTO_MIX_MAX_ATTENUATION_DB,
@@ -632,6 +638,9 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "rhythmic_attenuation_db": rhythm_adjustment_db,
             "vocal_priority_attenuation_db": priority_adjustment_db,
             "vocal_group_correction_db": vocal_group_adjustment_db,
+            "vocal_pair_correction_db": vocal_pair_adjustment_db,
+            "role_balance_correction_db": role_balance_adjustment_db,
+            "role_balance_reason": role_balance_reasons.get(stem.path.name),
             "vocal_pair_key": mix_controls.get("vocal_pair_keys", {}).get(stem.path.name),
             "mix_role_group": pipeline.mix_role_group(mix_role, stem.path.name),
             "base_level_db": pipeline.base_level_db(mix_role),
@@ -682,14 +691,14 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     ]
     if len(active_vocal_names) > 1:
         post_gain = np.array(
-            [rms_values_db[name] + float(stem_params[name]["makeup_gain_db"]) for name in active_vocal_names],
+            [active_levels_db.get(name, rms_values_db[name]) + float(stem_params[name]["makeup_gain_db"]) for name in active_vocal_names],
             dtype=np.float32,
         )
         target_vocal_rms = float(np.median(post_gain))
         for name in active_vocal_names:
             if name not in initialized_makeup_names:
                 continue
-            current = rms_values_db[name] + float(stem_params[name]["makeup_gain_db"])
+            current = active_levels_db.get(name, rms_values_db[name]) + float(stem_params[name]["makeup_gain_db"])
             adjustment = float(np.clip(target_vocal_rms - current, -6.0, 6.0))
             stem_params[name]["makeup_gain_db"] = float(stem_params[name]["makeup_gain_db"]) + adjustment
             stem_params[name]["vocal_balance_db"] = adjustment
