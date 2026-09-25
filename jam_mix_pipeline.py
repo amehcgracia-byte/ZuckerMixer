@@ -1995,6 +1995,21 @@ def enforce_hard_song_duration_bounds(
                     "result_durations_seconds": [candidate.duration for candidate in valid],
                     "split_points": [candidate.end for candidate in valid[:-1]],
                 })
+        if len(valid) <= 1 and item.duration > HARD_MAX_SONG_SECONDS:
+            # A long block must never be silently kept as one "song".  If no
+            # acoustically verified cut exists, expose the bounded acoustic
+            # proposals as needs_review so Select Cuts can decide.  This is a
+            # review proposal, not an automatically approved export window.
+            review_candidates = apply_stage_clock_soft_splits([item], stems, timelines)
+            if len(review_candidates) > 1:
+                valid = mark_partition_for_review(review_candidates, stems, timelines)
+                decisions.append({
+                    "action": "review-only-split",
+                    "reason": "no safe internal boundary; preserve proposals for Select Cuts",
+                    "source_duration_seconds": item.duration,
+                    "result_durations_seconds": [candidate.duration for candidate in valid],
+                    "split_points": [candidate.end for candidate in valid[:-1]],
+                })
         if len(valid) > 1:
             # Preserve the original introduction metadata on the first piece;
             # later inferred pieces remain explicitly unintroduced unless a
@@ -2115,6 +2130,253 @@ def split_oversized_at_safe_boundaries(
             speech_reason="inferred acoustic continuation; review if presenter context is ambiguous",
         )
         pieces[index:index + 1] = [left, right]
+
+
+def mark_partition_for_review(
+    pieces: list[Segment],
+    stems: list[Stem],
+    timelines: dict[str, np.ndarray],
+) -> list[Segment]:
+    """Annotate a bounded partition that still needs human confirmation.
+
+    Soft acoustic proposals are useful for exposing a 40-minute recording as
+    reviewable song-sized windows, but they are never silently promoted to
+    valid cuts.  Each shared boundary is checked and every affected window
+    carries the review state into Select Cuts and the render manifest.
+    """
+    ordered = sorted(pieces, key=lambda item: item.start)
+    unsafe: list[float] = []
+    for right in ordered[1:]:
+        safe, instruments, voices = _boundary_activity(
+            float(right.start), stems, timelines, radius_seconds=3.0, diagnostic=True
+        )
+        if not safe:
+            unsafe.append(float(right.start))
+    annotated: list[Segment] = []
+    for index, item in enumerate(ordered):
+        boundary = float(item.start) if index else None
+        is_review = bool(unsafe) or boundary in unsafe
+        annotated.append(replace(
+            item,
+            boundary_source="needs-review-acoustic-proposal" if is_review else "acoustic-safe-boundary",
+            boundary_validation="needs_review" if is_review else "valid",
+            boundary_validation_reason=(
+                "soft partition requires human confirmation" if is_review
+                else "quiet multi-stem boundary verified"
+            ),
+            speech_reason=(item.speech_reason or "") + (
+                "; proposed split requires Select Cuts confirmation" if is_review else ""
+            ),
+        ))
+    return annotated
+
+
+def bounded_review_partition(
+    segment: Segment,
+    stems: list[Stem],
+    timelines: dict[str, np.ndarray],
+) -> list[Segment]:
+    """Create a bounded, shared proposal partition for one long block.
+
+    The search is deliberately variable: it chooses the quietest aggregate
+    multi-stem point in the legal interval rather than slicing at a fixed
+    ten-minute clock position.  A point that is not acoustically safe is still
+    exposed, but marked ``needs_review`` for Select Cuts.
+    """
+    pieces = [segment]
+    combined = combine_normalized_envelope(stems, timelines)
+    while True:
+        index = next((i for i, item in enumerate(pieces) if item.duration > HARD_MAX_SONG_SECONDS), None)
+        if index is None:
+            break
+        item = pieces[index]
+        lower = item.start + HARD_MIN_SONG_SECONDS
+        upper = min(item.start + HARD_MAX_SONG_SECONDS, item.end - HARD_MIN_SONG_SECONDS)
+        if upper <= lower:
+            cut = min(item.start + HARD_MIN_SONG_SECONDS, item.end - 1.0)
+        elif len(combined):
+            lo = max(0, int(round(lower / DETECTION_FRAME_SECONDS)))
+            hi = min(len(combined), int(round(upper / DETECTION_FRAME_SECONDS)) + 1)
+            cut = float(lo + int(np.argmin(combined[lo:hi]))) * DETECTION_FRAME_SECONDS if hi > lo else (lower + upper) / 2.0
+        else:
+            cut = (lower + upper) / 2.0
+        cut = min(max(cut, item.start + HARD_MIN_SONG_SECONDS), item.end - 1.0)
+        left = replace(item, end=cut, core_end=cut, nominal_end=cut)
+        right = replace(
+            item,
+            start=cut,
+            core_start=cut,
+            speech_text="",
+            speech_reason="bounded continuation proposal; review in Select Cuts",
+            speech_intro_text="",
+            speech_intro_start=None,
+        )
+        pieces[index:index + 1] = [left, right]
+    return mark_partition_for_review(pieces, stems, timelines)
+
+
+def normalize_global_song_windows(
+    segments: list[Segment],
+    stems: list[Stem],
+    timelines: dict[str, np.ndarray],
+) -> list[Segment]:
+    """Enforce one legal global topology after all detector passes."""
+    partitioned: list[Segment] = []
+    audits: list[dict[str, object]] = []
+    for segment in sorted(segments, key=lambda item: item.start):
+        if segment.duration > HARD_MAX_SONG_SECONDS:
+            safe = split_oversized_at_safe_boundaries(segment, stems, timelines)
+            parts = safe if len(safe) > 1 else bounded_review_partition(segment, stems, timelines)
+            partitioned.extend(parts)
+            audits.append({
+                "source_start": segment.start,
+                "source_end": segment.end,
+                "durations": [part.duration for part in parts],
+                "mode": "safe" if len(safe) > 1 else "needs_review",
+            })
+        else:
+            partitioned.append(segment)
+
+    # Whisper can produce brief commentary fragments. Remove those artificial
+    # song boundaries where the resulting shared window remains legal.
+    result = sorted(partitioned, key=lambda item: item.start)
+    while True:
+        short_index = next((i for i, item in enumerate(result) if item.duration < HARD_MIN_SONG_SECONDS), None)
+        if short_index is None or len(result) <= 1:
+            break
+        options: list[tuple[float, int, int]] = []
+        if short_index > 0:
+            options.append((result[short_index - 1].duration + result[short_index].duration, short_index - 1, short_index))
+        if short_index + 1 < len(result):
+            options.append((result[short_index].duration + result[short_index + 1].duration, short_index, short_index + 1))
+        legal = [option for option in options if option[0] <= HARD_MAX_SONG_SECONDS]
+        if not legal:
+            break
+        _duration, left_index, right_index = min(legal)
+        left, right = result[left_index], result[right_index]
+        merged = replace(
+            left,
+            end=right.end,
+            nominal_end=right.end,
+            core_end=right.core_end or right.end,
+            boundary_source="merged-commentary-fragments",
+            boundary_validation="needs_review" if left.boundary_validation == "needs_review" or right.boundary_validation == "needs_review" else "valid",
+            boundary_validation_reason="short commentary fragment merged into shared song window",
+            speech_reason=(left.speech_reason or "") + "; short fragment merged; review if presenter context is ambiguous",
+        )
+        result[left_index:right_index + 1] = [merged]
+
+    total_end = max((item.end for item in result), default=0.0)
+    minimum_count = max(1, int(math.ceil(total_end / HARD_MAX_SONG_SECONDS)))
+    duration_target_count = max(minimum_count, int(round(total_end / 750.0)))
+    target_count = max(minimum_count, int(KNOWN_SONG_COUNT or duration_target_count))
+    bounded_rebuild = False
+    if len(result) != target_count or any(not HARD_MIN_SONG_SECONDS <= item.duration <= HARD_MAX_SONG_SECONDS for item in result):
+        result = build_duration_bounded_global_proposals(result, stems, timelines, target_count)
+        bounded_rebuild = True
+
+    DETECTION_STRATEGY["global_window_normalization"] = {
+        "input_count": len(segments),
+        "output_count": len(result),
+        "expected_window_seconds": [HARD_MIN_SONG_SECONDS, HARD_MAX_SONG_SECONDS],
+        "long_block_partitions": audits,
+        "shared_stem_cut_list": True,
+        "out_of_range_count": sum(not HARD_MIN_SONG_SECONDS <= item.duration <= HARD_MAX_SONG_SECONDS for item in result),
+        "needs_review_count": sum(item.boundary_validation == "needs_review" for item in result),
+        "bounded_rebuild": bounded_rebuild,
+        "bounded_target_count": target_count,
+    }
+    return result
+
+
+def build_duration_bounded_global_proposals(
+    existing: list[Segment],
+    stems: list[Stem],
+    timelines: dict[str, np.ndarray],
+    target_count: int,
+) -> list[Segment]:
+    """Build one feasible global partition when detector fragments disagree.
+
+    This is not a fixed-duration splitter.  The number of windows is derived
+    from the shared active-session duration and the legal maximum; each cut is
+    then moved to the quietest aggregate point in its feasible interval.
+    """
+    if not existing or target_count < 1:
+        return existing
+    start = min(item.start for item in existing)
+    end = max(item.end for item in existing)
+    if end - start < target_count * HARD_MIN_SONG_SECONDS or end - start > target_count * HARD_MAX_SONG_SECONDS:
+        return existing
+    combined = combine_normalized_envelope(stems, timelines)
+    existing_cuts = sorted({float(item.start) for item in existing if start < float(item.start) < end})
+    cuts: list[float] = [start]
+    cursor = start
+    for index in range(1, target_count):
+        remaining = target_count - index
+        lower = max(cursor + HARD_MIN_SONG_SECONDS, end - remaining * HARD_MAX_SONG_SECONDS)
+        upper = min(cursor + HARD_MAX_SONG_SECONDS, end - remaining * HARD_MIN_SONG_SECONDS)
+        desired = cursor + (end - cursor) / float(remaining + 1)
+        candidates = [candidate for candidate in existing_cuts if lower <= candidate <= upper]
+        if candidates:
+            # Prefer a real detector boundary close to the proportional target
+            # and give a modest preference to a boundary that passes the
+            # shared multi-stem acoustic gate.  This avoids synthetic 13:00
+            # cuts when Whisper/energy already supplied a usable candidate.
+            scored: list[tuple[float, float]] = []
+            for candidate in candidates:
+                safe, _instruments, _voices = _boundary_activity(candidate, stems, timelines, radius_seconds=3.0, diagnostic=True)
+                scored.append((abs(candidate - desired) + (0.0 if safe else 60.0), candidate))
+            cut = min(scored)[1]
+        elif upper <= lower:
+            cut = lower
+        elif len(combined):
+            lo = max(0, int(round(lower / DETECTION_FRAME_SECONDS)))
+            hi = min(len(combined), int(round(upper / DETECTION_FRAME_SECONDS)) + 1)
+            cut = float(lo + int(np.argmin(combined[lo:hi]))) * DETECTION_FRAME_SECONDS if hi > lo else (lower + upper) / 2.0
+        else:
+            cut = (lower + upper) / 2.0
+        cut = min(max(cut, lower), upper)
+        cuts.append(cut)
+        cursor = cut
+    cuts.append(end)
+
+    proposals: list[Segment] = []
+    for index, (left, right) in enumerate(zip(cuts, cuts[1:])):
+        source = min(existing, key=lambda item: abs(item.start - left))
+        safe = True
+        reason = "global aggregate boundary verified"
+        if index:
+            safe, instruments, voices = _boundary_activity(left, stems, timelines, radius_seconds=3.0, diagnostic=True)
+            if not safe:
+                reason = f"needs review: active stems at proposal ({', '.join(instruments + voices)})"
+        proposals.append(replace(
+            Segment(
+                left,
+                right,
+                core_start=left,
+                core_end=right,
+                nominal_end=right,
+                boundary_source="global-acoustic-proposal",
+                boundary_validation="valid" if safe else "needs_review",
+                boundary_validation_reason=reason,
+                speech_text=source.speech_text if index == 0 else "",
+                speech_reason=source.speech_reason if index == 0 else "global proposal; review introduction context",
+                speech_intro_text=source.speech_intro_text if index == 0 else "",
+                speech_intro_start=source.speech_intro_start if index == 0 else None,
+                speech_confidence=source.speech_confidence if index == 0 else 0.0,
+            ),
+            boundary_source="global-acoustic-proposal",
+        ))
+    DETECTION_STRATEGY["global_bounded_partition"] = {
+        "target_count": target_count,
+        "session_start": start,
+        "session_end": end,
+        "durations": [item.duration for item in proposals],
+        "cut_points": cuts[1:-1],
+        "shared_across_stems": True,
+        "needs_review_count": sum(item.boundary_validation == "needs_review" for item in proposals),
+    }
+    return proposals
 
 
 def preserve_content_coverage(
@@ -2362,7 +2624,21 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     print("Loading cached per-stem RMS envelopes for MC-break detection...", flush=True)
     timelines = load_cached_timelines_or_die(stems, "Detection")
     durations = sorted(s.offset_seconds + s.timeline_duration for s in stems)
-    session_end = max(durations)
+    metadata_session_end = max(durations)
+    session_end = active_session_end_from_timelines(stems, timelines, metadata_session_end)
+    DETECTION_STRATEGY["global_timeline"] = {
+        "mode": "shared_parallel_stem_timeline",
+        "stem_count": len(stems),
+        "metadata_session_end_seconds": metadata_session_end,
+        "active_audio_end_seconds": session_end,
+        "tail_excluded_seconds": max(0.0, metadata_session_end - session_end),
+        "cut_list_scope": "one global list applied to every stem",
+    }
+    print(
+        f"SESSION TIMELINE: {len(stems)} parallel stems; active audio ends at "
+        f"{fmt_time(session_end)} (metadata {fmt_time(metadata_session_end)})",
+        flush=True,
+    )
     if len(durations) >= 4 and session_end > float(np.median(durations)) + 120.0:
         # A lone long export is usually a recorder tail, not a fourth-hour song.
         session_end = float(np.percentile(durations, 90))
@@ -2559,19 +2835,47 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     final_partition_audit: list[dict[str, object]] = []
     for segment in segments:
         parts = split_oversized_at_safe_boundaries(segment, stems, timelines) if segment.duration > HARD_MAX_SONG_SECONDS else []
+        if len(parts) <= 1 and segment.duration > HARD_MAX_SONG_SECONDS:
+            # Do not leave a 20--40 minute source block as one song merely
+            # because no boundary passed the automatic acoustic gate. Expose
+            # conservative song-sized proposals for Select Cuts instead.
+            soft_parts = apply_stage_clock_soft_splits([segment], stems, timelines)
+            if len(soft_parts) > 1:
+                parts = mark_partition_for_review(soft_parts, stems, timelines)
+                final_partition_audit.append({
+                    "source_start": segment.start,
+                    "source_end": segment.end,
+                    "result_durations": [part.duration for part in parts],
+                    "split_points": [part.end for part in parts[:-1]],
+                    "validation": "needs_review",
+                })
         if len(parts) > 1:
             final_partitioned.extend(parts)
-            final_partition_audit.append({
-                "source_start": segment.start,
-                "source_end": segment.end,
-                "result_durations": [part.duration for part in parts],
-                "split_points": [part.end for part in parts[:-1]],
-            })
+            if not any(item.get("source_start") == segment.start and item.get("source_end") == segment.end for item in final_partition_audit):
+                final_partition_audit.append({
+                    "source_start": segment.start,
+                    "source_end": segment.end,
+                    "result_durations": [part.duration for part in parts],
+                    "split_points": [part.end for part in parts[:-1]],
+                    "validation": "valid",
+                })
         else:
             final_partitioned.append(segment)
     if final_partition_audit:
         DETECTION_STRATEGY["final_safe_partition"] = final_partition_audit
     segments = sorted(final_partitioned, key=lambda item: item.start)
+    # Final topology is one shared cut list for the parallel session.  This
+    # pass prevents Whisper fragments and recorder tails from becoming songs
+    # and guarantees that no long source block reaches the renderer as one
+    # window.  Unsafe inferred boundaries remain needs_review.
+    segments = normalize_global_song_windows(segments, stems, timelines)
+    print(
+        "GLOBAL WINDOWS: "
+        f"{len(segments)} shared windows; "
+        f"needs_review={sum(item.boundary_validation == 'needs_review' for item in segments)}; "
+        f"out_of_range={sum(not HARD_MIN_SONG_SECONDS <= item.duration <= HARD_MAX_SONG_SECONDS for item in segments)}",
+        flush=True,
+    )
     # Re-check the final post-split topology. Earlier validation happens
     # before duration repair, and synthetic duration-safe pieces must not be
     # reported as if Whisper had verified an introduction for them.
@@ -2626,6 +2930,33 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     else:
         print(f"CALIBRATION: found {len(segments)} songs; expected around 20 or more, looks reasonable.", flush=True)
     return segments, mc_mask.astype(np.float32)
+
+
+def active_session_end_from_timelines(
+    stems: list[Stem],
+    timelines: dict[str, np.ndarray],
+    metadata_session_end: float,
+    threshold_dbfs: float = -55.0,
+) -> float:
+    """Find the shared session end from all parallel-stem envelopes.
+
+    File duration is not song duration: some recorders leave long silent tails
+    and some stems carry a different container length.  The common timeline is
+    therefore bounded by the last real activity in any decodable stem, while
+    preserving a small analysis-frame margin for the final note/reverb.
+    """
+    active_ends: list[float] = []
+    floor = db_to_amp(threshold_dbfs)
+    for stem in stems:
+        env = np.asarray(timelines.get(stem.path.name, np.array([], dtype=np.float32)), dtype=np.float64)
+        active = np.flatnonzero(env >= floor)
+        if active.size:
+            active_ends.append(float(active[-1] + 1) * DETECTION_FRAME_SECONDS)
+    if not active_ends:
+        return float(metadata_session_end)
+    # Preserve the last active tail across any one short/quiet stem, but never
+    # extend beyond the longest source container.
+    return min(float(metadata_session_end), max(active_ends) + 2.0 * DETECTION_FRAME_SECONDS)
 
 
 def load_cached_timelines_or_die(stems: list[Stem], label: str) -> dict[str, np.ndarray]:
@@ -2936,41 +3267,41 @@ def merge_unsafe_music_boundaries(
     if len(segments) < 2:
         return segments
     result = sorted(list(segments), key=lambda item: item.start)
-    merged: list[dict[str, object]] = []
-    index = 0
-    while index < len(result) - 1:
+    review_boundaries: list[dict[str, object]] = []
+    for index in range(len(result) - 1):
         left, right = result[index], result[index + 1]
         cut = float(right.start)
         safe, instruments, voices = _boundary_activity(
             cut, stems, timelines, radius_seconds=3.0, diagnostic=True
         )
         if safe:
-            index += 1
             continue
-        merged.append({
+        review_boundaries.append({
             "cut_seconds": cut,
             "active_instruments": instruments,
             "active_voices": voices,
-            "reason": "boundary crosses active music; adjacent proposals merged",
+            "reason": "boundary crosses active music; proposals retained for Select Cuts review",
         })
         result[index] = replace(
             left,
-            end=right.end,
-            nominal_end=right.end,
-            core_end=right.core_end,
-            boundary_source="needs-review-merged-active-music",
+            boundary_source="needs-review-active-music-boundary",
             boundary_validation="needs_review",
             boundary_validation_reason="active music at proposed boundary",
-            speech_reason=(left.speech_reason or "") + "; active-music boundary merged; review in Select Cuts",
+            speech_reason=(left.speech_reason or "") + "; active-music boundary retained as provisional; review in Select Cuts",
         )
-        del result[index + 1]
-        if index:
-            index -= 1
+        result[index + 1] = replace(
+            right,
+            boundary_source="needs-review-active-music-boundary",
+            boundary_validation="needs_review",
+            boundary_validation_reason="active music at proposed boundary",
+            speech_reason=(right.speech_reason or "") + "; active-music boundary retained as provisional; review in Select Cuts",
+        )
     DETECTION_STRATEGY["unsafe_music_boundary_merge"] = {
-        "merged_count": len(merged),
-        "boundaries": merged,
+        "merged_count": 0,
+        "retained_for_review_count": len(review_boundaries),
+        "boundaries": review_boundaries,
         "remaining_count": len(result),
-        "policy": "never cut active music; merge and require review",
+        "policy": "never approve active-music cuts; retain proposal and require review",
     }
     return result
 
