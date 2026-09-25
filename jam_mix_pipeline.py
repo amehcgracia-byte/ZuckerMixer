@@ -1880,6 +1880,17 @@ def validate_final_render_boundaries(
     instruments = [stem for stem in stems if stem.role not in {"vocal", "room"}]
     for index, segment in enumerate(segments):
         cut = float(segment.end)
+        if segment.boundary_source == "metadata-provisional":
+            audit.append({
+                "song": int(numbers[index]),
+                "cut_seconds": cut,
+                "cut_sample": int(round(cut * stems[0].samplerate)),
+                "active_instruments": [],
+                "safe": False,
+                "needs_review": True,
+                "reason": "Whisper unavailable; metadata-only proposal requires Select Cuts review",
+            })
+            continue
         start = max(float(segment.start), cut - 2.0)
         end = min(max(stem.timeline_duration for stem in stems), cut + 0.25)
         active: list[dict[str, object]] = []
