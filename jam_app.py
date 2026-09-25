@@ -896,14 +896,18 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
 
 
 def snapshot_has_valid_segment_windows(snapshot: dict[str, Any]) -> bool:
-    """Return whether a cached detection can be exposed without redetecting."""
+    """Return whether a cached detection can be exposed without redetecting.
+
+    Duration-invalid proposals are still useful application state: they must
+    be shown as ``needs_review`` in Select Cuts, not discarded and replaced
+    with an empty song list.  The render guard remains responsible for
+    refusing an unconfirmed invalid window.
+    """
     for item in snapshot.get("segments", []) if isinstance(snapshot, dict) else []:
         try:
             start = float(item.get("start", 0.0)) if isinstance(item, dict) else float(item.start)
             end = float(item.get("end", 0.0)) if isinstance(item, dict) else float(item.end)
         except (AttributeError, TypeError, ValueError):
-            return False
-        if not pipeline.HARD_MIN_SONG_SECONDS <= end - start <= pipeline.HARD_MAX_SONG_SECONDS:
             return False
     return bool(snapshot.get("stems")) and bool(snapshot.get("segments"))
 
@@ -1335,12 +1339,11 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
                 invalid_snapshot_durations.append(round(duration, 3))
         if invalid_snapshot_durations:
             print(
-                "DETECTION SNAPSHOT: ignored invalid persisted windows "
+                "DETECTION SNAPSHOT: exposing invalid windows as needs_review "
                 + json.dumps(invalid_snapshot_durations)
-                + "; redetecting with the current 8–13 minute contract",
+                + "; Select Cuts is required before render",
                 flush=True,
             )
-            snapshot = None
     if snapshot is not None:
         snapshot["audio_scan"] = _ensure_snapshot_scan_report(snapshot)
         with state_lock:
@@ -1502,14 +1505,24 @@ def visible_songs(
         item["skipped"] = bool(user_skipped)
         item["skip_reason"] = "skipped" if user_skipped else ""
         duration = float(item.get("duration") or 0.0)
+        segment_payload = item.get("segment") if isinstance(item.get("segment"), dict) else {}
+        boundary_review = (
+            segment_payload.get("boundary_validation") == "needs_review"
+            or str(segment_payload.get("boundary_source") or "").startswith("needs-review")
+            or segment_payload.get("boundary_source") == "metadata-provisional"
+        )
+        item["needs_review"] = bool(boundary_review)
         item["render_valid"] = (
             not user_skipped
             and MIN_RENDER_DURATION_SECONDS <= duration <= MAX_RENDER_DURATION_SECONDS
+            and not boundary_review
         )
         item["render_validation"] = (
             "valid"
             if item["render_valid"]
+            else ("needs_review: unsafe or unconfirmed boundary" if boundary_review
             else ("skipped" if user_skipped else f"duration_out_of_range:{duration:.3f}s")
+            )
         )
         if str(segment_id) in state.get("active_stems_by_song", {}):
             item["active_stems"] = state["active_stems_by_song"][str(segment_id)]
@@ -2935,8 +2948,6 @@ def api_state() -> Response:
         except Exception as exc:
             snapshot = None
             lifecycle_log("source_scan_signature_failed", error=f"{type(exc).__name__}: {exc}")
-        if snapshot is not None and not snapshot_has_valid_segment_windows(snapshot):
-            snapshot = None
         if snapshot is not None:
             snapshot["audio_scan"] = _ensure_snapshot_scan_report(snapshot)
             with state_lock:

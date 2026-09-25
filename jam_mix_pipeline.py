@@ -2479,6 +2479,10 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     # metadata restored on a repaired piece cannot leave its speech boundary
     # stranded in the preceding export.
     segments = align_transcript_introduction_boundaries(segments)
+    # Duration repair and coverage restoration can introduce new boundaries
+    # after the earlier activity gate.  Apply the same conservative gate to
+    # the final topology so a late split can never cut through active music.
+    segments = merge_unsafe_music_boundaries(segments, stems, timelines)
     # Re-check the final post-split topology. Earlier validation happens
     # before duration repair, and synthetic duration-safe pieces must not be
     # reported as if Whisper had verified an introduction for them.
