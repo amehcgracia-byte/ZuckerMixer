@@ -5947,6 +5947,11 @@ def render_segment(
         )
         for stem in stems
     }
+    for name in noise_names:
+        activity_decisions[name] = (
+            False,
+            "source broadband noise detected; kept in manifest and muted by safety policy",
+        )
     active_names = {name for name, (active, _reason) in activity_decisions.items() if active}
     active_energies = [energies[name] for name in active_names]
     if not active_energies:

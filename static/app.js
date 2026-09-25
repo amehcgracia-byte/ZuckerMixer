@@ -2598,9 +2598,25 @@ function jobErrorText(job) {
 
 async function ensureRenderPlans(songIds) {
   const missing = [];
-  for (const songId of songIds) {
-    const response = await fetch(`/api/mix-plan-status/${songId}`);
-    const data = await response.json().catch(() => ({}));
+  for (let index = 0; index < songIds.length; index += 1) {
+    const songId = songIds[index];
+    setRenderControlsBusy(true, `Preparing DSP plan ${index + 1}/${songIds.length}…`);
+    const started = Date.now();
+    const watchdog = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - started) / 1000);
+      if (elapsed >= 10) {
+        const status = document.querySelector("#currentWork");
+        if (status) status.textContent = `Preparing DSP plan ${index + 1}/${songIds.length}… stalled ${elapsed}s for song ${songId}`;
+      }
+    }, 1000);
+    let response;
+    let data;
+    try {
+      response = await fetch(`/api/mix-plan-status/${songId}`);
+      data = await response.json().catch(() => ({}));
+    } finally {
+      clearInterval(watchdog);
+    }
     if (!response.ok) throw new Error(data.error || `Could not inspect DSP plan for song ${songId}.`);
     if (!data.valid) missing.push({ songId, reason: data.reason || "Analyze required." });
   }
@@ -2793,7 +2809,7 @@ function renderJobs(items) {
     loadingLabel.textContent = scanning ? "Scanning source folder..." : "Loading songs...";
     loadingDetail.textContent = `${detectionJob.stage_detail || "working"} · ${detectionJob.progress || 0}% · ${formatRemaining(detectionJob.eta_seconds)}`;
     loadingFill.style.width = `${detectionJob.progress || 0}%`;
-    loading.classList.toggle("stalled", Date.now() - Number(detectionJob.progress_updated_at || detectionJob.heartbeat || Date.now() / 1000) * 1000 > 30000);
+    loading.classList.toggle("stalled", Date.now() - Number(detectionJob.progress_updated_at || detectionJob.heartbeat || Date.now() / 1000) * 1000 > 10000);
   } else if (loading) {
     loading.hidden = true;
   }
@@ -2807,7 +2823,11 @@ function renderJobs(items) {
     const elapsed = shortElapsed(active.started);
     const detail = active.stage_detail || "working";
     const workerPid = active.child_pid || active.pid || active.launch_pid || "pending";
-    $("#queuePosition").textContent = `${detail} · PID ${workerPid} · ${position} of ${total} · ${active.song_progress || 0}% · ${elapsed || "0:00"} elapsed · ${formatRemaining(active.eta_seconds)}`;
+    const lastEventAt = Number(active.last_event_at || active.progress_updated_at || active.heartbeat || 0) * 1000;
+    const silenceSeconds = lastEventAt ? Math.max(0, Math.floor((Date.now() - lastEventAt) / 1000)) : 0;
+    const stallText = silenceSeconds >= 10 ? ` · stalled ${silenceSeconds}s · last: ${active.last_event || detail}` : "";
+    const memoryText = active.memory_mb != null ? ` · ${active.memory_mb} MB` : "";
+    $("#queuePosition").textContent = `${detail} · PID ${workerPid} · ${position} of ${total} · ${active.song_progress || 0}% · ${elapsed || "0:00"} elapsed · ${formatRemaining(active.eta_seconds)}${memoryText}${stallText}`;
     $("#progressFill").style.width = `${active.song_progress || 0}%`;
     const messages = {
       scanning: ["Checking the room mics...", "Reading the session clock..."],
@@ -2822,10 +2842,10 @@ function renderJobs(items) {
     if (fun) fun.textContent = choices[Math.floor(Date.now() / 5000) % choices.length];
     const stall = $("#progressStall");
     const updated = Number(active.progress_updated_at || active.heartbeat || Date.now() / 1000) * 1000;
-    const stale = Date.now() - updated > 30000;
+    const stale = Date.now() - updated > 10000;
     if (stall) {
       stall.hidden = !stale;
-      stall.textContent = stale ? "This phase is still active — reading or processing a large file can keep the percentage steady for a while." : "";
+      stall.textContent = stale ? `No worker event for ${Math.floor((Date.now() - updated) / 1000)}s — stage: ${active.current_stage || "unknown"}; last event: ${active.last_event || active.stage_detail || "unknown"}. Cancel if it does not resume.` : "";
     }
   } else {
     const terminal = [...items].reverse().find((job) => ["partial_failed", "error", "cancelled"].includes(job.status));

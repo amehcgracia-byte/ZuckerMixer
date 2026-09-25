@@ -58,3 +58,14 @@ def test_out_of_range_windows_remain_visible_and_renderable_with_warning():
     assert 'if not song.get("skipped")' in source
     assert "return visibleSongs();" in frontend
     assert "needs review" in frontend
+
+
+def test_render_all_exposes_stall_diagnostics_and_keeps_source_stems():
+    app = Path(__file__).with_name("jam_app.py").read_text(encoding="utf-8")
+    pipeline = Path(__file__).with_name("jam_mix_pipeline.py").read_text(encoding="utf-8")
+    frontend = Path(__file__).with_name("static").joinpath("app.js").read_text(encoding="utf-8")
+    assert '"last_event_at"' in app
+    assert '"memory_mb"' in app
+    assert '"decodable source included; activity measurement is diagnostic only"' in pipeline
+    assert '"source broadband noise detected; kept in manifest and muted by safety policy"' in pipeline
+    assert "stalled ${silenceSeconds}s" in frontend

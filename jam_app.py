@@ -11,6 +11,7 @@ import os
 import pickle
 import queue
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -1636,6 +1637,10 @@ def job_status_debug_payload(payload: dict[str, Any] | None) -> dict[str, Any] |
         "finished_at",
         "stderr_path",
         "lifecycle_log_path",
+        "last_event",
+        "last_event_at",
+        "progress_updated_at",
+        "memory_mb",
     )
     return {key: payload.get(key) for key in keys if key in payload}
 
@@ -1886,6 +1891,15 @@ def find_job(job_id: str) -> dict[str, Any] | None:
 def set_job(job: dict[str, Any], **updates: Any) -> None:
     with state_lock:
         job.update(updates)
+        if any(key in updates for key in ("status", "current_stage", "stage_detail", "current", "done_count", "error")):
+            job["last_event_at"] = time.time()
+            stage = job.get("current_stage") or job.get("status") or "working"
+            detail = job.get("stage_detail") or ""
+            job["last_event"] = f"{stage}: {detail}".rstrip(": ")
+        try:
+            job["memory_mb"] = round(float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / (1024 * 1024), 1)
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
         write_job_status(job)
 
 
@@ -2234,6 +2248,15 @@ def app_progress(payload: dict[str, Any]) -> None:
     payload = json.loads(json.dumps(dict(payload), default=json_default))
     payload.setdefault("heartbeat", now)
     payload["progress_updated_at"] = now
+    payload["last_event_at"] = now
+    payload.setdefault(
+        "last_event",
+        f"{payload.get('current_stage', 'working')}: {payload.get('stage_detail', '')}".rstrip(": "),
+    )
+    try:
+        payload["memory_mb"] = round(float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / (1024 * 1024), 1)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
     started = payload.get("started") or child_status_snapshot.get("started")
     if started:
         elapsed = max(0.0, now - float(started))
