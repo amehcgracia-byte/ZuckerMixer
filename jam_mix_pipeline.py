@@ -5633,7 +5633,11 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
         wind_score += 0.5
     if explicit_wind:
         wind_score += 1.5
-    is_wind = wind_score >= 2.0
+    # A stem whose filename already identifies it as a vocal microphone must
+    # remain vocal unless the filename explicitly names a wind instrument.
+    # Spectral purity alone is not sufficient: sustained vowels can resemble
+    # narrow-band wind material and otherwise lose vocal-bus processing.
+    is_wind = bool(explicit_wind and wind_score >= 2.0)
     return {
         "classification": "wind" if is_wind else "voice",
         "confidence": float(np.clip(0.45 + abs(wind_score - 1.5) * 0.18, 0.0, 0.95)),
@@ -5739,7 +5743,13 @@ def analyze_song_mix_controls(
         for stem in stems if stem.role == "vocal"
     }
     effective_roles = {
-        stem.path.name: "horn" if mic_content.get(stem.path.name, {}).get("classification") == "wind" else stem.role
+        stem.path.name: (
+            "horn"
+            if stem.role == "vocal"
+            and mic_content.get(stem.path.name, {}).get("classification") == "wind"
+            and any(term in stem.path.name.lower() for term in VOICE_WIND_EXPLICIT_TERMS)
+            else stem.role
+        )
         for stem in stems
     }
     rhythm = {

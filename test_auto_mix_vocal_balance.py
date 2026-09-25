@@ -34,6 +34,10 @@ class AutoMixVocalBalanceTests(unittest.TestCase):
         self.assertEqual(pipeline.vocal_pair_key("vox L_1.wav"), "vox")
         self.assertEqual(pipeline.vocal_pair_key("vox R_1.wav"), "vox")
 
+    def test_explicit_vocal_stem_is_not_reclassified_by_spectral_heuristic(self):
+        self.assertEqual(pipeline.classify_role("vox 1_1.wav"), "vocal")
+        self.assertEqual(pipeline.classify_role("Vox 2_1.wav"), "vocal")
+
 
 if __name__ == "__main__":
     unittest.main()
