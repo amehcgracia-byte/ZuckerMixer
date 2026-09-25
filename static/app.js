@@ -260,7 +260,8 @@ function stemEq(song, stem) {
 function stemGainDb(song, stem) {
   const ov = currentStemOverrides(song, stem.file);
   const params = previewStemParams(song, stem);
-  if (Number.isFinite(Number(ov.gain_db))) return Number(ov.gain_db);
+  if (ov.user_confirmed && Number.isFinite(Number(ov.gain_db))) return Number(ov.gain_db);
+  if (params && Number.isFinite(Number(params.user_gain_db))) return Number(params.user_gain_db);
   if (params && Number.isFinite(Number(params.gain_db))) return Number(params.gain_db);
   return 0;
 }
@@ -336,7 +337,9 @@ function effectiveMixDump(songIndex, reason = "preview") {
       const makeupGainDb = numeric(params.makeup_gain_db, 0);
       const userGainDb = stemGainDb(songIndex, stem);
       const preGainDb = makeupGainDb + userGainDb;
-      const faderDb = numeric(ov.fader_db, numeric(params.fader_db, 0));
+      const faderDb = ov.user_confirmed
+        ? numeric(ov.fader_db, 0)
+        : numeric(params.user_fader_db, 0);
       const muted = Boolean(ov.mute) || faderDb <= -60;
       const solo = Boolean(ov.solo);
       const fxEnabled = ov.fx_enabled === true;
@@ -1025,7 +1028,9 @@ function renderFaders(root, songIndex) {
       ov.eq_air_gain_db ??= Number(params.eq_air_gain_db);
     }
     const gainDb = stemGainDb(songIndex, stem);
-    const fader = Number(ov.fader_db || 0);
+    const fader = ov.user_confirmed
+      ? Number(ov.fader_db || 0)
+      : Number(params?.user_fader_db ?? 0);
     const automaticFaderDb = Number(params?.automatic_fader_db ?? params?.computed_gain_db ?? 0);
     if (!Number.isFinite(Number(ov.pan))) ov.pan = defaultPan(stem);
     const pan = Number(ov.pan);
@@ -1067,6 +1072,7 @@ function renderFaders(root, songIndex) {
       const liveGainDb = Number(gainSlider.value);
       ov.gain_db = liveGainDb;
       setLinkedOverride(songIndex, linked, "gain_db", liveGainDb);
+      linked.forEach((item) => { stemOverrides(songIndex, item.file).user_confirmed = true; });
       gainLabel.textContent = signedDb(liveGainDb);
       linked.forEach((item) => applyLivePreGain(songIndex, item, liveGainDb, "gain:direct-input"));
       persistPreviewChange(songIndex, `gain:${stem.file}`);
@@ -1093,6 +1099,7 @@ function renderFaders(root, songIndex) {
       const liveFaderDb = Number(slider.value);
       ov.fader_db = liveFaderDb;
       setLinkedOverride(songIndex, linked, "fader_db", liveFaderDb);
+      linked.forEach((item) => { stemOverrides(songIndex, item.file).user_confirmed = true; });
       label.textContent = `Trim ${amount(ov.fader_db)} · auto ${signedDb(automaticFaderDb)}`;
       applyLiveFaderGain(songIndex, stem, liveFaderDb, "fader:direct-input");
       linked.forEach((item) => updatePreviewGains(songIndex, item.file, "fader", { faderDb: liveFaderDb }));

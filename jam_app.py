@@ -438,6 +438,18 @@ def stem_is_active_for_preview(
     return active
 
 
+def persisted_fader_values(stem_ov: dict[str, Any]) -> tuple[float, float, bool]:
+    """Return trusted user fader, legacy fader, and provenance flag.
+
+    Older state files used one ambiguous fader field. Those values remain
+    available for audit/undo, but must not silently attenuate a new Auto-Mix.
+    The UI marks an explicit edit with ``user_confirmed``.
+    """
+    raw = float(stem_ov.get("fader_db", 0.0) or 0.0)
+    trusted = bool(stem_ov.get("user_confirmed", False) or stem_ov.get("user_fader_confirmed", False))
+    return (raw if trusted else 0.0, raw if not trusted else 0.0, trusted)
+
+
 def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     state = ensure_pipeline_state()
     if segment_id < 1 or segment_id > len(state["segments"]):
@@ -545,6 +557,10 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         stem_ov = stems_overrides.get(stem.path.name, {})
         if not isinstance(stem_ov, dict):
             stem_ov = {}
+        user_fader_db, legacy_fader_db, fader_trusted = persisted_fader_values(stem_ov)
+        raw_gain_db = float(stem_ov.get("gain_db", 0.0) or 0.0)
+        user_gain_db = raw_gain_db if fader_trusted else 0.0
+        legacy_gain_db = raw_gain_db if not fader_trusted else 0.0
         mix_role = str(effective_roles.get(stem.path.name, stem.role))
         rhythm_adjustment_db = float(rhythm_controls.get(stem.path.name, {}).get("attenuation_db", 0.0))
         priority_adjustment_db = float(vocal_priority.get(stem.path.name, 0.0))
@@ -561,8 +577,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             pipeline.AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, pipeline.AUTO_MIX_MAX_BOOST_DB),
         ))
         lead_bonus = 1.5 if energies.get(stem.path.name, 0.0) > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
-        if "makeup_gain_db" not in stem_ov and "gain_db" in stem_ov:
-            stem_ov["makeup_gain_db"] = float(stem_ov.get("gain_db", computed_gain_db) or 0.0)
+        if "makeup_gain_db" not in stem_ov and "gain_db" in stem_ov and fader_trusted:
+            stem_ov["makeup_gain_db"] = user_gain_db
             stem_ov["gain_db"] = 0.0
             initialized_makeup_names.add(stem.path.name)
             changed = True
@@ -607,8 +623,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             changed = True
         stems_overrides[stem.path.name] = stem_ov
         makeup_gain_db = float(stem_ov.get("makeup_gain_db", computed_gain_db))
-        gain_db = float(stem_ov.get("gain_db", 0.0))
-        fader_db = float(stem_ov.get("fader_db", 0.0) or 0.0)
+        gain_db = user_gain_db
+        fader_db = user_fader_db
         mute = bool(stem_ov.get("mute", False)) or fader_db <= pipeline.FADER_HARD_SILENCE_DB
         solo = bool(stem_ov.get("solo", False))
         base_reverb = pipeline.reverb_send_level_db(mix_role)
@@ -628,6 +644,12 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "base_level_db": pipeline.base_level_db(mix_role),
             "makeup_gain_db": makeup_gain_db,
             "gain_db": gain_db,
+            "user_gain_db": user_gain_db,
+            "user_fader_db": user_fader_db,
+            "legacy_gain_db": legacy_gain_db,
+            "legacy_fader_db": legacy_fader_db,
+            "legacy_gain_state": "legacy_untrusted" if (abs(legacy_gain_db) > 0.001 or abs(legacy_fader_db) > 0.001) else "none",
+            "user_confirmed": fader_trusted,
             "computed_gain_db": computed_gain_db,
             "active_level_db": active_level,
             "accompaniment_reference_db": accompaniment_reference_db,

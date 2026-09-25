@@ -4711,6 +4711,13 @@ def per_song_auto_mix_gain_db(
 def vocal_pair_key(name: str) -> str:
     """Return a stable logical pair key without changing channel panning."""
     low = re.sub(r"\.[^.]+$", "", str(name or "")).lower()
+    # Generic two-channel vocal captures are commonly named ``Vox 1`` and
+    # ``Vox 2`` (sometimes with a take suffix). They are one vocal pair for
+    # analysis, while remaining separate channels for pan and rendering.
+    if re.match(r"^(?:vox|vocal|voice|mic)[ _-]*[12](?:[_ -]?\d+)?$", low):
+        return "vocal_pair"
+    if re.match(r"^(?:vox|vocal|voice|mic)[ _-]*(?:l|left|r|right)(?:[_ -]?\d+)?$", low):
+        return "vocal_pair"
     low = re.sub(r"[_ -]?\d+$", "", low)
     low = re.sub(r"(?:^|[ _-])(left|right|l|r)$", "", low).strip(" _-")
     return re.sub(r"[^a-z0-9]+", "_", low).strip("_") or "vocal"
