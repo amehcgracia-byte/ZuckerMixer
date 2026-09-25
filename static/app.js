@@ -549,13 +549,25 @@ function persistPreviewChange(songIndex, reason) {
 }
 
 async function loadState() {
-  const res = await fetch("/api/state");
-  appState = await res.json();
+  let res;
+  try {
+    res = await fetch("/api/state");
+    appState = await res.json();
+  } catch (error) {
+    appState = appState || {
+      songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [],
+      source_folder: "Not available", last_error: error?.message || String(error),
+    };
+    showToast(`Error loading folder: ${appState.last_error}`);
+  }
   renderBuildInfo();
   syncOverrideSequenceFromState();
   const detected = visibleSongs().length;
   const review = visibleSongs().filter((song) => song.render_valid === false).length;
-  $("#songCount").textContent = `${detected} songs detected / ${renderableSongs().length} songs prepared${review ? ` · ${review} needs review` : ""}`;
+  const loadError = appState.last_error || appState.audio_scan?.error;
+  $("#songCount").textContent = loadError
+    ? `Error loading folder: ${loadError}`
+    : `${detected} songs detected / ${renderableSongs().length} songs prepared${review ? ` · ${review} needs review` : ""}`;
   if (appState.ffmpeg && !appState.ffmpeg.ok) {
     showToast("ffmpeg is missing. Install it with Homebrew: brew install ffmpeg");
   }
@@ -726,12 +738,14 @@ function renderCutTools() {
     const includedWarningText = includedWarnings.length
       ? ` · included with warning ${includedWarnings.length}`
       : "";
+    const scanStatus = scan.status ? `<strong>${esc(scan.status)}</strong>` : "";
+    const scanError = scan.error ? `<div class="scan-warning">Error loading folder: ${esc(scan.error)}</div>` : "";
     if (scan.fragment_warning) {
       const aligned = Array.isArray(scan.aligned_files) ? scan.aligned_files : [];
       const fragments = Array.isArray(scan.fragment_files) ? scan.fragment_files : [];
       scanNode.innerHTML = `
         <strong class="scan-warning">${esc(scan.fragment_warning)}</strong>
-        <span>Using all decodable files${includedWarningText}.</span>
+        ${scanStatus}${scanError}<span>Using all decodable files${includedWarningText}.</span>
         <details>
           <summary>Show included/excluded files</summary>
           <div><strong>Included files (${accepted.length}; aligned exports detected: ${aligned.length})</strong><br>${accepted.map((item) => esc(item.file)).join("<br>") || "none"}</div>
@@ -740,7 +754,7 @@ function renderCutTools() {
         </details>
       `;
     } else {
-      scanNode.textContent = `Audio scan: accepted ${accepted.length}${acceptedText}${skippedText}`;
+      scanNode.innerHTML = `${scanStatus} <span>Audio scan: accepted ${accepted.length}${esc(acceptedText)}${esc(skippedText)}</span>${scanError}`;
     }
   }
   const signature = transitionsSignature(appState.transitions);
@@ -3053,6 +3067,20 @@ if (typeof document !== "undefined") {
       return;
     }
     await pollJobs();
+    const waitForSourceDetection = async () => {
+      const jobs = await pollJobs();
+      const job = [...jobs].reverse().find((item) => item.kind === "redetect");
+      if (job?.status === "done") {
+        await loadState();
+        showToast(`${appState.audio_scan?.accepted?.length || 0} WAV/audio files loaded.`);
+      } else if (job?.status === "error" || job?.status === "cancelled") {
+        await loadState();
+        showToast(`Error loading folder: ${job.error || job.stage_detail || job.status}`);
+      } else {
+        setTimeout(() => waitForSourceDetection().catch((err) => showToast(`Error loading folder: ${err.message || err}`)), 1000);
+      }
+    };
+    setTimeout(() => waitForSourceDetection().catch((err) => showToast(`Error loading folder: ${err.message || err}`)), 250);
   });
 
   // Start the lightweight job channel before the expensive initial state

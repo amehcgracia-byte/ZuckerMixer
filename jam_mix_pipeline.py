@@ -495,6 +495,8 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
             "source": str(source_dir),
             "accepted": [],
             "skipped": [{"file": str(source_dir), "reason": "source folder not found"}],
+            "status": "Error loading folder",
+            "error": "source folder not found",
             "mode": AUDIO_SCAN_MODE,
             "fragment_warning": "",
             "fragment_files": [],
@@ -502,7 +504,20 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
             "using_aligned_only": False,
         }
         return [], report
-    candidates = sorted(p for p in source_dir.iterdir() if p.is_file())
+    # Selected jams may contain subfolders.  Keep every file in the scan and
+    # match extensions case-insensitively; the source folder is the user's
+    # authority, not the layout used by the previous jam.
+    candidates = sorted(
+        (Path(root) / name)
+        for root, _dirs, names in os.walk(source_dir, onerror=lambda _error: None)
+        for name in names
+    )
+
+    def display_name(path: Path) -> str:
+        try:
+            return str(path.relative_to(source_dir))
+        except ValueError:
+            return path.name
     scan_total_bytes = sum(max(0, path.stat().st_size) for path in candidates)
     scan_bytes_done = 0
     scan_started = time.perf_counter()
@@ -516,7 +531,7 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
     for file_index, path in enumerate(candidates, 1):
         suffix = path.suffix.lower()
         if suffix not in ACCEPTED_AUDIO_EXTENSIONS:
-            skipped.append({"file": path.name, "reason": "unsupported format"})
+            skipped.append({"file": display_name(path), "reason": "unsupported format"})
             scan_bytes_done += max(0, path.stat().st_size)
             ratio = scan_bytes_done / max(1, scan_total_bytes)
             elapsed = max(0.001, time.perf_counter() - scan_started)
@@ -529,7 +544,7 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
                 raise ValueError("empty or invalid audio")
             valid.append((path, prepared, info))
         except Exception as exc:
-            skipped.append({"file": path.name, "reason": f"unreadable/corrupt: {exc}"})
+            skipped.append({"file": display_name(path), "reason": f"unreadable/corrupt: {exc}"})
         scan_bytes_done += max(0, path.stat().st_size)
         ratio = scan_bytes_done / max(1, scan_total_bytes)
         elapsed = max(0.001, time.perf_counter() - scan_started)
@@ -610,7 +625,7 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
             accepted.append(prepared)
     report = {
         "source": str(source_dir),
-        "accepted": [{"file": path.name, "path": str(path)} for path in accepted],
+        "accepted": [{"file": display_name(path), "path": str(path)} for path, _prepared, _info in valid],
         "skipped": skipped,
         "included_warnings": included_warnings,
         "mode": scan_mode,
@@ -623,6 +638,8 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
         "fragment_files": [path.name for path in fragment_paths],
         "aligned_files": [path.name for path in aligned_paths],
         "using_aligned_only": use_aligned_only,
+        "status": f"WAV files found: {sum(1 for path, _prepared, _info in valid if path.suffix.lower() == '.wav')} (accepted audio: {len(valid)})",
+        "error": "",
     }
     return accepted, report
 
@@ -630,6 +647,7 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
 def list_audio_files(source_dir: Path) -> list[Path]:
     global AUDIO_SCAN_REPORT
     paths, AUDIO_SCAN_REPORT = scan_audio_files(source_dir)
+    AUDIO_SCAN_REPORT["status"] = f"WAV files found: {sum(1 for item in AUDIO_SCAN_REPORT.get('accepted', []) if str(item.get('file', '')).lower().endswith('.wav'))}"
     return paths
 
 
@@ -701,10 +719,12 @@ def inspect_stems(source_dir: Path) -> list[Stem]:
             offset_seconds=offset,
             offset_source=offset_source,
         )
+        # A decodable WAV is a real stem even when it is short or mostly
+        # silent.  Keep it visible to the application; low activity is a
+        # detection warning, never a silent load exclusion.
+        stems.append(stem)
         if duration < MIN_SONG_SECONDS:
             excluded.append(stem)
-        else:
-            stems.append(stem)
         bytes_done += max(0, path.stat().st_size)
         elapsed = max(0.001, time.perf_counter() - scan_started)
         ratio = bytes_done / max(1, total_bytes)
@@ -721,11 +741,11 @@ def inspect_stems(source_dir: Path) -> list[Stem]:
         print("  Excluded Logic fragments:")
         for name in scan.get("fragment_files", []):
             print(f"    excluded: {name}")
-    print(f"Audio files: {len(stems) + len(excluded)}")
+    print(f"Audio files: {len(stems)}")
     if excluded:
-        print(f"Excluded junk clips shorter than {MIN_SONG_SECONDS:.0f}s: {len(excluded)}")
+        print(f"Short audio files retained for review: {len(excluded)}")
         for stem in excluded:
-            print(f"  excluded: {stem.path.name:18s} dur={fmt_time(stem.duration)}")
+            print(f"  retained: {stem.path.name:18s} dur={fmt_time(stem.duration)}")
     print(f"Usable stems: {len(stems)}")
     for stem in stems:
         print(
@@ -737,7 +757,7 @@ def inspect_stems(source_dir: Path) -> list[Stem]:
     print("\nSTEM TIMELINE OFFSETS")
     print("  filename             offset       source")
     for stem in stems:
-        print(f"  {stem.path.name:20s} {fmt_time(stem.offset_seconds):>11s}  {stem.offset_source}")
+            print(f"  {stem.path.name:20s} {fmt_time(stem.offset_seconds):>11s}  {stem.offset_source}")
     if missing_bext:
         print("\nWARNING: files without BWF/bext time_reference were assigned offset 00:00:00.00.")
         print("Verify these offsets before mixing; AIFF files usually do not contain a bext chunk.")
@@ -771,6 +791,7 @@ def inspect_stems(source_dir: Path) -> list[Stem]:
         print("  filename             offset       note")
         for stem in stems:
             print(f"  {stem.path.name:20s} {fmt_time(stem.offset_seconds):>11s}  aligned export")
+    AUDIO_SCAN_REPORT["status"] = f"Loaded {len(stems)} WAV files"
     return stems
 
 

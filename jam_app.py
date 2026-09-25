@@ -82,6 +82,7 @@ jobs: list[dict[str, Any]] = []
 log_lines: list[dict[str, Any]] = []
 pipeline_state: dict[str, Any] | None = None
 pipeline_state_signature: tuple[float | None, tuple[float, ...]] | None = None
+last_load_error: str = ""
 cancel_requested = False
 active_job_by_id: dict[str, dict[str, Any]] = {}
 server_ref: Any | None = None
@@ -839,6 +840,14 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, PREVIEW_DIR
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
+    pipeline.AUDIO_SCAN_REPORT = {
+        "source": str(source),
+        "accepted": [],
+        "skipped": [],
+        "included_warnings": [],
+        "status": "Scanning folder",
+        "error": "",
+    }
     pipeline.configure_detection_cache(source, STATE_ROOT)
     source_key = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:20]
     ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "sources" / source_key
@@ -905,13 +914,16 @@ def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int
     source = Path(pipeline.SOURCE_DIR)
     files: list[tuple[str, int, int]] = []
     if source.is_dir():
-        for path in sorted(source.iterdir()):
-            if path.is_file() and path.suffix.lower() in pipeline.ACCEPTED_AUDIO_EXTENSIONS:
-                try:
-                    stat = path.stat()
-                    files.append((path.name, stat.st_size, stat.st_mtime_ns))
-                except OSError:
-                    continue
+        for root, _dirs, names in os.walk(source, onerror=lambda _error: None):
+            for name in names:
+                path = Path(root) / name
+                if path.suffix.lower() in pipeline.ACCEPTED_AUDIO_EXTENSIONS:
+                    try:
+                        stat = path.stat()
+                        files.append((str(path.relative_to(source)), stat.st_size, stat.st_mtime_ns))
+                    except (OSError, ValueError):
+                        continue
+    files.sort()
     return (str(source), tuple(mtimes), tuple(files))
 
 
@@ -952,13 +964,17 @@ def _waveform_identity() -> dict[str, Any]:
     """Cheap source identity used to invalidate the low-resolution waveform cache."""
     files = []
     source = Path(pipeline.SOURCE_DIR)
-    for path in sorted(source.iterdir()) if source.is_dir() else []:
-        if path.is_file() and path.suffix.lower() in pipeline.ACCEPTED_AUDIO_EXTENSIONS:
-            try:
-                stat = path.stat()
-                files.append({"name": path.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
-            except OSError:
-                continue
+    if source.is_dir():
+        for root, _dirs, names in os.walk(source, onerror=lambda _error: None):
+            for name in names:
+                path = Path(root) / name
+                if path.suffix.lower() in pipeline.ACCEPTED_AUDIO_EXTENSIONS:
+                    try:
+                        stat = path.stat()
+                        files.append({"name": str(path.relative_to(source)), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+                    except (OSError, ValueError):
+                        continue
+    files.sort(key=lambda item: item["name"])
     return {"source": str(source), "files": files, "version": 1, "points": 2400}
 
 
@@ -1286,6 +1302,8 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
         with state_lock:
             pipeline_state = snapshot
             pipeline_state_signature = signature
+        if isinstance(snapshot.get("audio_scan"), dict):
+            pipeline.AUDIO_SCAN_REPORT = dict(snapshot["audio_scan"])
         print(f"DETECTION SNAPSHOT: reused {DETECTION_STATE_PATH}; render/preview will not recalibrate", flush=True)
         return snapshot
     capture = JobLog("detect")
@@ -1468,8 +1486,61 @@ def visible_songs(
     return songs
 
 
+def _loading_state(error: str = "") -> dict[str, Any]:
+    """Return a useful state even when detection has not completed."""
+    settings = load_settings()
+    source = str(pipeline.SOURCE_DIR)
+    scan = dict(pipeline.audio_scan_report() or {})
+    if scan.get("source") != source:
+        scan["source"] = source
+    scan.setdefault("accepted", [])
+    scan.setdefault("skipped", [])
+    scan.setdefault("included_warnings", [])
+    scan["status"] = "Error loading folder" if error else scan.get("status", "Scanning folder")
+    scan["error"] = error
+    stem_info = []
+    for index, item in enumerate(scan.get("accepted", []), 1):
+        file_name = str(item.get("file") or Path(str(item.get("path") or "")).name)
+        stem_info.append({
+            "index": index,
+            "file": file_name,
+            "name": Path(file_name).stem,
+            "label": Path(file_name).stem,
+            "role": pipeline.classify_role(Path(file_name).stem),
+            "base_level_db": pipeline.base_level_db(pipeline.classify_role(Path(file_name).stem)),
+            "reverb_send_db": 0.0,
+            "delay_send_db": 0.0,
+        })
+    return {
+        "songs": [],
+        "transitions": [],
+        "stems": stem_info,
+        "overrides": load_json(OVERRIDES_PATH, {"songs": {}}),
+        "settings": settings,
+        "jobs": current_jobs(),
+        "output_dir": str(out_dir()),
+        "average_render_seconds": 180.0,
+        "ffmpeg": ffmpeg_status(),
+        "source_folder": source,
+        "audio_scan": scan,
+        "detection_calibration": {"status": "not_available", "count": 0},
+        "segmentation_status": "not_available",
+        "last_error": error,
+        "build": BUILD_METADATA,
+    }
+
+
 def public_state() -> dict[str, Any]:
-    state = ensure_pipeline_state()
+    global last_load_error
+    try:
+        state = ensure_pipeline_state()
+        last_load_error = ""
+    except Exception as exc:
+        last_load_error = f"{type(exc).__name__}: {exc}"
+        traceback_text = traceback.format_exc()
+        lifecycle_log("state_load_failed", error=last_load_error, traceback=traceback_text)
+        print("STATE_LOAD_FAILED " + last_load_error + "\n" + traceback_text, flush=True)
+        return _loading_state(last_load_error)
     history = load_json(HISTORY_PATH, {})
     disk = disk_versions()
     names = load_song_names()
@@ -1516,7 +1587,9 @@ def public_state() -> dict[str, Any]:
         "average_render_seconds": sum(render_seconds) / len(render_seconds) if render_seconds else 180.0,
         "ffmpeg": ffmpeg_status(),
         "source_folder": str(pipeline.SOURCE_DIR),
-        "audio_scan": pipeline.audio_scan_report(),
+        "audio_scan": state.get("audio_scan") or pipeline.audio_scan_report(),
+        "segmentation_status": "ready",
+        "last_error": last_load_error,
         "detection_calibration": state.get("detection_calibration", {}),
         "matchering": {
             "available": pipeline.matchering_api is not None,
@@ -2782,7 +2855,10 @@ def favicon() -> Response:
 
 @app.get("/api/state")
 def api_state() -> Response:
-    return jsonify(public_state())
+    # Loading/detection failures are application state, not a server crash.
+    # Always return a JSON diagnostic so the UI can show the exact cause and
+    # the files found before the failure.
+    return jsonify(public_state()), 200
 
 
 @app.get("/api/cuts/<int:song_id>")
@@ -2960,7 +3036,7 @@ def api_mix_plan_status(segment_id: int) -> Response:
 
 @app.post("/api/settings")
 def api_settings() -> Response:
-    global pipeline_state, pipeline_state_signature
+    global pipeline_state, pipeline_state_signature, last_load_error
     payload = request.get_json(force=True, silent=True) or {}
     settings = load_settings()
     if "skipped_segments" in payload:
@@ -2975,6 +3051,7 @@ def api_settings() -> Response:
         if source is None or not source.is_dir():
             return jsonify({"error": "source folder not found"}), 400
         configure_source_folder(source)
+        last_load_error = ""
         settings["source_folder"] = str(source)
         with state_lock:
             pipeline_state = None
@@ -2985,6 +3062,7 @@ def api_settings() -> Response:
             return jsonify({"error": "invalid audio scan mode"}), 400
         settings["audio_scan_mode"] = mode
         pipeline.AUDIO_SCAN_MODE = mode
+        last_load_error = ""
         with state_lock:
             pipeline_state = None
             pipeline_state_signature = None
