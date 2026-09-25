@@ -895,6 +895,36 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
         return None
 
 
+def _ensure_snapshot_scan_report(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Backfill scan details for older snapshots created before scan metadata."""
+    report = snapshot.get("audio_scan")
+    if isinstance(report, dict) and report.get("accepted"):
+        return report
+    stems = snapshot.get("stems", [])
+    accepted = []
+    source = Path(pipeline.SOURCE_DIR)
+    for stem in stems:
+        path = Path(stem.path)
+        try:
+            name = str(path.relative_to(source))
+        except ValueError:
+            name = path.name
+        accepted.append({"file": name, "path": str(path)})
+    return {
+        "source": str(source),
+        "accepted": accepted,
+        "skipped": [],
+        "included_warnings": [],
+        "mode": "cached",
+        "fragment_warning": "",
+        "fragment_files": [],
+        "aligned_files": [],
+        "using_aligned_only": False,
+        "status": f"Loaded {len(accepted)} WAV files",
+        "error": "",
+    }
+
+
 def save_detection_snapshot(state: dict[str, Any], signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> None:
     payload = {
         "version": 1,
@@ -1299,6 +1329,7 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
             )
             snapshot = None
     if snapshot is not None:
+        snapshot["audio_scan"] = _ensure_snapshot_scan_report(snapshot)
         with state_lock:
             pipeline_state = snapshot
             pipeline_state_signature = signature
