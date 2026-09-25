@@ -2485,7 +2485,10 @@ def _run_child_job(job_path: Path) -> int:
     )
     print(f"APP_PROGRESS_DEBUG child status file {child_status_path}", flush=True)
     pipeline.PROGRESS_HOOK = app_progress
-    pipeline.WHISPER_ALLOWED = bool(payload.get("allow_whisper", True))
+    # Render jobs must never enter optional Whisper analysis.  Source
+    # registration may explicitly request it, but a normal render defaults to
+    # the already-registered WAV metadata and persisted plan.
+    pipeline.WHISPER_ALLOWED = bool(payload.get("allow_whisper", False))
     kind = payload.get("kind")
     songs = [int(x) for x in payload.get("songs", [])]
     job_id = str(payload.get("id", "child"))

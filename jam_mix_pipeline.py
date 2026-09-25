@@ -7259,11 +7259,16 @@ def write_report(out_dir: Path, rows: list[dict[str, object]], segments: list[Se
                 if item.get("performance_deviation_db") is not None
             ]
             f.write("    Per-song role adaptation: " + ("; ".join(adaptive) if adaptive else "none") + "\n")
-            voice_mics = [
-                f"{item['name']}={item.get('content_classification', {}).get('classification', 'unknown')}"
-                for item in row.get("stem_report", [])
-                if item.get("source_role") == "vocal"
-            ]
+            voice_mics = []
+            for item in row.get("stem_report", []):
+                if item.get("source_role") != "vocal":
+                    continue
+                classification = item.get("content_classification")
+                if not isinstance(classification, dict):
+                    classification = {}
+                voice_mics.append(
+                    f"{item['name']}={classification.get('classification', 'unknown')}"
+                )
             f.write("    Mic content (per song): " + (", ".join(voice_mics) if voice_mics else "none") + "\n")
             rhythm_flags = [
                 f"{item['name']} {float(item.get('rhythmic_attenuation_db', 0.0)):+.1f} dB ({item.get('rhythm_analysis', {}).get('reason', 'flagged')})"
