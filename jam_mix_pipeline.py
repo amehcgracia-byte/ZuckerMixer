@@ -4708,6 +4708,87 @@ def per_song_auto_mix_gain_db(
     return float(np.clip(requested, AUTO_MIX_MAX_ATTENUATION_DB, upper))
 
 
+def vocal_pair_key(name: str) -> str:
+    """Return a stable logical pair key without changing channel panning."""
+    low = re.sub(r"\.[^.]+$", "", str(name or "")).lower()
+    low = re.sub(r"[_ -]?\d+$", "", low)
+    low = re.sub(r"(?:^|[ _-])(left|right|l|r)$", "", low).strip(" _-")
+    return re.sub(r"[^a-z0-9]+", "_", low).strip("_") or "vocal"
+
+
+def mix_role_group(role: str, name: str = "") -> str:
+    """Group stems for balance while preserving their individual channels."""
+    if role in {"vocal", "room"}:
+        return "vocals"
+    if role in {"keys", "keys_l", "keys_r", "synth"}:
+        return "harmonic_keys"
+    if role == "guitar":
+        return "harmonic_guitar"
+    if role in {"sax", "horn"}:
+        return "melodic_winds"
+    if role == "bass":
+        return "bass"
+    if role in {"kick", "snare", "drums"}:
+        return "rhythm"
+    return role or "other"
+
+
+def group_active_level_db(names: list[str], active_levels_db: dict[str, float]) -> float | None:
+    """Combine active RMS levels in power, never by arithmetic dB averaging."""
+    values = [
+        float(active_levels_db[name])
+        for name in names
+        if name in active_levels_db and np.isfinite(active_levels_db[name]) and active_levels_db[name] > -100.0
+    ]
+    if not values:
+        return None
+    return amp_to_db(float(np.sqrt(np.sum(np.power(10.0, np.asarray(values) / 10.0)))))
+
+
+def vocal_harmonic_balance(
+    effective_roles: dict[str, str],
+    active_levels_db: dict[str, float],
+    envelopes: dict[str, np.ndarray] | None = None,
+) -> dict[str, object]:
+    """Measure the per-song vocal-vs-harmonic relationship."""
+    vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room"}]
+    harmonic_names = [
+        name for name, role in effective_roles.items()
+        if role in {"keys", "keys_l", "keys_r", "synth", "guitar"}
+    ]
+    vocal_level = group_active_level_db(vocal_names, active_levels_db)
+    harmonic_level = group_active_level_db(harmonic_names, active_levels_db)
+    overlap = None
+    if envelopes and vocal_names and harmonic_names:
+        def group_env(names: list[str]) -> np.ndarray | None:
+            arrays = [np.asarray(envelopes[n], dtype=np.float64) for n in names if n in envelopes and len(envelopes[n])]
+            if not arrays:
+                return None
+            length = min(len(a) for a in arrays)
+            return np.sqrt(np.sum([np.square(a[:length]) for a in arrays], axis=0))
+        vocal_env = group_env(vocal_names)
+        harmonic_env = group_env(harmonic_names)
+        if vocal_env is not None and harmonic_env is not None and len(vocal_env):
+            voice_mask = vocal_env > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
+            overlap = float(np.mean(harmonic_env[voice_mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(voice_mask) else 0.0
+    gap = None if vocal_level is None or harmonic_level is None else float(vocal_level - harmonic_level)
+    vocal_correction = 0.0
+    if gap is not None and gap < VOCAL_PRIORITY_MARGIN_DB:
+        vocal_correction = float(np.clip((VOCAL_PRIORITY_MARGIN_DB + 0.5) - gap, 0.0, 3.0))
+    harmonic_correction = 0.0
+    if gap is not None and gap < VOCAL_PRIORITY_MARGIN_DB and (overlap is None or overlap >= 0.35):
+        harmonic_correction = -float(np.clip(VOCAL_PRIORITY_MARGIN_DB - gap, 2.0, 4.0))
+    return {
+        "vocal_names": vocal_names,
+        "harmonic_names": harmonic_names,
+        "vocal_group_level_db": vocal_level,
+        "harmonic_group_level_db": harmonic_level,
+        "vocal_minus_harmonic_db": gap,
+        "vocal_harmonic_overlap_fraction": overlap,
+        "vocal_group_correction_db": vocal_correction,
+        "harmonic_group_correction_db": harmonic_correction,
+        "balance_method": "per-song active RMS power groups plus active-envelope overlap",
+    }
 
 
 def role_norms_from_detection_cache(stems: list[Stem]) -> dict[str, float]:
@@ -5642,7 +5723,15 @@ def analyze_harmonic_consistency(stem: Stem, segment: Segment, reference: np.nda
             "reason": "persistent out-of-key content" if flagged else "harmonically compatible"}
 
 
-def analyze_song_mix_controls(stems: list[Stem], segment: Segment, sr: int, rms_values_db: dict[str, float], role_norms_db: dict[str, float]) -> dict[str, object]:
+def analyze_song_mix_controls(
+    stems: list[Stem],
+    segment: Segment,
+    sr: int,
+    rms_values_db: dict[str, float],
+    role_norms_db: dict[str, float],
+    active_levels_db: dict[str, float] | None = None,
+    segment_envelopes: dict[str, np.ndarray] | None = None,
+) -> dict[str, object]:
     """Return independent per-song content roles, rhythm trims, and vocal priority trims."""
     bpm, bpm_confidence = estimate_segment_drum_bpm(stems, segment, sr)
     mic_content = {
@@ -5666,33 +5755,27 @@ def analyze_song_mix_controls(stems: list[Stem], segment: Segment, sr: int, rms_
         stem.path.name: analyze_harmonic_consistency(stem, segment, reference, RHYTHM_ANALYSIS_SR, rms_values_db.get(stem.path.name, -120.0))
         for stem in stems
     }
+    active_levels_db = active_levels_db or dict(rms_values_db)
+    balance = vocal_harmonic_balance(effective_roles, active_levels_db, segment_envelopes)
+    vocal_names = set(balance["vocal_names"])
+    harmonic_names = set(balance["harmonic_names"])
+    vocal_group_correction = float(balance["vocal_group_correction_db"] or 0.0)
+    harmonic_group_correction = float(balance["harmonic_group_correction_db"] or 0.0)
     initial_levels = {}
     for stem in stems:
         role = effective_roles[stem.path.name]
-        initial_levels[stem.path.name] = rms_values_db.get(stem.path.name, -120.0) + automatic_makeup_gain_db(
-            rms_values_db.get(stem.path.name, -120.0), role, role_norm_db=role_norms_db.get(role)
-        )
-    voice_names = [name for name, role in effective_roles.items() if role == "vocal" and rms_values_db.get(name, -120.0) > -90.0]
-    voice_floor = float(np.median([initial_levels[name] for name in voice_names])) - VOCAL_PRIORITY_MARGIN_DB if voice_names else None
-    priority = {}
-    for name, role in effective_roles.items():
-        if role in {"guitar", "keys", "keys_l", "keys_r", "synth", "horn", "sax"} and voice_floor is not None:
-            priority[name] = float(min(0.0, voice_floor - initial_levels[name]))
-        else:
-            priority[name] = 0.0
-    melodic_levels = [
-        initial_levels[name]
-        for name, role in effective_roles.items()
-        if role in {"guitar", "keys", "keys_l", "keys_r"}
-    ]
+        initial_levels[stem.path.name] = active_levels_db.get(stem.path.name, -120.0)
+    voice_floor = None if balance["vocal_group_level_db"] is None else float(balance["vocal_group_level_db"]) - VOCAL_PRIORITY_MARGIN_DB
+    priority = {
+        name: harmonic_group_correction if name in harmonic_names else 0.0
+        for name in effective_roles
+    }
+    vocal_gain = {
+        name: vocal_group_correction if name in vocal_names else 0.0
+        for name in effective_roles
+    }
+    pair_keys = {name: vocal_pair_key(name) for name in vocal_names}
     synth_floor = None
-    if melodic_levels:
-        synth_floor = min(melodic_levels) - SYNTH_BELOW_MELODIC_MARGIN_DB
-        for name, role in effective_roles.items():
-            if role == "synth":
-                # A synth must remain below both melodic tiers even when its
-                # raw capture is naturally much louder than the guitar/keys.
-                priority[name] = min(priority.get(name, 0.0), synth_floor - initial_levels[name], -6.0)
     return {
         "bpm": bpm,
         "bpm_confidence": bpm_confidence,
@@ -5701,6 +5784,9 @@ def analyze_song_mix_controls(stems: list[Stem], segment: Segment, sr: int, rms_
         "rhythm": rhythm,
         "harmonic": harmonic,
         "vocal_priority": priority,
+        "vocal_group_gain": vocal_gain,
+        "vocal_pair_keys": pair_keys,
+        "balance": balance,
         "voice_floor_db": voice_floor,
         "synth_floor_db": synth_floor,
         "pan_assignments": {
@@ -5841,6 +5927,8 @@ def render_segment(
     rhythm_controls = mix_controls["rhythm"]
     harmonic_controls = mix_controls["harmonic"]
     vocal_priority = mix_controls["vocal_priority"]
+    vocal_group_gain = mix_controls.get("vocal_group_gain", {})
+    vocal_pair_keys = mix_controls.get("vocal_pair_keys", {})
     mic_content = mix_controls["mic_content"]
     active_levels_db = {
         name: active_level_db(rms_values_db.get(name, -120.0), segment_envelopes.get(name))
@@ -5877,6 +5965,7 @@ def render_segment(
         rhythm_adjustment_db = float(rhythm_controls.get(stem.path.name, {}).get("attenuation_db", 0.0))
         harmonic_adjustment_db = float(harmonic_controls.get(stem.path.name, {}).get("attenuation_db", 0.0))
         priority_adjustment_db = float(vocal_priority.get(stem.path.name, 0.0))
+        vocal_group_adjustment_db = float(vocal_group_gain.get(stem.path.name, 0.0))
         overrides = stem_override(song_overrides, stem.path.name)
         trace_row = override_trace.setdefault(stem.path.name, {})
         raw_rms_db = rms_values_db[stem.path.name]
@@ -5902,7 +5991,7 @@ def render_segment(
             gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
             computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
             computed_makeup_gain_db = float(np.clip(
-                computed_makeup_gain_before_lift_db + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db,
+                computed_makeup_gain_before_lift_db + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db + vocal_group_adjustment_db,
                 AUTO_MIX_MAX_ATTENUATION_DB,
                 AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
             ))
@@ -5939,6 +6028,9 @@ def render_segment(
                     "harmonic_analysis": harmonic_controls.get(stem.path.name),
                     "harmonic_attenuation_db": harmonic_adjustment_db,
                     "vocal_priority_attenuation_db": priority_adjustment_db,
+                    "vocal_group_correction_db": vocal_group_adjustment_db,
+                    "vocal_pair_key": vocal_pair_keys.get(stem.path.name),
+                    "mix_role_group": mix_role_group(mix_role, stem.path.name),
                     "rms_dbfs": raw_rms_db,
                     "active_level_db": gain_level_db,
                     "accompaniment_reference_db": accompaniment_reference_db,
@@ -5988,7 +6080,7 @@ def render_segment(
         gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
         computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
         computed_makeup_gain_db = float(np.clip(
-            computed_makeup_gain_before_lift_db + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db,
+            computed_makeup_gain_before_lift_db + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db + vocal_group_adjustment_db,
             AUTO_MIX_MAX_ATTENUATION_DB,
             AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
         ))
@@ -6062,6 +6154,9 @@ def render_segment(
                 "harmonic_analysis": harmonic_controls.get(stem.path.name),
                 "harmonic_attenuation_db": harmonic_adjustment_db,
                 "vocal_priority_attenuation_db": priority_adjustment_db,
+                "vocal_group_correction_db": vocal_group_adjustment_db,
+                "vocal_pair_key": vocal_pair_keys.get(stem.path.name),
+                "mix_role_group": mix_role_group(mix_role, stem.path.name),
                 "rms_dbfs": raw_rms_db,
                 "active_level_db": gain_level_db,
                 "accompaniment_reference_db": accompaniment_reference_db,

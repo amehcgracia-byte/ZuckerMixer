@@ -476,7 +476,18 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     sr = state["stems"][0].samplerate
     rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr)
     role_norms_db = pipeline.role_norms_from_detection_cache(state["stems"])
-    mix_controls = pipeline.analyze_song_mix_controls(state["stems"], segment, sr, rms_values_db, role_norms_db)
+    mix_controls = pipeline.analyze_song_mix_controls(
+        state["stems"],
+        segment,
+        sr,
+        rms_values_db,
+        role_norms_db,
+        active_levels_db={
+            name: pipeline.active_level_db(rms_values_db.get(name, -120.0), segment_envelopes.get(name))
+            for name in segment_envelopes
+        },
+        segment_envelopes=segment_envelopes,
+    )
     effective_roles = mix_controls["effective_roles"]
     rhythm_controls = mix_controls["rhythm"]
     vocal_priority = mix_controls["vocal_priority"]
@@ -537,12 +548,13 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         mix_role = str(effective_roles.get(stem.path.name, stem.role))
         rhythm_adjustment_db = float(rhythm_controls.get(stem.path.name, {}).get("attenuation_db", 0.0))
         priority_adjustment_db = float(vocal_priority.get(stem.path.name, 0.0))
+        vocal_group_adjustment_db = float(mix_controls.get("vocal_group_gain", {}).get(stem.path.name, 0.0))
         eq_defaults = pipeline.role_eq_defaults(mix_role)
         raw_rms_db = rms_values_db.get(stem.path.name, -120.0)
         role_norm_db = role_norms_db.get(mix_role)
         active_level = active_levels_db.get(stem.path.name, raw_rms_db)
         computed_gain_before_lift_db = pipeline.per_song_auto_mix_gain_db(mix_role, active_level, accompaniment_reference_db)
-        computed_gain_db = computed_gain_before_lift_db + rhythm_adjustment_db + priority_adjustment_db
+        computed_gain_db = computed_gain_before_lift_db + rhythm_adjustment_db + priority_adjustment_db + vocal_group_adjustment_db
         computed_gain_db = float(np.clip(
             computed_gain_db,
             pipeline.AUTO_MIX_MAX_ATTENUATION_DB,
@@ -610,6 +622,9 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "rhythm_analysis": rhythm_controls.get(stem.path.name),
             "rhythmic_attenuation_db": rhythm_adjustment_db,
             "vocal_priority_attenuation_db": priority_adjustment_db,
+            "vocal_group_correction_db": vocal_group_adjustment_db,
+            "vocal_pair_key": mix_controls.get("vocal_pair_keys", {}).get(stem.path.name),
+            "mix_role_group": pipeline.mix_role_group(mix_role, stem.path.name),
             "base_level_db": pipeline.base_level_db(mix_role),
             "makeup_gain_db": makeup_gain_db,
             "gain_db": gain_db,
@@ -686,6 +701,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "target_lufs": target_lufs,
         "preview_master_gain_db": target_lufs - (-14.0),
         "mastering_intensity": str(song_overrides.get("mastering_intensity", "natural") if isinstance(song_overrides, dict) else "natural"),
+        "auto_mix_balance": mix_controls.get("balance", {}),
+        "auto_mix_method": "per-song active-envelope RMS power groups with vocal/harmonic overlap",
         "stems": stem_params,
     }
     plan_signature = mix_plan_signature(segment_id, segment, song_overrides)
