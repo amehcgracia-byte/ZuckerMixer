@@ -739,6 +739,12 @@ function renderCutTools() {
       ? ` · included with warning ${includedWarnings.length}`
       : "";
     const scanStatus = scan.status ? `<strong>${esc(scan.status)}</strong>` : "";
+    const whisper = appState?.whisper || {};
+    const whisperStatus = whisper.status === "timed_out"
+      ? `<div class="scan-warning">Whisper timed out; song proposals remain available.</div>`
+      : (whisper.status === "unavailable" || whisper.status === "skipped")
+        ? `<div class="scan-warning">Whisper unavailable; song proposals remain available.</div>`
+        : "";
     const scanError = scan.error ? `<div class="scan-warning">Error loading folder: ${esc(scan.error)}</div>` : "";
     if (scan.fragment_warning) {
       const aligned = Array.isArray(scan.aligned_files) ? scan.aligned_files : [];
@@ -754,7 +760,7 @@ function renderCutTools() {
         </details>
       `;
     } else {
-      scanNode.innerHTML = `${scanStatus} <span>Audio scan: accepted ${accepted.length}${esc(acceptedText)}${esc(skippedText)}</span>${scanError}`;
+      scanNode.innerHTML = `${scanStatus} <span>Audio scan: accepted ${accepted.length}${esc(acceptedText)}${esc(skippedText)}</span>${scanError}${whisperStatus}`;
     }
   }
   const signature = transitionsSignature(appState.transitions);
@@ -3061,7 +3067,11 @@ if (typeof document !== "undefined") {
       return;
     }
     showToast("Source folder changed. Scanning audio files...");
-    const detection = await fetch("/api/redetect", { method: "POST" });
+    const detection = await fetch("/api/redetect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allow_whisper: false }),
+    });
     if (!detection.ok) {
       showToast("Source folder changed, but automatic detection could not start.");
       return;

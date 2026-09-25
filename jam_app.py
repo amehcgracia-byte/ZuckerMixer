@@ -1570,6 +1570,7 @@ def _loading_state(error: str = "") -> dict[str, Any]:
         "detection_calibration": {"status": "not_available", "count": 0},
         "segmentation_status": "not_available",
         "last_error": error,
+        "whisper": pipeline.LAST_WHISPER_STATUS,
         "build": BUILD_METADATA,
     }
 
@@ -1634,6 +1635,7 @@ def public_state() -> dict[str, Any]:
         "audio_scan": state.get("audio_scan") or pipeline.audio_scan_report(),
         "segmentation_status": "ready",
         "last_error": last_load_error,
+        "whisper": pipeline.LAST_WHISPER_STATUS,
         "detection_calibration": state.get("detection_calibration", {}),
         "matchering": {
             "available": pipeline.matchering_api is not None,
@@ -2477,6 +2479,7 @@ def _run_child_job(job_path: Path) -> int:
     )
     print(f"APP_PROGRESS_DEBUG child status file {child_status_path}", flush=True)
     pipeline.PROGRESS_HOOK = app_progress
+    pipeline.WHISPER_ALLOWED = bool(payload.get("allow_whisper", True))
     kind = payload.get("kind")
     songs = [int(x) for x in payload.get("songs", [])]
     job_id = str(payload.get("id", "child"))
@@ -2939,7 +2942,7 @@ def api_state() -> Response:
             except Exception as exc:
                 return jsonify(_loading_state(f"{type(exc).__name__}: {exc}")), 200
         if not detection_active:
-            api_redetect()
+            api_redetect(False)
         return jsonify(_loading_state()), 200
     return jsonify(public_state()), 200
 
@@ -3207,7 +3210,10 @@ def api_song_name(segment_id: int) -> Response:
 
 
 @app.post("/api/redetect")
-def api_redetect() -> Response:
+def api_redetect(allow_whisper: bool = True) -> Response:
+    payload = request.get_json(force=True, silent=True) or {}
+    if "allow_whisper" in payload:
+        allow_whisper = bool(payload.get("allow_whisper"))
     job_id = f"{int(time.time())}-{len(jobs) + 1}"
     job = {
         "id": job_id,
@@ -3226,6 +3232,7 @@ def api_redetect() -> Response:
         "done_count": 0,
         "total_count": 1,
         "lifecycle_log_path": str(LIFECYCLE_LOG_PATH),
+        "allow_whisper": bool(allow_whisper),
     }
     with state_lock:
         jobs.append(job)

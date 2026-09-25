@@ -209,8 +209,11 @@ DETECTION_CACHE_ALGORITHM_VERSION = "20260902-full-session-segmentation-v4"
 SPEECH_DETECTION_ALGORITHM_VERSION = "20260827-whisper-v1"
 SPEECH_TRANSCRIPTION_CACHE_VERSION = "20260902-full-session-segmentation-v2"
 WHISPER_MODEL_SIZE = os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")
+WHISPER_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "90"))
 WHISPER_ENV = Path(__file__).resolve().parent / ".whisperenv"
 LAST_SPEECH_TRANSCRIPTIONS: list[dict[str, object]] = []
+LAST_WHISPER_STATUS: dict[str, object] = {"status": "not_started"}
+WHISPER_ALLOWED = True
 KNOWN_SONG_COUNT: int | None = None
 DETECTION_RESCAN_MODE = False
 
@@ -1085,16 +1088,24 @@ def transcribe_speech_candidates(
     session_end: float,
     boundary_probes: list[float] | None = None,
 ) -> tuple[list[dict[str, object]], list[Segment]]:
-    global LAST_SPEECH_TRANSCRIPTIONS
+    global LAST_SPEECH_TRANSCRIPTIONS, LAST_WHISPER_STATUS
     windows = speech_candidate_windows(stems, timelines, session_end, boundary_probes)
     LAST_SPEECH_TRANSCRIPTIONS = []
+    LAST_WHISPER_STATUS = {"status": "starting", "candidate_windows": len(windows)}
     whisper_python, worker = whisper_runtime_paths()
     if not whisper_python.exists() or not worker.exists():
+        LAST_WHISPER_STATUS = {
+            "status": "unavailable",
+            "reason": "Whisper runtime is not installed",
+            "python": str(whisper_python),
+            "worker": str(worker),
+        }
         raise RuntimeError(
             "Whisper is mandatory for detection but its runtime is unavailable: "
             f"python={whisper_python} worker={worker}"
         )
     if not windows:
+        LAST_WHISPER_STATUS = {"status": "unavailable", "reason": "no speech candidate windows"}
         raise RuntimeError(
             "Whisper is mandatory for detection but speech candidate discovery produced no windows; "
             "acoustic-only fallback is disabled."
@@ -1151,8 +1162,39 @@ def transcribe_speech_candidates(
             input_json.write_text(json.dumps(requests), encoding="utf-8")
             model_dir = Path.home() / "Library" / "Application Support" / "ZuckerMixer" / "whisper"
             report_progress({"current_stage": "transcribing speech", "stage_detail": f"Whisper: {len(requests)} candidate windows", "progress": 84, "song_progress": 84, "heartbeat": time.time()})
-            subprocess.run([str(whisper_python), str(worker), "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)], check=True)
+            command = [str(whisper_python), str(worker), "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=WHISPER_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                LAST_WHISPER_STATUS = {
+                    "status": "timed_out",
+                    "timeout_seconds": WHISPER_TIMEOUT_SECONDS,
+                    "candidate_windows": len(requests),
+                    "stdout": str(exc.stdout or "")[-2000:],
+                    "stderr": str(exc.stderr or "")[-2000:],
+                }
+                raise RuntimeError(f"Whisper timed out after {WHISPER_TIMEOUT_SECONDS:.0f}s") from exc
+            except subprocess.CalledProcessError as exc:
+                LAST_WHISPER_STATUS = {
+                    "status": "error",
+                    "returncode": exc.returncode,
+                    "stdout": str(exc.stdout or "")[-2000:],
+                    "stderr": str(exc.stderr or "")[-2000:],
+                }
+                raise RuntimeError(f"Whisper exited with code {exc.returncode}") from exc
             results = json.loads(output_json.read_text(encoding="utf-8"))
+            LAST_WHISPER_STATUS = {
+                "status": "available",
+                "candidate_windows": len(requests),
+                "stdout": str(completed.stdout or "")[-2000:],
+                "stderr": str(completed.stderr or "")[-2000:],
+            }
         try:
             transcript_cache_path.parent.mkdir(parents=True, exist_ok=True)
             transcript_cache_path.write_text(json.dumps({
@@ -1187,10 +1229,15 @@ def transcribe_speech_candidates(
         result["speech_intro_text"] = " ".join(intro_texts).strip() or (text if result["announcement"] else "")
     LAST_SPEECH_TRANSCRIPTIONS = results
     if not LAST_SPEECH_TRANSCRIPTIONS:
+        LAST_WHISPER_STATUS = {"status": "unavailable", "reason": "no transcriptions returned"}
         raise RuntimeError("Whisper is mandatory for detection but produced no transcriptions.")
     print(f"WHISPER STORE CONFIRMED: LAST_SPEECH_TRANSCRIPTIONS={len(LAST_SPEECH_TRANSCRIPTIONS)}", flush=True)
     announcement_windows = [item for item in results if item.get("announcement") and item.get("text")]
     if len(announcement_windows) < 2:
+        LAST_WHISPER_STATUS = {
+            "status": "unavailable",
+            "reason": f"fewer than two introductions ({len(announcement_windows)})",
+        }
         raise RuntimeError(
             "Whisper is mandatory for detection but found fewer than two song introductions "
             f"({len(announcement_windows)}); acoustic-only detection is disabled."
@@ -2208,12 +2255,28 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     # Every detection starts from the same explicit defaults.  Calibration is
     # allowed to choose values for this run, but never to leak them into the
     # next run in the same process.
-    global SILENCE_THRESHOLD_DB, SILENCE_GAP_SECONDS, DETECTION_STRATEGY, LAST_DETECTION_CALIBRATION
+    global SILENCE_THRESHOLD_DB, SILENCE_GAP_SECONDS, DETECTION_STRATEGY, LAST_DETECTION_CALIBRATION, LAST_WHISPER_STATUS
     USED_SESSION_TITLES.clear()
     SILENCE_THRESHOLD_DB = DEFAULT_SILENCE_THRESHOLD_DB
     SILENCE_GAP_SECONDS = DEFAULT_SILENCE_GAP_SECONDS
     DETECTION_STRATEGY = {"id": "starting", "label": "fresh deterministic detection"}
     LAST_DETECTION_CALIBRATION = {}
+
+    if not WHISPER_ALLOWED:
+        segments = provisional_segments_from_metadata(stems)
+        LAST_WHISPER_STATUS = {
+            "status": "skipped",
+            "reason": "optional analysis disabled for initial source registration",
+        }
+        DETECTION_STRATEGY = {
+            "id": "metadata_provisional",
+            "label": "Metadata-only song proposals; Whisper and audio analysis deferred",
+            "detected_count": len(segments),
+            "needs_review": True,
+            "whisper": LAST_WHISPER_STATUS,
+        }
+        print(f"PROVISIONAL DETECTION: registered {len(segments)} metadata windows", flush=True)
+        return segments, np.array([], dtype=np.float32)
 
     print("\nSONG DETECTION")
     report_progress({"current_stage": "analyzing stems", "stage_detail": f"analyzing {len(stems)} stems before detecting song boundaries", "progress": 82, "song_progress": 82, "heartbeat": time.time()})
@@ -2242,10 +2305,30 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         probe_segments = auto_calibrate_drum_fallback(
             stems, timelines, session_end, voice_stems, instrument_stems, mc_data,
         )
-    whisper_transcripts, whisper_segments = transcribe_speech_candidates(
-        stems, timelines, session_end,
-        boundary_probes=[segment.start for segment in probe_segments],
-    )
+    whisper_available = bool(WHISPER_ALLOWED)
+    if whisper_available:
+        try:
+            whisper_transcripts, whisper_segments = transcribe_speech_candidates(
+                stems, timelines, session_end,
+                boundary_probes=[segment.start for segment in probe_segments],
+            )
+        except Exception as exc:
+            whisper_available = False
+            whisper_transcripts, whisper_segments = [], []
+            LAST_SPEECH_TRANSCRIPTIONS.clear()
+            LAST_WHISPER_STATUS = {
+                **LAST_WHISPER_STATUS,
+                "status": LAST_WHISPER_STATUS.get("status", "unavailable"),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            print(f"WHISPER OPTIONAL: {LAST_WHISPER_STATUS}", flush=True)
+    else:
+        whisper_transcripts, whisper_segments = [], []
+        LAST_WHISPER_STATUS = {
+            "status": "skipped",
+            "reason": "optional analysis disabled for initial source registration",
+        }
+        print("WHISPER OPTIONAL: skipped during initial source registration", flush=True)
     mc_mask = mc_data["mc_mask"]
     raw_mc_breaks = mask_to_regions(mc_mask, MC_BREAK_MIN_SECONDS)
     merged_mc_breaks = merge_regions(raw_mc_breaks, MC_SCAN_MERGE_GAP_SECONDS)
@@ -2259,25 +2342,44 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         f"\n  final transition zones after removing <{fmt_time(MC_MIN_FINAL_SONG_SECONDS)} songs: {len(mc_breaks)}"
     )
     print_mc_breaks(mc_breaks)
-    if len(whisper_segments) < 2:
+    if whisper_available and len(whisper_segments) < 2:
         raise RuntimeError(
             "Transcript-first detection requires at least two introduction boundaries; "
             f"Whisper supplied {len(whisper_segments)}. Acoustic segmentation is diagnostic only."
         )
-    # Transcript-first invariant: this ordered list is the complete accepted
-    # segmentation. No acoustic, duration, numbering, or correction pass may
-    # add, remove, merge, or move one of these song windows.
-    segments = list(whisper_segments)
-    segments = apply_spoken_number_structure(segments, whisper_transcripts, session_end)
-    DETECTION_STRATEGY = {
-        "id": "transcript_first",
-        "label": "Transcript-first introductions; acoustic cross-check only",
-        "detected_count": len(segments),
-        "whisper_candidate_count": len(whisper_transcripts),
-        "whisper_boundary_count": len(whisper_segments),
-        "whisper_spoken_numbers": [item.get("spoken_song_number") for item in whisper_transcripts if item.get("spoken_song_number") is not None],
-        "rhythm_equivalent_sources": rhythm_names,
-    }
+    if whisper_available:
+        # Transcript-first invariant: this ordered list is the complete accepted
+        # segmentation. No acoustic, duration, numbering, or correction pass may
+        # add, remove, merge, or move one of these song windows.
+        segments = list(whisper_segments)
+        segments = apply_spoken_number_structure(segments, whisper_transcripts, session_end)
+        DETECTION_STRATEGY = {
+            "id": "transcript_first",
+            "label": "Transcript-first introductions; acoustic cross-check only",
+            "detected_count": len(segments),
+            "whisper_candidate_count": len(whisper_transcripts),
+            "whisper_boundary_count": len(whisper_segments),
+            "whisper_spoken_numbers": [item.get("spoken_song_number") for item in whisper_transcripts if item.get("spoken_song_number") is not None],
+            "rhythm_equivalent_sources": rhythm_names,
+            "whisper": LAST_WHISPER_STATUS,
+        }
+    else:
+        # The acoustic proposal is sufficient to register songs and render a
+        # reviewable result. Whisper remains diagnostic and must never remove
+        # songs or block the source-loading path.
+        segments = list(probe_segments or [])
+        if not segments:
+            segments = auto_calibrate_drum_fallback(
+                stems, timelines, session_end, voice_stems, instrument_stems, mc_data,
+            )
+        DETECTION_STRATEGY = {
+            "id": "acoustic_fallback",
+            "label": "Acoustic song proposals; Whisper optional",
+            "detected_count": len(segments),
+            "whisper": LAST_WHISPER_STATUS,
+            "rhythm_equivalent_sources": rhythm_names,
+            "needs_review": True,
+        }
     if not mc_breaks:
         acoustic_fallback_segments = auto_calibrate_drum_fallback(stems, timelines, session_end, voice_stems, instrument_stems, mc_data)
         inferred_count = sum(segment.boundary_source == "stage-clock-inferred" for segment in acoustic_fallback_segments)
@@ -2316,7 +2418,8 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         if segments[index].start - segments[index - 1].start > 20 * 60.0
     ]
     print(f"TRANSCRIPT-FIRST: accepted {len(segments)} songs from {len(whisper_segments)} ordered introductions; acoustic checks cannot alter them", flush=True)
-    require_structural_introductions(segments)
+    if whisper_available:
+        require_structural_introductions(segments)
     segments = auto_retry_bad_detection(
         segments, stems, timelines, session_end, voice_stems, instrument_stems, mc_data,
     )
@@ -2684,6 +2787,28 @@ def auto_calibrate_detection(
     print("AUTO CALIBRATION: " + str(LAST_DETECTION_CALIBRATION), flush=True)
     # Keep the selected values; the original values are intentionally not restored.
     return data, segments
+
+
+def provisional_segments_from_metadata(stems: list[Stem]) -> list[Segment]:
+    """Create reviewable song windows without reading full-session audio."""
+    if not stems:
+        return []
+    session_end = max(float(stem.offset_seconds + stem.timeline_duration) for stem in stems)
+    count = max(1, int(math.ceil(session_end / 600.0)))
+    boundaries = np.linspace(0.0, session_end, count + 1)
+    return [
+        Segment(
+            float(boundaries[index]),
+            float(boundaries[index + 1]),
+            core_start=float(boundaries[index]),
+            core_end=float(boundaries[index + 1]),
+            nominal_end=float(boundaries[index + 1]),
+            boundary_source="metadata-provisional",
+            speech_reason="Whisper optional; confirm this proposed cut in Select Cuts",
+        )
+        for index in range(count)
+        if float(boundaries[index + 1]) > float(boundaries[index])
+    ]
 
 
 def auto_calibrate_drum_fallback(
