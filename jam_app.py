@@ -895,6 +895,19 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
         return None
 
 
+def snapshot_has_valid_segment_windows(snapshot: dict[str, Any]) -> bool:
+    """Return whether a cached detection can be exposed without redetecting."""
+    for item in snapshot.get("segments", []) if isinstance(snapshot, dict) else []:
+        try:
+            start = float(item.get("start", 0.0)) if isinstance(item, dict) else float(item.start)
+            end = float(item.get("end", 0.0)) if isinstance(item, dict) else float(item.end)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if not pipeline.HARD_MIN_SONG_SECONDS <= end - start <= pipeline.HARD_MAX_SONG_SECONDS:
+            return False
+    return bool(snapshot.get("stems")) and bool(snapshot.get("segments"))
+
+
 def _ensure_snapshot_scan_report(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Backfill scan details for older snapshots created before scan metadata."""
     report = snapshot.get("audio_scan")
@@ -2886,6 +2899,7 @@ def favicon() -> Response:
 
 @app.get("/api/state")
 def api_state() -> Response:
+    global pipeline_state, pipeline_state_signature
     # Loading/detection failures are application state, not a server crash.
     # Always return a JSON diagnostic so the UI can show the exact cause and
     # the files found before the failure.
@@ -2909,7 +2923,14 @@ def api_state() -> Response:
         except Exception as exc:
             snapshot = None
             lifecycle_log("source_scan_signature_failed", error=f"{type(exc).__name__}: {exc}")
+        if snapshot is not None and not snapshot_has_valid_segment_windows(snapshot):
+            snapshot = None
         if snapshot is not None:
+            snapshot["audio_scan"] = _ensure_snapshot_scan_report(snapshot)
+            with state_lock:
+                pipeline_state = snapshot
+                pipeline_state_signature = signature
+            pipeline.AUDIO_SCAN_REPORT = dict(snapshot["audio_scan"])
             return jsonify(public_state()), 200
         if not pipeline.audio_scan_report().get("accepted") and source.is_dir():
             try:
