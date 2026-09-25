@@ -1621,6 +1621,12 @@ def public_state() -> dict[str, Any]:
         }
         for song in songs
     ]
+    whisper_status = pipeline.LAST_WHISPER_STATUS
+    strategy = state.get("detection_calibration", {}).get("strategy", {})
+    if whisper_status.get("status") == "not_started" and isinstance(strategy, dict):
+        strategy_whisper = strategy.get("whisper")
+        if isinstance(strategy_whisper, dict):
+            whisper_status = strategy_whisper
     return {
         "songs": songs,
         "transitions": transitions,
@@ -1635,7 +1641,7 @@ def public_state() -> dict[str, Any]:
         "audio_scan": state.get("audio_scan") or pipeline.audio_scan_report(),
         "segmentation_status": "ready",
         "last_error": last_load_error,
-        "whisper": pipeline.LAST_WHISPER_STATUS,
+        "whisper": whisper_status,
         "detection_calibration": state.get("detection_calibration", {}),
         "matchering": {
             "available": pipeline.matchering_api is not None,
