@@ -55,7 +55,7 @@ LIFECYCLE_LOG_PATH = STATE_ROOT / "redetect_worker_lifecycle.jsonl"
 RENDER_DIAGNOSTICS_ROOT = STATE_ROOT / "render_diagnostics"
 RENDER_DIAGNOSTICS_ROOT.mkdir(parents=True, exist_ok=True)
 ORPHANED_ACTIVE_JOB_SECONDS = 90.0
-ACTIVE_STEM_DETECTION_VERSION = 4
+ACTIVE_STEM_DETECTION_VERSION = 5
 BUILD_METADATA_PATH = RESOURCE_ROOT / "build" / "build_metadata.json"
 HOST = "127.0.0.1"
 DEFAULT_TARGET_LUFS = pipeline.TARGET_LUFS
@@ -335,17 +335,12 @@ def stem_display_label(stem: pipeline.Stem) -> str:
 
 
 def active_stems_for_segment(stems: list[pipeline.Stem], segment: pipeline.Segment) -> list[str]:
-    sr = stems[0].samplerate
-    rms_values_db, _energies, has_audio, dynamic_spread_db, envelopes, _peaks = pipeline.scan_segment_activity(stems, segment, sr)
-    loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
-    return [
-        stem.path.name
-        for stem in stems
-        if stem_is_active_for_preview(stem, rms_values_db, has_audio, dynamic_spread_db, loudest_db, envelopes.get(stem.path.name))
-    ]
+    # A decodable source is available to the user even when it is quiet or
+    # sparse in this song. Activity is diagnostic, not an eligibility filter.
+    return [stem.path.name for stem in stems]
 
 
-MIX_PLAN_VERSION = 2
+MIX_PLAN_VERSION = 3
 
 
 def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
@@ -505,12 +500,9 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     vocal_priority = mix_controls["vocal_priority"]
     mic_content = mix_controls["mic_content"]
     loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
-    active_names = {
-        name
-        for stem in state["stems"]
-        for name in [stem.path.name]
-        if stem_is_active_for_preview(stem, rms_values_db, has_audio, dynamic_spread_db, loudest_db, segment_envelopes)
-    }
+    # All successfully decoded stems enter every song plan. Explicit mute and
+    # solo overrides are applied later; low energy must not hide a track.
+    active_names = {stem.path.name for stem in state["stems"]}
     active_files = set(active_names)
     cache[key] = sorted(active_files)
     active_energies = [energies[name] for name in active_names]
@@ -529,7 +521,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     # per-song snapshot. Render consumes this snapshot and never recomputes
     # thresholds, Whisper, activity, or Auto-Mix from the source files.
     analysis_cache = {
-        "version": 1,
+        "version": 2,
         "song_id": int(segment_id),
         "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
         "rms_values_db": rms_values_db,
@@ -3064,10 +3056,12 @@ def api_render_song(song_index: int) -> Response:
         state = load_render_state()
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
+    # Duration and confidence warnings must remain visible and renderable.
+    # Only an explicit user skip removes a song from the batch.
     visible_ids = {
         int(song["id"])
         for song in visible_songs(state, load_settings(), load_json(HISTORY_PATH, {}))
-        if song.get("render_valid")
+        if not song.get("skipped")
     }
     if song_index not in visible_ids:
         return jsonify({"error": "song not found"}), 404
@@ -3175,7 +3169,14 @@ def api_render_many() -> Response:
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
     settings = load_settings()
-    visible_ids = {int(song["id"]) for song in visible_songs(state, settings, load_json(HISTORY_PATH, {})) if song.get("render_valid")}
+    # Mix everything is deliberately warning-tolerant: every detected,
+    # non-skipped song is prepared. Select Cuts can repair suspicious cuts;
+    # detection must never make them disappear from the batch.
+    visible_ids = {
+        int(song["id"])
+        for song in visible_songs(state, settings, load_json(HISTORY_PATH, {}))
+        if not song.get("skipped")
+    }
     payload = request.get_json(force=True, silent=True) or {}
     try:
         songs = validate_batch_song_ids(payload.get("songs", []), visible_ids)

@@ -49,9 +49,12 @@ def test_mix_everything_uses_all_visible_songs_and_shows_count():
     assert "[1, 2, 3]" not in block
 
 
-def test_render_valid_contract_excludes_out_of_range_windows():
+def test_out_of_range_windows_remain_visible_and_renderable_with_warning():
     source = Path(__file__).with_name("jam_app.py").read_text(encoding="utf-8")
+    frontend = Path(__file__).with_name("static").joinpath("app.js").read_text(encoding="utf-8")
     assert "MIN_RENDER_DURATION_SECONDS = 480.0" in source
     assert "MAX_RENDER_DURATION_SECONDS = 780.0" in source
     assert '"render_valid"' in source
-    assert 'if song.get("render_valid")' in source
+    assert 'if not song.get("skipped")' in source
+    assert "return visibleSongs();" in frontend
+    assert "needs review" in frontend

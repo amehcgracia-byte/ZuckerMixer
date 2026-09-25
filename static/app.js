@@ -553,7 +553,9 @@ async function loadState() {
   appState = await res.json();
   renderBuildInfo();
   syncOverrideSequenceFromState();
-  $("#songCount").textContent = `${renderableSongs().length} valid songs ready (${visibleSongs().length} detected)`;
+  const detected = visibleSongs().length;
+  const review = visibleSongs().filter((song) => song.render_valid === false).length;
+  $("#songCount").textContent = `${detected} songs detected / ${renderableSongs().length} songs prepared${review ? ` · ${review} needs review` : ""}`;
   if (appState.ffmpeg && !appState.ffmpeg.ok) {
     showToast("ffmpeg is missing. Install it with Homebrew: brew install ffmpeg");
   }
@@ -571,7 +573,9 @@ function visibleSongs() {
 }
 
 function renderableSongs() {
-  return visibleSongs().filter((song) => song.render_valid !== false && Number(song.duration || 0) >= 480 && Number(song.duration || 0) <= 780);
+  // Detection warnings are information for the user, not a silent batch
+  // filter. Select Cuts remains the place to correct a suspicious window.
+  return visibleSongs();
 }
 
 function formatTime(seconds) {
@@ -712,22 +716,27 @@ function renderCutTools() {
   if (scanNode) {
     const accepted = Array.isArray(scan.accepted) ? scan.accepted : [];
     const skipped = Array.isArray(scan.skipped) ? scan.skipped : [];
+    const includedWarnings = Array.isArray(scan.included_warnings) ? scan.included_warnings : [];
     const acceptedText = accepted.length
       ? `: ${accepted.map((item) => item.file).join(", ")}`
       : "";
     const skippedText = skipped.length
       ? ` · skipped ${skipped.length}: ${skipped.slice(0, 5).map((item) => `${item.file} (${item.reason})`).join(", ")}${skipped.length > 5 ? "…" : ""}`
       : "";
+    const includedWarningText = includedWarnings.length
+      ? ` · included with warning ${includedWarnings.length}`
+      : "";
     if (scan.fragment_warning) {
       const aligned = Array.isArray(scan.aligned_files) ? scan.aligned_files : [];
       const fragments = Array.isArray(scan.fragment_files) ? scan.fragment_files : [];
       scanNode.innerHTML = `
         <strong class="scan-warning">${esc(scan.fragment_warning)}</strong>
-        <span>Using ${scan.using_aligned_only ? "aligned exports only" : "all detected files"}.</span>
+        <span>Using all decodable files${includedWarningText}.</span>
         <details>
           <summary>Show included/excluded files</summary>
           <div><strong>Included files (${accepted.length}; aligned exports detected: ${aligned.length})</strong><br>${accepted.map((item) => esc(item.file)).join("<br>") || "none"}</div>
-          <div><strong>Excluded files (${skipped.length}; Logic fragments detected: ${fragments.length})</strong><br>${skipped.map((item) => `${esc(item.file)} (${esc(item.reason)})`).join("<br>") || "none"}</div>
+          <div><strong>Included with warning (${includedWarnings.length})</strong><br>${includedWarnings.map((item) => `${esc(item.file)} (${esc(item.reason)})`).join("<br>") || "none"}</div>
+          <div><strong>Unreadable or excluded files (${skipped.length})</strong><br>${skipped.map((item) => `${esc(item.file)} (${esc(item.reason)})`).join("<br>") || "none"}</div>
         </details>
       `;
     } else {
@@ -2481,7 +2490,9 @@ async function refreshState(options = {}) {
   renderBuildInfo();
   syncOverrideSequenceFromState();
   checkedSongs = new Set([...checkedSongs].filter((id) => appState.songs.some((song) => song.id === id && !song.skipped)));
-  $("#songCount").textContent = `${renderableSongs().length} valid songs ready (${visibleSongs().length} detected)`;
+  const detected = visibleSongs().length;
+  const review = visibleSongs().filter((song) => song.render_valid === false).length;
+  $("#songCount").textContent = `${detected} songs detected / ${renderableSongs().length} songs prepared${review ? ` · ${review} needs review` : ""}`;
   if (renderLarge) {
     renderCutTools();
     renderSongs();

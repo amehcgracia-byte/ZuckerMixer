@@ -581,24 +581,30 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
     )
     scan_mode = AUDIO_SCAN_MODE if AUDIO_SCAN_MODE in {"auto", "aligned_only", "all"} else "auto"
     use_aligned_only = scan_mode == "aligned_only" or (scan_mode == "auto" and fragments_confident)
-    selected_paths = {
-        path
-        for path, _prepared, _info in valid
-        if not use_aligned_only or path in aligned_paths
-    }
-    if use_aligned_only and fragments_confident:
-        for path in fragment_paths:
-            if path in valid_by_path:
-                skipped.append(
-                    {
-                        "file": path.name,
-                        "reason": "Logic per-take fragment excluded; aligned timeline exports selected",
-                    }
-                )
+    # A decodable source is evidence that the track exists. Aligned/fragments
+    # are still reported for diagnostics, but never silently removed from the
+    # song render because of RMS, duration, or the aligned-only heuristic.
+    selected_paths = {path for path, _prepared, _info in valid}
+    use_aligned_only = False
+    included_warnings = []
+    if fragments_confident:
+        included_warnings.extend(
+            {
+                "file": path.name,
+                "reason": "available decodable source included; timeline alignment requires review",
+            }
+            for path in fragment_paths
+            if path in valid_by_path
+        )
     elif scan_mode == "aligned_only":
-        for path, _prepared, _info in valid:
-            if path not in selected_paths:
-                skipped.append({"file": path.name, "reason": "excluded by aligned-only input mode"})
+        included_warnings.extend(
+            {
+                "file": path.name,
+                "reason": "available decodable source included despite aligned-only preference",
+            }
+            for path, _prepared, _info in valid
+            if path not in aligned_paths
+        )
     for path, prepared, _info in valid:
         if path in selected_paths:
             accepted.append(prepared)
@@ -606,6 +612,7 @@ def scan_audio_files(source_dir: Path) -> tuple[list[Path], dict[str, object]]:
         "source": str(source_dir),
         "accepted": [{"file": path.name, "path": str(path)} for path in accepted],
         "skipped": skipped,
+        "included_warnings": included_warnings,
         "mode": scan_mode,
         "fragment_warning": (
             f"This folder contains {len(fragment_paths)} per-take fragment files from Logic's Media folder "
@@ -5896,7 +5903,7 @@ def render_segment(
             analysis_cache = pickle.load(cache_file)
     except Exception as exc:
         raise RuntimeError(f"Analyze required: analysis snapshot is unavailable: {exc}") from exc
-    if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 1:
+    if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
         raise RuntimeError("Analyze required: analysis snapshot version is unsupported.")
     cached_selection = analysis_cache.get("selection", {})
     if (
@@ -5934,22 +5941,16 @@ def render_segment(
     scan_seconds = time.perf_counter() - scan_t0
     loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
     activity_decisions: dict[str, tuple[bool, str]] = {
-        stem.path.name: segment_stem_activity_decision(
-            stem,
-            rms_values_db.get(stem.path.name, -120.0),
-            has_audio.get(stem.path.name, False),
-            dynamic_spread_db.get(stem.path.name, 0.0),
-            loudest_db,
-            segment_envelopes.get(stem.path.name),
+        stem.path.name: (
+            True,
+            "decodable source included; activity measurement is diagnostic only",
         )
         for stem in stems
     }
-    for name in noise_names:
-        activity_decisions[name] = (False, "broadband noise-only input muted")
     active_names = {name for name, (active, _reason) in activity_decisions.items() if active}
     active_energies = [energies[name] for name in active_names]
     if not active_energies:
-        raise RuntimeError(f"No musically active stems in segment {index:02d}")
+        raise RuntimeError(f"No decodable stems in segment {index:02d}")
     median_energy = np.median(active_energies)
     effective_roles = mix_controls["effective_roles"]
     rhythm_controls = mix_controls["rhythm"]
@@ -6007,10 +6008,6 @@ def render_segment(
             inactive_reasons.append("silenced by fader")
         if solo_names and stem.path.name not in solo_names:
             inactive_reasons.append("not soloed")
-        if not has_audio.get(stem.path.name, False):
-            inactive_reasons.append("no audio in segment")
-        elif not stem_activity:
-            inactive_reasons.append(activity_reason)
         if inactive_reasons:
             eq_defaults = role_eq_defaults(mix_role)
             requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
