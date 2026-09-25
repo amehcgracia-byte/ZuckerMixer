@@ -1964,6 +1964,17 @@ def enforce_hard_song_duration_bounds(
         candidates = focused_retry_split_oversized([item], stems, timelines, voice_stems, instrument_stems, mc_data)
         valid = [candidate for candidate in candidates if HARD_MIN_SONG_SECONDS <= candidate.duration <= HARD_MAX_SONG_SECONDS]
         if len(valid) <= 1:
+            safe_parts = split_oversized_at_safe_boundaries(item, stems, timelines)
+            if len(safe_parts) > len(valid):
+                valid = safe_parts
+                decisions.append({
+                    "action": "safe-envelope-split",
+                    "reason": "bounded search found quiet multi-stem boundaries",
+                    "source_duration_seconds": item.duration,
+                    "result_durations_seconds": [candidate.duration for candidate in valid],
+                    "split_points": [candidate.end for candidate in valid[:-1]],
+                })
+        if len(valid) <= 1:
             # The tight drum-gap sweep can return only an active fragment when
             # the moderator talks over the transition. Apply the same
             # stage-clock quiet-point fallback to the original oversized
@@ -2047,6 +2058,63 @@ def enforce_hard_song_duration_bounds(
         print("HARD DURATION VALIDATION: " + str(decision), flush=True)
     print(f"HARD DURATION VALIDATION: final_count={len(result)} expected={EXPECTED_SONG_COUNT} violations={violations}", flush=True)
     return result
+
+
+def split_oversized_at_safe_boundaries(
+    segment: Segment,
+    stems: list[Stem],
+    timelines: dict[str, np.ndarray],
+) -> list[Segment]:
+    """Partition a long proposal only at verified quiet multi-stem points.
+
+    This is a bounded acoustic search, not a clock split.  If no safe point
+    exists in the legal interval, the original proposal is preserved for
+    Select Cuts review rather than cutting active music.
+    """
+    pieces = [segment]
+    while True:
+        index = next((i for i, item in enumerate(pieces) if item.duration > HARD_MAX_SONG_SECONDS), None)
+        if index is None:
+            return pieces if len(pieces) > 1 else []
+        item = pieces[index]
+        lower = item.start + HARD_MIN_SONG_SECONDS
+        upper = item.start + HARD_MAX_SONG_SECONDS
+        if upper >= item.end - HARD_MIN_SONG_SECONDS:
+            return pieces if len(pieces) > 1 else []
+        target = min(item.start + 600.0, item.end - HARD_MIN_SONG_SECONDS)
+        cut, _instruments, _voices = _nearest_valid_boundary(
+            target,
+            lower,
+            upper,
+            stems,
+            timelines,
+            search_seconds=180.0,
+            validation_radius_seconds=3.0,
+        )
+        if cut is None:
+            return pieces if len(pieces) > 1 else []
+        left = replace(
+            item,
+            end=cut,
+            nominal_end=cut,
+            core_end=cut,
+            boundary_source="acoustic-safe-boundary",
+            boundary_validation="valid",
+            boundary_validation_reason="quiet multi-stem boundary verified",
+        )
+        right = replace(
+            item,
+            start=cut,
+            core_start=cut,
+            boundary_source="acoustic-safe-boundary",
+            boundary_validation="valid",
+            boundary_validation_reason="quiet multi-stem boundary verified",
+            speech_text="",
+            speech_intro_text="",
+            speech_intro_start=None,
+            speech_reason="inferred acoustic continuation; review if presenter context is ambiguous",
+        )
+        pieces[index:index + 1] = [left, right]
 
 
 def preserve_content_coverage(
@@ -2483,6 +2551,27 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     # after the earlier activity gate.  Apply the same conservative gate to
     # the final topology so a late split can never cut through active music.
     segments = merge_unsafe_music_boundaries(segments, stems, timelines)
+    # The merge above is authoritative for existing boundaries, but a merged
+    # review block can still contain independently verifiable quiet points.
+    # Partition those long blocks once, at the very end, so later topology
+    # passes cannot move the cut away from the measured safe sample region.
+    final_partitioned: list[Segment] = []
+    final_partition_audit: list[dict[str, object]] = []
+    for segment in segments:
+        parts = split_oversized_at_safe_boundaries(segment, stems, timelines) if segment.duration > HARD_MAX_SONG_SECONDS else []
+        if len(parts) > 1:
+            final_partitioned.extend(parts)
+            final_partition_audit.append({
+                "source_start": segment.start,
+                "source_end": segment.end,
+                "result_durations": [part.duration for part in parts],
+                "split_points": [part.end for part in parts[:-1]],
+            })
+        else:
+            final_partitioned.append(segment)
+    if final_partition_audit:
+        DETECTION_STRATEGY["final_safe_partition"] = final_partition_audit
+    segments = sorted(final_partitioned, key=lambda item: item.start)
     # Re-check the final post-split topology. Earlier validation happens
     # before duration repair, and synthetic duration-safe pieces must not be
     # reported as if Whisper had verified an introduction for them.
