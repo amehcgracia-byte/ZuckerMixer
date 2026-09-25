@@ -2281,7 +2281,7 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         }
         DETECTION_STRATEGY = {
             "id": "metadata_provisional",
-            "label": "Metadata-only song proposals; Whisper and audio analysis deferred",
+            "label": "Single conservative metadata block; Analyze or Select Cuts required",
             "detected_count": len(segments),
             "needs_review": True,
             "whisper": LAST_WHISPER_STATUS,
@@ -2439,6 +2439,11 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     )
     segments = attach_speech_metadata(segments)
     segments = align_transcript_introduction_boundaries(segments)
+    # A transcript or acoustic proposal is not sufficient evidence by itself.
+    # Collapse any boundary that still crosses active music; the resulting
+    # longer window remains reviewable in Select Cuts instead of exporting a
+    # song split in the middle of a performance.
+    segments = merge_unsafe_music_boundaries(segments, stems, timelines)
     # Coverage and duration repair can add the leading pre-session window
     # after the first numbering pass; enforce SONG 0 once more at the final
     # topology boundary.
@@ -2801,25 +2806,80 @@ def auto_calibrate_detection(
 
 
 def provisional_segments_from_metadata(stems: list[Stem]) -> list[Segment]:
-    """Create reviewable song windows without reading full-session audio."""
+    """Create one conservative review window without reading full audio.
+
+    Metadata alone cannot identify song boundaries.  Fixed ten-minute slices
+    created false songs and could cut active performances, so source
+    registration exposes the complete session as one needs-review block until
+    Analyze supplies acoustic evidence or the user confirms Select Cuts.
+    """
     if not stems:
         return []
     session_end = max(float(stem.offset_seconds + stem.timeline_duration) for stem in stems)
-    count = max(1, int(math.ceil(session_end / 600.0)))
-    boundaries = np.linspace(0.0, session_end, count + 1)
     return [
         Segment(
-            float(boundaries[index]),
-            float(boundaries[index + 1]),
-            core_start=float(boundaries[index]),
-            core_end=float(boundaries[index + 1]),
-            nominal_end=float(boundaries[index + 1]),
+            0.0,
+            session_end,
+            core_start=0.0,
+            core_end=session_end,
+            nominal_end=session_end,
             boundary_source="metadata-provisional",
-            speech_reason="Whisper optional; confirm this proposed cut in Select Cuts",
+            speech_reason="No boundary evidence yet; Analyze or Select Cuts required",
         )
-        for index in range(count)
-        if float(boundaries[index + 1]) > float(boundaries[index])
     ]
+
+
+def merge_unsafe_music_boundaries(
+    segments: list[Segment],
+    stems: list[Stem],
+    timelines: dict[str, np.ndarray],
+) -> list[Segment]:
+    """Remove proposed cuts that cross active music.
+
+    This is deliberately conservative: a comment/Whisper timestamp can be a
+    useful hint, but it never overrides the multi-stem activity check.  When a
+    boundary is unsafe, adjacent windows are merged and marked for review.
+    """
+    if len(segments) < 2:
+        return segments
+    result = sorted(list(segments), key=lambda item: item.start)
+    merged: list[dict[str, object]] = []
+    index = 0
+    while index < len(result) - 1:
+        left, right = result[index], result[index + 1]
+        cut = float(right.start)
+        safe, instruments, voices = _boundary_activity(
+            cut, stems, timelines, radius_seconds=3.0, diagnostic=True
+        )
+        if safe:
+            index += 1
+            continue
+        merged.append({
+            "cut_seconds": cut,
+            "active_instruments": instruments,
+            "active_voices": voices,
+            "reason": "boundary crosses active music; adjacent proposals merged",
+        })
+        result[index] = replace(
+            left,
+            end=right.end,
+            nominal_end=right.end,
+            core_end=right.core_end,
+            boundary_source="needs-review-merged-active-music",
+            boundary_validation="needs_review",
+            boundary_validation_reason="active music at proposed boundary",
+            speech_reason=(left.speech_reason or "") + "; active-music boundary merged; review in Select Cuts",
+        )
+        del result[index + 1]
+        if index:
+            index -= 1
+    DETECTION_STRATEGY["unsafe_music_boundary_merge"] = {
+        "merged_count": len(merged),
+        "boundaries": merged,
+        "remaining_count": len(result),
+        "policy": "never cut active music; merge and require review",
+    }
+    return result
 
 
 def auto_calibrate_drum_fallback(
