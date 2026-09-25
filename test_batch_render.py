@@ -45,7 +45,7 @@ def test_mix_everything_uses_all_visible_songs_and_shows_count():
     end = frontend.index("function chooseMixSource()", start)
     block = frontend[start:end]
     assert "renderableSongs().map" in block
-    assert "Se van a exportar ${songs.length} canciones" in block
+    assert "Preparing ${songs.length} songs" in block
     assert "[1, 2, 3]" not in block
 
 

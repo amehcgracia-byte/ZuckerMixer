@@ -5891,20 +5891,54 @@ def render_segment(
             }
         )
 
-    if not isinstance(prepared_plan, dict):
-        raise RuntimeError("Analyze required: Render did not receive a frozen DSP plan.")
-    cache_path_value = prepared_plan.get("analysis_cache_path")
-    cache_signature = prepared_plan.get("analysis_cache_signature")
-    if not cache_path_value or not cache_signature:
-        raise RuntimeError("Analyze required: the DSP plan has no analysis snapshot.")
-    cache_path = Path(str(cache_path_value))
-    try:
-        with cache_path.open("rb") as cache_file:
-            analysis_cache = pickle.load(cache_file)
-    except Exception as exc:
-        raise RuntimeError(f"Analyze required: analysis snapshot is unavailable: {exc}") from exc
-    if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
-        raise RuntimeError("Analyze required: analysis snapshot version is unsupported.")
+    lightweight_render = bool(isinstance(prepared_plan, dict) and prepared_plan.get("lightweight_render"))
+    if lightweight_render:
+        # Fast render fallback: use current controls and conservative defaults.
+        # It never scans source audio, runs Whisper, computes thresholds, or
+        # rebuilds Auto-Mix. The full analysis remains an explicit Analyze step.
+        names = [stem.path.name for stem in stems]
+        analysis_cache = {
+            "version": 2,
+            "song_id": int(index),
+            "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
+            "rms_values_db": {name: -30.0 for name in names},
+            "energies": {name: 1.0 for name in names},
+            "has_audio": {name: True for name in names},
+            "dynamic_spread_db": {name: 0.0 for name in names},
+            "segment_envelopes": {name: np.array([], dtype=np.float32) for name in names},
+            "segment_peaks_db": {name: -6.0 for name in names},
+            "role_norms_db": {},
+            "mix_controls": {
+                "effective_roles": {name: stem.role for name, stem in zip(names, stems)},
+                "rhythm": {},
+                "harmonic": {},
+                "vocal_priority": {},
+                "vocal_group_gain": {},
+                "vocal_pair_keys": {},
+                "mic_content": {},
+                "balance": {},
+                "bpm": 0.0,
+            },
+            "noise_diagnostics": {},
+            "flattening": {},
+            "drum_bpm": (0.0, 0.0),
+        }
+        print(f"RENDER ANALYSIS CACHE: lightweight settings snapshot for song {index}", flush=True)
+    else:
+        if not isinstance(prepared_plan, dict):
+            raise RuntimeError("Render did not receive a usable settings snapshot.")
+        cache_path_value = prepared_plan.get("analysis_cache_path")
+        cache_signature = prepared_plan.get("analysis_cache_signature")
+        if not cache_path_value or not cache_signature:
+            raise RuntimeError("Render analysis snapshot is incomplete.")
+        cache_path = Path(str(cache_path_value))
+        try:
+            with cache_path.open("rb") as cache_file:
+                analysis_cache = pickle.load(cache_file)
+        except Exception as exc:
+            raise RuntimeError(f"Render analysis snapshot is unavailable: {exc}") from exc
+        if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
+            raise RuntimeError("Render analysis snapshot version is unsupported.")
     cached_selection = analysis_cache.get("selection", {})
     if (
         int(analysis_cache.get("song_id", index)) != int(index)

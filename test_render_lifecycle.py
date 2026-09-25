@@ -85,14 +85,14 @@ class RenderLifecycleTest(unittest.TestCase):
         self.assertIn("stderr_tail = tail_text(stderr_path)", source)
         self.assertIn('stage_detail="see details"', source)
 
-    def test_missing_mix_plan_has_explicit_read_only_preflight(self):
+    def test_missing_mix_plan_does_not_block_render(self):
         backend = (ROOT / "jam_app.py").read_text(encoding="utf-8")
         frontend = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn('@app.get("/api/mix-plan-status/<int:segment_id>")', backend)
         self.assertIn("async function ensureRenderPlans(songIds)", frontend)
-        self.assertIn("await ensureRenderPlans(requestedSongs)", frontend)
-        self.assertIn("await refreshState({ renderLarge: false })", frontend)
-        self.assertIn("Analyze required", frontend)
+        self.assertNotIn("await ensureRenderPlans(requestedSongs)", frontend)
+        self.assertIn('await postOverrides("before-render")', frontend)
+        self.assertIn('"lightweight_render": True', backend)
 
     def test_worker_uses_frozen_persisted_plan_when_ui_snapshot_lacks_auto_stems(self):
         backend = (ROOT / "jam_app.py").read_text(encoding="utf-8")

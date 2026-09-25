@@ -528,7 +528,7 @@ async function prepareOverridesForRender() {
   // frozen DSP plan; those edits are persisted and analyzed explicitly here.
   await waitForOverrideWrites();
   if (!pendingOverrideSongs.size) return;
-  await postOverrides("render-preflight");
+  await postOverrides("before-render");
 }
 
 function currentOverrideSnapshot(songIndex) {
@@ -2504,7 +2504,7 @@ async function refreshState(options = {}) {
 }
 
 function updateSelectedButton() {
-  $("#mixSelected").textContent = `Mix selected (${checkedSongs.size})`;
+  $("#mixSelected").textContent = "Mix selected";
   $("#mixSelected").disabled = checkedSongs.size === 0;
 }
 
@@ -2553,7 +2553,6 @@ function setRenderControlsBusy(busy, detail = "") {
       if (!button.dataset.renderWasDisabled) button.dataset.renderWasDisabled = button.disabled ? "1" : "0";
       button.disabled = true;
       if (button.matches("#mixSelected, #mixAll, [data-mix-settings]")) button.dataset.renderOriginalText ||= button.textContent;
-      if (button.matches("#mixSelected, #mixAll, [data-mix-settings]")) button.textContent = detail || "Mixing…";
     } else {
       const wasDisabled = button.dataset.renderWasDisabled === "1";
       button.disabled = wasDisabled || (button.id === "mixSelected" && checkedSongs.size === 0);
@@ -2688,18 +2687,8 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     if (renderTargetDir === false) return;
     console.info("RENDER DESTINATION request_target", renderTargetDir);
     await prepareOverridesForRender();
-    // A Render click may prepare a missing/stale frozen plan, but this is an
-    // explicit, visible preflight. The worker itself never runs Analyze.
-    await ensureRenderPlans(requestedSongs);
-    // Analyze may have normalized and persisted automatic stem parameters.
-    // Refresh the authoritative state before freezing the job payload; using
-    // the pre-Analyze in-memory snapshot makes the worker reject otherwise
-    // valid plans as stale for later songs in a batch.
-    await refreshState({ renderLarge: false });
-    // The state response can intentionally preserve live preview overrides,
-    // but Render must freeze the server's persisted post-Analyze snapshot.
-    // Fetch it explicitly so generated per-song Auto-Mix stem values are not
-    // lost when the batch contains songs that were not open in the UI.
+    // Render takes a light in-memory snapshot. It never waits for or starts
+    // Whisper, thresholds, full-stem analysis, or DSP-plan preparation.
     const overridesResponse = await fetch("/api/overrides");
     const overridesSnapshot = overridesResponse.ok
       ? await overridesResponse.json()
@@ -2747,10 +2736,9 @@ function mixEverything() {
     showToast("No valid songs are available for Mix everything.");
     return;
   }
-  const preflight = `Se van a exportar ${songs.length} canciones`;
+  const preflight = `Preparing ${songs.length} songs`;
   const currentWork = document.querySelector("#currentWork");
   if (currentWork) currentWork.textContent = preflight;
-  showToast(preflight);
   console.info("[batch] Mix everything requested", { count: songs.length, song_ids: songs });
   mixSongs(songs, true, songs.length > 1, preflight);
 }
@@ -2855,7 +2843,7 @@ function renderJobs(items) {
       $("#currentWork").textContent = `${label} · ${terminal.id}`;
       $("#queuePosition").textContent = `${terminalError || terminal.stage_detail || "see job details"} · PID ${terminal.child_pid || terminal.pid || terminal.launch_pid || "unknown"}`;
     } else {
-      $("#currentWork").textContent = "Nothing mixing right now";
+      $("#currentWork").textContent = "Ready";
       $("#queuePosition").textContent = "Ready";
     }
     $("#progressFill").style.width = "0%";

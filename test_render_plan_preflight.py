@@ -8,7 +8,7 @@ def test_render_does_not_bump_override_revision_without_real_changes():
     source = (ROOT / "static" / "app.js").read_text()
     assert "await saveOverrides({ songIndexes: songs, reason: \"before-render\" });" not in source
     assert "async function prepareOverridesForRender()" in source
-    assert 'await postOverrides("render-preflight")' in source
+    assert 'await postOverrides("before-render")' in source
 
 
 def test_batch_master_marks_only_changed_songs():

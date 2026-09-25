@@ -2091,10 +2091,10 @@ def apply_overrides_for_song(
         authoritative_payload = normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}}))
         prepared_mix = load_mix_plan(segment_id, state_snapshot=state)
     if not isinstance(prepared_mix, dict):
-        raise RuntimeError(
-            f"Analyze required: the Auto-Mix plan for song {segment_id} is missing or stale. "
-            "Analyze the jam again before rendering."
-        )
+        # Render uses the current controls immediately when an optional heavy
+        # Analyze snapshot is absent or stale. Analyze remains explicit and is
+        # never started implicitly from a Render click.
+        prepared_mix = {"lightweight_render": True, "song": int(segment_id)}
     disk_payload = authoritative_payload or (overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}}))
     write_trace = disk_payload.get("_write_trace", {}) if isinstance(disk_payload, dict) else {}
     overrides = normalize_overrides(disk_payload)
