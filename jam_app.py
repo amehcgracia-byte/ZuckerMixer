@@ -2037,12 +2037,20 @@ def apply_overrides_for_song(
 ) -> dict[str, Any]:
     state = state_snapshot if isinstance(state_snapshot, dict) else load_render_state()
     prepared_mix = load_mix_plan(segment_id, overrides_snapshot=overrides_snapshot, state_snapshot=state)
+    authoritative_payload = None
+    if prepared_mix is None and isinstance(overrides_snapshot, dict):
+        # A batch snapshot may omit automatic stem fields for a song that was
+        # never open in the UI. Do not recalculate anything in Render: fall
+        # back only to the frozen plan and persisted overrides validated by
+        # Analyze. A stale persisted plan still fails below.
+        authoritative_payload = normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}}))
+        prepared_mix = load_mix_plan(segment_id, state_snapshot=state)
     if not isinstance(prepared_mix, dict):
         raise RuntimeError(
             f"Analyze required: the Auto-Mix plan for song {segment_id} is missing or stale. "
             "Analyze the jam again before rendering."
         )
-    disk_payload = overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}})
+    disk_payload = authoritative_payload or (overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}}))
     write_trace = disk_payload.get("_write_trace", {}) if isinstance(disk_payload, dict) else {}
     overrides = normalize_overrides(disk_payload)
     source_song = overrides.get("songs", {}).get(str(segment_id), {}) if use_saved_mixes else {}

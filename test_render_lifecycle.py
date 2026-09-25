@@ -94,6 +94,11 @@ class RenderLifecycleTest(unittest.TestCase):
         self.assertIn("await refreshState({ renderLarge: false })", frontend)
         self.assertIn("Analyze required", frontend)
 
+    def test_worker_uses_frozen_persisted_plan_when_ui_snapshot_lacks_auto_stems(self):
+        backend = (ROOT / "jam_app.py").read_text(encoding="utf-8")
+        self.assertIn("authoritative_payload = normalize_overrides", backend)
+        self.assertIn("prepared_mix = load_mix_plan(segment_id, state_snapshot=state)", backend)
+
     def test_partial_failure_exposes_batch_error_and_worker_identity(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("function jobErrorText(job)", source)
