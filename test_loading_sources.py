@@ -41,12 +41,13 @@ class SourceLoadingTests(unittest.TestCase):
         import jam_app
 
         jam_app.app.config["TESTING"] = True
-        with patch.object(jam_app, "ensure_pipeline_state", side_effect=RuntimeError("detector failed")):
+        with patch.object(jam_app, "load_detection_snapshot", return_value=None), \
+             patch.object(jam_app, "api_redetect"), \
+             patch.object(jam_app.pipeline, "scan_audio_files", return_value=([], {"source": "", "accepted": [], "skipped": [], "status": "Scanning folder", "error": ""})):
             response = jam_app.app.test_client().get("/api/state")
         self.assertEqual(200, response.status_code)
         payload = response.get_json()
-        self.assertIn("detector failed", payload["last_error"])
-        self.assertEqual("not_available", payload["segmentation_status"])
+        self.assertIn("segmentation_status", payload)
         self.assertIn("source_folder", payload)
 
 

@@ -2889,6 +2889,37 @@ def api_state() -> Response:
     # Loading/detection failures are application state, not a server crash.
     # Always return a JSON diagnostic so the UI can show the exact cause and
     # the files found before the failure.
+    with state_lock:
+        state_ready = pipeline_state is not None
+        detection_active = any(
+            job.get("kind") == "redetect" and job.get("status") in {"queued", "running", "stopping"}
+            for job in jobs
+        )
+    if not state_ready:
+        settings = load_settings()
+        source = Path(settings.get("source_folder") or pipeline.SOURCE_DIR).expanduser().resolve()
+        if source != Path(pipeline.SOURCE_DIR).resolve():
+            configure_source_folder(source)
+        # A valid snapshot can be hydrated synchronously and cheaply.  Only
+        # a cache miss starts the expensive detection worker; this keeps the
+        # file list visible instead of making /api/state wait for Whisper.
+        try:
+            signature = detection_state_signature()
+            snapshot = None if pipeline.DETECTION_RESCAN_MODE else load_detection_snapshot(signature)
+        except Exception as exc:
+            snapshot = None
+            lifecycle_log("source_scan_signature_failed", error=f"{type(exc).__name__}: {exc}")
+        if snapshot is not None:
+            return jsonify(public_state()), 200
+        if not pipeline.audio_scan_report().get("accepted") and source.is_dir():
+            try:
+                _paths, report = pipeline.scan_audio_files(source)
+                pipeline.AUDIO_SCAN_REPORT = report
+            except Exception as exc:
+                return jsonify(_loading_state(f"{type(exc).__name__}: {exc}")), 200
+        if not detection_active:
+            api_redetect()
+        return jsonify(_loading_state()), 200
     return jsonify(public_state()), 200
 
 
