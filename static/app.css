@@ -80,6 +80,8 @@ button:disabled {
 .cut-editor-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
 .cut-editor-tools audio { max-width: 280px; height: 34px; }
 .cut-context-menu { position: absolute; z-index: 20; display: grid; gap: 3px; min-width: 170px; padding: 7px; border: 1px solid var(--line); border-radius: 8px; background: #17120f; box-shadow: 0 12px 30px #000b; }
+.cut-context-heading { padding: 4px 9px 6px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.cut-context-divider { height: 1px; margin: 4px 0; background: var(--line); }
 .cut-context-menu button { border: 0; background: transparent; color: var(--cream); text-align: left; padding: 7px 9px; border-radius: 5px; cursor: pointer; }
 .cut-context-menu button:hover { background: #3a251a; }
 .cut-wave-wrap { position: relative; min-height: 190px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: #100e0c; }
