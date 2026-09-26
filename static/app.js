@@ -17,6 +17,7 @@ const pendingOverrideSongs = new Set();
 const pendingOverrideReasons = new Set();
 const activeStemLoadPromises = {};
 const livePreviewOverrides = {};
+let redetectPromptedJobId = null;
 const previewVocalExpander = {
   thresholdDb: -45,
   ratio: 2,
@@ -878,33 +879,57 @@ function ensureCutSelector() {
   dialog.id = "cutSelectorDialog";
   dialog.innerHTML = `
     <form method="dialog" class="cut-selector-shell">
-      <div class="cut-selector-header"><div><h2>Select Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><button value="cancel" class="ghost">Cancel</button></div>
-      <div class="cut-wave-wrap"><canvas id="cutWaveform" aria-label="Full jam waveform"></canvas><div id="cutMarkers" class="cut-markers"></div><div id="cutSelection" class="cut-selection"><button type="button" class="cut-handle left" aria-label="Move start"></button><button type="button" class="cut-center" aria-label="Move selection"></button><button type="button" class="cut-handle right" aria-label="Move end"></button></div></div>
+      <div class="cut-selector-header"><div><h2>Edit Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><button type="button" id="cutClose" class="ghost" aria-label="Close">×</button></div>
+      <div class="cut-wave-wrap"><canvas id="cutWaveform" aria-label="Selected slot waveform"></canvas><div id="cutMarkers" class="cut-markers"></div><div id="cutSelection" class="cut-selection"><button type="button" class="cut-handle left" aria-label="Move start"></button><button type="button" class="cut-center" aria-label="Move selection"></button><button type="button" class="cut-handle right" aria-label="Move end"></button></div></div>
+      <div class="cut-zoom-controls"><label>Zoom <input id="cutZoom" type="range" min="1" max="20" step="0.1" value="1"></label><button type="button" id="cutFit" class="ghost">Fit selected slot</button><button type="button" id="cutZoomSelection" class="ghost">Zoom to selection</button><label>Scroll <input id="cutPan" type="range" min="0" max="1000" step="1" value="0"></label></div>
       <div class="cut-readout"><label>Start <input id="cutStart" type="number" step="0.1"></label><label>End <input id="cutEnd" type="number" step="0.1"></label><strong>Duration <span id="cutDuration">—</span></strong><span id="cutValidation" class="cut-validation"></span></div>
       <div id="cutEvidence" class="cut-evidence"></div>
-      <div class="cut-selector-actions"><button id="cutApply" type="button" class="accent">Apply/Save</button><button id="cutCancel" type="button" class="ghost">Cancel</button></div>
+      <div class="cut-selector-actions"><button id="cutApply" type="button" class="accent">Save Changes</button></div>
     </form>`;
   document.body.appendChild(dialog);
-  dialog.querySelector("#cutCancel").addEventListener("click", () => dialog.close("cancel"));
-  cutSelector = { dialog, canvas: dialog.querySelector("#cutWaveform"), selection: dialog.querySelector("#cutSelection"), start: dialog.querySelector("#cutStart"), end: dialog.querySelector("#cutEnd") };
+  dialog.querySelector("#cutClose").addEventListener("click", () => closeCutSelector());
+  cutSelector = { dialog, canvas: dialog.querySelector("#cutWaveform"), selection: dialog.querySelector("#cutSelection"), start: dialog.querySelector("#cutStart"), end: dialog.querySelector("#cutEnd"), zoom: dialog.querySelector("#cutZoom"), pan: dialog.querySelector("#cutPan") };
   wireCutSelector(cutSelector);
   return cutSelector;
 }
 
 async function openCutSelector(songId) {
   const ui = ensureCutSelector();
+  setCutLoading("Loading cut editor", `Loading selected slot ${songId}`, 8);
   const response = await fetch(`/api/cuts/${songId}`);
   const data = await response.json();
-  if (!response.ok) return showToast(data.error || "Could not load cut editor.");
+  if (!response.ok) { setCutLoading("Error", data.error || "Could not load cut editor."); return showToast(data.error || "Could not load cut editor."); }
+  setCutLoading("Loading selected waveform", `Preparing slot ${songId}`, 40);
   ui.songId = songId;
   ui.data = data;
-  ui.duration = Number(data.waveform.duration_sec || 0);
+  ui.sourceStart = Number(data.waveform.window_start_sec || data.selection.start_sec || 0);
+  ui.sourceEnd = Number(data.waveform.window_end_sec || data.selection.end_sec || 0);
+  ui.duration = Math.max(0, ui.sourceEnd - ui.sourceStart);
   ui.startValue = Number(data.selection.start_sec);
   ui.endValue = Number(data.selection.end_sec);
-  ui.dialog.querySelector("#cutSelectorTitle").textContent = `Song ${String(songId).padStart(2, "0")} · waveform cache ${data.waveform.cached ? "hit" : "created"}`;
-  ui.dialog.querySelector("#cutEvidence").innerHTML = data.markers.map((marker) => `<span class="cut-evidence-item ${marker.status}">${cutTime(marker.start_sec)}–${cutTime(marker.end_sec)} · ${esc(marker.boundary_source || "automatic proposal")} · ${marker.confidence ? `${Math.round(marker.confidence * 100)}%` : "no confidence"}</span>`).join("");
+  ui.viewStart = ui.sourceStart; ui.viewEnd = ui.sourceEnd; ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue;
+  ui.dialog.querySelector("#cutSelectorTitle").textContent = `Slot ${String(songId).padStart(2, "0")} · ${data.waveform.cached ? "waveform cache hit" : "waveform prepared"}`;
+  ui.dialog.querySelector("#cutEvidence").innerHTML = data.markers.filter((marker) => marker.song_id === songId).map((marker) => `<span class="cut-evidence-item ${marker.status}">${cutTime(marker.start_sec)}–${cutTime(marker.end_sec)} · ${esc(marker.boundary_source || "automatic proposal")} · ${marker.confidence ? `${Math.round(marker.confidence * 100)}%` : "no confidence"}</span>`).join("");
   drawCutEditor();
   ui.dialog.showModal();
+  setCutLoading("Finished", `Slot ${songId} ready for precise editing`, 100);
+  setTimeout(() => clearCutLoading(), 700);
+}
+
+function setCutLoading(label, detail, progress = 0) {
+  const box = $("#loadingStatus"); if (!box) return;
+  box.hidden = false; $("#loadingLabel").textContent = label; $("#loadingDetail").textContent = detail || ""; $("#loadingProgressFill").style.width = `${Math.max(0, Math.min(100, progress))}%`;
+}
+function clearCutLoading() { const box = $("#loadingStatus"); if (box && !document.querySelector("#cutSelectorDialog[open]")) box.hidden = true; }
+function cutIsDirty() { const ui = cutSelector; return Boolean(ui && (Math.abs(ui.startValue - ui.originalStart) > 0.05 || Math.abs(ui.endValue - ui.originalEnd) > 0.05)); }
+function closeCutSelector() { if (!cutIsDirty() || window.confirm("Discard unsaved cut changes?")) { cutSelector.dialog.close("cancel"); clearCutLoading(); } }
+async function editAllCuts() {
+  const slots = visibleSongs().filter((song) => !song.skipped).map((song) => Number(song.id));
+  if (!slots.length) return showToast("No slots available for Edit All.");
+  cutSelector = null;
+  const ui = ensureCutSelector();
+  ui.editAllQueue = slots.slice(1);
+  await openCutSelector(slots[0]);
 }
 
 function drawCutEditor() {
@@ -918,9 +943,10 @@ function drawCutEditor() {
   const ctx = canvas.getContext("2d"); ctx.scale(devicePixelRatio, devicePixelRatio);
   ctx.fillStyle = "#100e0c"; ctx.fillRect(0, 0, width, height);
   const peaks = ui.data.waveform.peaks || [];
+  const visibleStart = ui.viewStart ?? ui.sourceStart ?? 0; const visibleEnd = ui.viewEnd ?? ui.sourceEnd ?? ui.duration; const visibleSpan = Math.max(0.001, visibleEnd - visibleStart);
   ctx.strokeStyle = "#eca35e"; ctx.globalAlpha = .8; ctx.beginPath();
-  peaks.forEach((value, index) => { const x = index / Math.max(1, peaks.length - 1) * width; const y = height / 2 - Number(value) * (height * .42); ctx.moveTo(x, height / 2 + Number(value) * (height * .42)); ctx.lineTo(x, y); }); ctx.stroke(); ctx.globalAlpha = 1;
-  const x = (seconds) => Math.max(0, Math.min(width, Number(seconds) / Math.max(.001, ui.duration) * width));
+  peaks.forEach((value, index) => { const seconds = (ui.sourceStart + index / Math.max(1, peaks.length - 1) * ui.duration); if (seconds < visibleStart || seconds > visibleEnd) return; const x = (seconds - visibleStart) / visibleSpan * width; const y = height / 2 - Number(value) * (height * .42); ctx.moveTo(x, height / 2 + Number(value) * (height * .42)); ctx.lineTo(x, y); }); ctx.stroke(); ctx.globalAlpha = 1;
+  const x = (seconds) => Math.max(0, Math.min(width, (Number(seconds) - visibleStart) / visibleSpan * width));
   const sx = x(ui.startValue), ex = x(ui.endValue);
   ctx.fillStyle = "rgba(200,111,47,.23)"; ctx.fillRect(sx, 0, Math.max(0, ex - sx), height);
   ctx.strokeStyle = "#ffd08f"; ctx.lineWidth = 2; [sx, ex].forEach((point) => { ctx.beginPath(); ctx.moveTo(point, 0); ctx.lineTo(point, height); ctx.stroke(); });
@@ -931,14 +957,15 @@ function drawCutEditor() {
   const valid = duration >= 480 && duration <= 780;
   const validation = ui.dialog.querySelector("#cutValidation"); validation.textContent = valid ? "Valid selection" : "Selection must be between 8:00 and 13:00"; validation.className = `cut-validation ${valid ? "valid" : "invalid"}`;
   ui.dialog.querySelector("#cutApply").disabled = !valid;
-  const markers = ui.dialog.querySelector("#cutMarkers"); markers.innerHTML = (ui.data.markers || []).flatMap((marker) => [marker.start_sec, marker.comment_start_sec]).filter((value) => Number.isFinite(Number(value))).map((value) => `<i style="left:${x(value) / width * 100}%" title="Comment/candidate ${cutTime(value)}"></i>`).join("");
+  const markers = ui.dialog.querySelector("#cutMarkers"); markers.innerHTML = (ui.data.markers || []).filter((marker) => marker.song_id === ui.songId).flatMap((marker) => [marker.start_sec, marker.end_sec, marker.comment_start_sec]).filter((value) => Number.isFinite(Number(value)) && Number(value) >= visibleStart && Number(value) <= visibleEnd).map((value) => `<i style="left:${x(value) / width * 100}%" title="Boundary ${cutTime(value)}"></i>`).join("");
+  if (ui.zoom) ui.zoom.value = Math.max(1, Math.min(20, ui.duration / visibleSpan));
 }
 
 function installCutDrag(element, mode) {
   element.addEventListener("pointerdown", (event) => {
-    event.preventDefault(); const ui = cutSelector; const rect = ui.canvas.getBoundingClientRect(); const startX = event.clientX; const originalStart = ui.startValue; const originalEnd = ui.endValue;
+    event.preventDefault(); const ui = cutSelector; const rect = ui.canvas.getBoundingClientRect(); const startX = event.clientX; const originalStart = ui.startValue; const originalEnd = ui.endValue; const viewSpan = ui.viewEnd - ui.viewStart;
     element.setPointerCapture(event.pointerId);
-    const move = (current) => { const delta = (current.clientX - startX) / rect.width * ui.duration; if (mode === "left") ui.startValue = Math.max(0, Math.min(originalEnd - 480, originalStart + delta)); else if (mode === "right") ui.endValue = Math.min(ui.duration, Math.max(originalStart + 480, originalEnd + delta)); else { const span = originalEnd - originalStart; const next = Math.max(0, Math.min(ui.duration - span, originalStart + delta)); ui.startValue = next; ui.endValue = next + span; } drawCutEditor(); };
+    const move = (current) => { const delta = (current.clientX - startX) / rect.width * viewSpan; if (mode === "left") ui.startValue = Math.max(ui.sourceStart, Math.min(originalEnd - 480, originalStart + delta)); else if (mode === "right") ui.endValue = Math.min(ui.sourceEnd, Math.max(originalStart + 480, originalEnd + delta)); else { const span = originalEnd - originalStart; const next = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, originalStart + delta)); ui.startValue = next; ui.endValue = next + span; } drawCutEditor(); };
     const onMove = (moveEvent) => move(moveEvent); const onUp = () => { element.removeEventListener("pointermove", onMove); element.removeEventListener("pointerup", onUp); };
     element.addEventListener("pointermove", onMove); element.addEventListener("pointerup", onUp, { once: true });
   });
@@ -947,7 +974,11 @@ function installCutDrag(element, mode) {
 function wireCutSelector(ui) {
   installCutDrag(ui.dialog.querySelector(".cut-handle.left"), "left"); installCutDrag(ui.dialog.querySelector(".cut-handle.right"), "right"); installCutDrag(ui.dialog.querySelector(".cut-center"), "center");
   [ui.start, ui.end].forEach((input) => input.addEventListener("input", () => { ui.startValue = Number(ui.start.value); ui.endValue = Number(ui.end.value); drawCutEditor(); }));
-  ui.dialog.querySelector("#cutApply").addEventListener("click", async () => { const response = await fetch(`/api/segment-selection/${ui.songId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_sec: ui.startValue, end_sec: ui.endValue }) }); const result = await response.json(); if (!response.ok) return showToast(result.error || "Could not save selection."); const planResponse = await fetch(`/api/analyze-mix/${ui.songId}`, { method: "POST" }); const planResult = await planResponse.json().catch(() => ({})); if (!planResponse.ok) return showToast(planResult.error || "Analyze required before rendering."); ui.dialog.close("saved"); await refreshState({ renderLarge: true }); showToast(`Saved cut ${cutTime(result.start_sec)}–${cutTime(result.end_sec)}. Analyze plan ready.`); });
+  ui.zoom.addEventListener("input", () => { const span = ui.duration / Number(ui.zoom.value); const center = (ui.viewStart + ui.viewEnd) / 2; ui.viewStart = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, center - span / 2)); ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
+  ui.pan.addEventListener("input", () => { const span = ui.viewEnd - ui.viewStart; const max = Math.max(0, ui.duration - span); ui.viewStart = ui.sourceStart + max * Number(ui.pan.value) / 1000; ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
+  ui.dialog.querySelector("#cutFit").addEventListener("click", () => { ui.viewStart = ui.sourceStart; ui.viewEnd = ui.sourceEnd; drawCutEditor(); });
+  ui.dialog.querySelector("#cutZoomSelection").addEventListener("click", () => { const span = Math.min(ui.duration, Math.max(ui.endValue - ui.startValue, (ui.endValue - ui.startValue) * 1.2)); const center = (ui.startValue + ui.endValue) / 2; ui.viewStart = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, center - span / 2)); ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
+  ui.dialog.querySelector("#cutApply").addEventListener("click", async () => { setCutLoading("Applying cut changes", `Validating slot ${ui.songId}`, 30); const response = await fetch(`/api/segment-selection/${ui.songId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_sec: ui.startValue, end_sec: ui.endValue }) }); const result = await response.json().catch(() => ({})); if (!response.ok) { setCutLoading("Error", result.error || "Could not save selection."); return showToast(result.error || "Could not save selection."); } setCutLoading("Saving changes", `Saved slot ${ui.songId}; preserving all other slots`, 80); ui.dialog.close("saved"); ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue; await refreshState({ renderLarge: true }); if (ui.editAllQueue?.length) { const next = ui.editAllQueue.shift(); await openCutSelector(next); } else { setCutLoading("Finished", `Slot ${ui.songId} saved`, 100); setTimeout(clearCutLoading, 700); } showToast(`Saved cut ${cutTime(result.start_sec)}–${cutTime(result.end_sec)}.`); });
 }
 
 function fineTuneHtml(song) {
@@ -2893,10 +2924,10 @@ function renderJobs(items) {
       stall.textContent = stale ? `No worker event for ${Math.floor((Date.now() - updated) / 1000)}s — stage: ${active.current_stage || "unknown"}; last event: ${active.last_event || active.stage_detail || "unknown"}. Cancel if it does not resume.` : "";
     }
   } else {
-    const terminal = [...items].reverse().find((job) => ["pending_review", "partial_failed", "error", "cancelled"].includes(job.status));
+    const terminal = [...items].reverse().find((job) => ["pending_confirmation", "pending_review", "partial_failed", "error", "cancelled"].includes(job.status));
     const terminalError = terminal ? jobErrorText(terminal) : "";
     if (terminal) {
-      const label = terminal.status === "pending_review" ? "Pending review" : terminal.status === "partial_failed" ? "Render partially failed" : terminal.status === "cancelled" ? "Render cancelled" : "Render failed";
+      const label = terminal.status === "pending_confirmation" ? "Re-detect ready for confirmation" : terminal.status === "pending_review" ? "Pending review" : terminal.status === "partial_failed" ? "Render partially failed" : terminal.status === "cancelled" ? "Render cancelled" : "Render failed";
       $("#currentWork").textContent = `${label} · ${terminal.id}`;
       $("#queuePosition").textContent = `${terminalError || terminal.stage_detail || "see job details"} · PID ${terminal.child_pid || terminal.pid || terminal.launch_pid || "unknown"}`;
     } else {
@@ -3014,6 +3045,21 @@ async function pollLogs() {
   }
 }
 
+async function reviewRedetectCandidate(job) {
+  if (!job || redetectPromptedJobId === job.id) return;
+  redetectPromptedJobId = job.id;
+  const response = await fetch("/api/redetect/candidate");
+  const candidate = await response.json().catch(() => ({}));
+  if (!candidate.available) return;
+  const approve = window.confirm(`Re-detect finished on the complete original session.\n\nCurrent slots: ${candidate.old_count}\nNew slots: ${candidate.new_count}\n\nReplace the current list only if this comparison is correct?\nCancel keeps all current and manual cuts.`);
+  const endpoint = approve ? "/api/redetect/commit" : "/api/redetect/discard";
+  const result = await fetch(endpoint, { method: "POST" }).then((r) => r.json().catch(() => ({})));
+  if (!approve) { showToast("Re-detect cancelled; current slots and manual cuts preserved."); return; }
+  if (!result.ok) return showToast(result.error || "Could not replace the current slot list.");
+  await refreshState({ renderLarge: true });
+  showToast(`Re-detect confirmed: ${result.count} slots loaded.`);
+}
+
 function showToast(text) {
   const toast = $("#toast");
   toast.textContent = text;
@@ -3025,6 +3071,8 @@ async function pollingLoop() {
   if (document.visibilityState === "visible") {
     await pollLogs();
     const jobs = await pollJobs();
+    const pendingRedetect = [...(jobs || [])].reverse().find((job) => job.kind === "redetect" && job.status === "pending_confirmation");
+    if (pendingRedetect) await reviewRedetectCandidate(pendingRedetect);
     const active = (jobs || []).some((job) => ["queued", "running", "stopping"].includes(job.status));
     await refreshState({ renderLarge: !active });
     setTimeout(pollingLoop, active ? 3000 : 5000);
@@ -3036,6 +3084,7 @@ async function pollingLoop() {
 if (typeof document !== "undefined") {
   $("#mixSelected").addEventListener("click", () => mixSongs([...checkedSongs], true, true).catch((error) => showToast(`Render failed: ${error.message || error}`)));
   $("#mixAll").addEventListener("click", () => mixEverything());
+  $("#editAllCuts").addEventListener("click", () => editAllCuts().catch((error) => { setCutLoading("Error", error.message || String(error)); showToast(error.message || String(error)); }));
   $("#cancelJob").addEventListener("click", () => {
     if (!window.confirm("Are you sure you want to cancel?")) return;
     fetch("/api/cancel", { method: "POST" }).then(pollJobs);
@@ -3062,13 +3111,15 @@ if (typeof document !== "undefined") {
     showToast("Matchering reference saved. New renders will use it.");
   });
   $("#redetectSongs").addEventListener("click", async () => {
-    const response = await fetch("/api/redetect", { method: "POST" });
+    if (!window.confirm("Re-detect the complete original session? Current slots remain until you confirm the comparison.")) return;
+    setCutLoading("Re-detecting songs", "Preparing full original session", 2);
+    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: true }) });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       showToast(data.error || "Could not start song detection.");
       return;
     }
-    showToast("Looking for songs again.");
+    showToast("Re-detecting the complete original session.");
     await pollJobs();
     // Do not wait for the general polling loop to repaint the song list. The
     // completion path invalidates the server's old detection state, so this
@@ -3076,7 +3127,9 @@ if (typeof document !== "undefined") {
     const waitForFreshDetection = async () => {
       const jobs = await pollJobs();
       const job = [...jobs].reverse().find((item) => item.kind === "redetect");
-      if (job?.status === "done") {
+      if (job?.status === "pending_confirmation") {
+        await reviewRedetectCandidate(job);
+      } else if (job?.status === "done") {
         await refreshState({ renderLarge: true });
         showToast(`${appState.songs.length} songs detected from a fresh pass.`);
       } else if (job?.status === "error" || job?.status === "cancelled") {

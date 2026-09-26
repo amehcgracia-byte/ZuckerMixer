@@ -72,6 +72,9 @@ button:disabled {
 .cut-selector-shell { padding: 22px; }
 .cut-selector-header, .cut-selector-actions, .cut-readout { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .cut-selector-header { margin-bottom: 16px; }
+.cut-zoom-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 10px 0; color: var(--muted); }
+.cut-zoom-controls label { display: inline-flex; align-items: center; gap: 7px; }
+.cut-zoom-controls input { accent-color: var(--orange2); min-width: 150px; }
 .cut-wave-wrap { position: relative; min-height: 190px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: #100e0c; }
 #cutWaveform { display: block; width: 100%; height: 190px; }
 .cut-selection { position: absolute; inset: 0 auto 0 0; border-left: 3px solid var(--orange2); border-right: 3px solid var(--orange2); pointer-events: none; background: rgba(200,111,47,.12); }

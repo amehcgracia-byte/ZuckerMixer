@@ -48,6 +48,8 @@ WAVEFORM_CACHE_PATH = ACTIVE_SOURCE_STATE_ROOT / "waveform_cache.json"
 MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
 SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
 DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
+REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
+REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerPreviewCache"
 PREVIEW_DIR = PREVIEW_CACHE_ROOT / "default"
 JOB_STATUS_DIR = STATE_ROOT / "job_status"
@@ -843,7 +845,7 @@ def save_manual_splits(values: list[float]) -> None:
 
 
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, PREVIEW_DIR
+    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, PREVIEW_DIR
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.AUDIO_SCAN_REPORT = {
@@ -866,6 +868,8 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
     SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
     DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
+    REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
+    REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
     PREVIEW_DIR = PREVIEW_CACHE_ROOT / source_key
     return source
 
@@ -962,6 +966,10 @@ def save_detection_snapshot(state: dict[str, Any], signature: tuple[str, float |
     save_json_atomic(DETECTION_STATE_PATH, payload)
 
 
+def session_id_for_signature(signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> str:
+    return hashlib.sha256(json.dumps(signature, sort_keys=True, default=str).encode()).hexdigest()[:20]
+
+
 def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int, int], ...]]:
     mtimes = [path.stat().st_mtime if path.exists() else None for path in (MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH)]
     source = Path(pipeline.SOURCE_DIR)
@@ -1031,36 +1039,45 @@ def _waveform_identity() -> dict[str, Any]:
     return {"source": str(source), "files": files, "version": 1, "points": 2400}
 
 
-def low_resolution_waveform() -> dict[str, Any]:
-    """Build/cache a visual envelope without invoking Whisper or thresholds."""
+def slot_waveform(start_sec: float, end_sec: float, points: int = 1400) -> dict[str, Any]:
+    """Build/cache only the selected slot waveform from the original stems."""
     identity = _waveform_identity()
-    cached = load_json(WAVEFORM_CACHE_PATH, None)
-    if isinstance(cached, dict) and cached.get("identity") == identity:
-        cached["cached"] = True
-        return cached
+    cache = load_json(WAVEFORM_CACHE_PATH, {})
+    if not isinstance(cache, dict) or cache.get("identity") != identity:
+        cache = {"identity": identity, "version": 2, "slots": {}}
+    key = f"{start_sec:.3f}:{end_sec:.3f}:{int(points)}"
+    cached = cache.get("slots", {}).get(key)
+    if isinstance(cached, dict):
+        return {**cached, "cached": True}
     state = ensure_pipeline_state()
     stems = state["stems"]
-    duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in stems), default=0.0)
-    points = int(identity["points"])
+    start_sec = max(0.0, float(start_sec))
+    end_sec = max(start_sec, float(end_sec))
+    duration = end_sec - start_sec
     envelope = np.zeros(points, dtype=np.float32)
-    # Read small windows at evenly spaced positions. This is intentionally a
-    # presentation cache and is never used to decide DSP gains or boundaries.
+    # Read only the selected source range. This cache is presentation-only and
+    # never participates in detection or DSP.
     for stem in stems:
         try:
             with sf.SoundFile(str(stem.path)) as audio_file:
-                total = max(1, int(audio_file.frames))
-                for index in range(points):
-                    frame = min(total - 1, int(index / max(1, points - 1) * total))
-                    audio_file.seek(frame)
-                    block = audio_file.read(min(256, total - frame), dtype="float32", always_2d=True)
-                    if len(block):
-                        envelope[index] = max(envelope[index], float(np.max(np.abs(block))))
+                sr = float(audio_file.samplerate)
+                local_start = max(0, int(round((start_sec - float(stem.offset_seconds)) * sr)))
+                local_end = min(int(audio_file.frames), max(local_start, int(round((end_sec - float(stem.offset_seconds)) * sr))))
+                if local_end <= local_start:
+                    continue
+                audio_file.seek(local_start)
+                block = audio_file.read(local_end - local_start, dtype="float32", always_2d=True)
+                mono = np.max(np.abs(block), axis=1) if len(block) else np.zeros(0, dtype=np.float32)
+                for index, chunk in enumerate(np.array_split(mono, points)):
+                    if len(chunk):
+                        envelope[index] = max(envelope[index], float(np.max(chunk)))
         except (OSError, RuntimeError, ValueError):
             continue
     peak = float(np.max(envelope)) if len(envelope) else 0.0
     values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
-    result = {"identity": identity, "duration_sec": duration, "peaks": values, "cached": False}
-    save_json_atomic(WAVEFORM_CACHE_PATH, result)
+    result = {"window_start_sec": start_sec, "window_end_sec": end_sec, "duration_sec": duration, "peaks": values, "cached": False}
+    cache.setdefault("slots", {})[key] = result
+    save_json_atomic(WAVEFORM_CACHE_PATH, cache)
     return result
 
 
@@ -1373,6 +1390,7 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
         pipeline.write_detection_outputs(out_dir(), segments)
     capture.flush()
 
+    session_id = session_id_for_signature(signature)
     raw_songs = []
     strategy = getattr(pipeline, "DETECTION_STRATEGY", {})
     boundary_audit = strategy.get("boundary_audit", []) if isinstance(strategy, dict) else []
@@ -1382,6 +1400,14 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
         raw_songs.append(
             {
                 "id": index,
+                "session_id": session_id,
+                "slot_id": f"{session_id}:slot-{index:03d}",
+                "source_start": float(segment.start),
+                "source_end": float(segment.end),
+                "manual_start": None,
+                "manual_end": None,
+                "revision": 0,
+                "detection_version": getattr(pipeline, "SPEECH_TRANSCRIPTION_CACHE_VERSION", "unknown"),
                 "start": segment.start,
                 "end": segment.end,
                 "duration": duration,
@@ -1483,6 +1509,10 @@ def ensure_pipeline_state() -> dict[str, Any]:
 
 def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
     global pipeline_state, pipeline_state_signature
+    is_redetect = job_id != "detect"
+    had_previous_snapshot = DETECTION_STATE_PATH.exists()
+    if is_redetect and had_previous_snapshot:
+        shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_BACKUP_PATH)
     append_log(job_id, "Searching again from a clean deterministic detection pass; suspicious regions will be rescanned.")
     pipeline.DETECTION_RESCAN_MODE = True
     with state_lock:
@@ -1491,9 +1521,33 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
     app_progress({"current_stage": "detecting songs", "stage_detail": "inspecting stems", "heartbeat": time.time(), "progress": 6})
     try:
         state = ensure_pipeline_state()
+        candidate_count = len(state.get("raw_songs", []))
+        if is_redetect:
+            if candidate_count < 2:
+                if REDETECTION_BACKUP_PATH.exists():
+                    shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
+                raise RuntimeError(
+                    f"Re-detect produced only {candidate_count} slot(s); previous session preserved and not replaced."
+                )
+            shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
+            if REDETECTION_BACKUP_PATH.exists():
+                shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
+            with state_lock:
+                pipeline_state = None
+                pipeline_state_signature = None
+            app_progress({
+                "status": "pending_confirmation",
+                "current_stage": "validating cuts",
+                "stage_detail": f"Detected {candidate_count} slots; compare before replacing the current session",
+                "candidate_count": candidate_count,
+                "heartbeat": time.time(),
+                "progress": 100,
+                "song_progress": 100,
+            })
     finally:
         pipeline.DETECTION_RESCAN_MODE = False
-    app_progress({"current_stage": "detecting songs", "stage_detail": "detection state ready", "heartbeat": time.time(), "progress": 90})
+    if not is_redetect:
+        app_progress({"current_stage": "detecting songs", "stage_detail": "detection state ready", "heartbeat": time.time(), "progress": 90})
     append_log(job_id, f"Found {len(state['raw_songs'])} commentator-led slots.")
     return state
 
@@ -2582,17 +2636,15 @@ def _run_child_job(job_path: Path) -> int:
             }
         )
         rebuild_detection_state(job_id)
-        app_progress(
-            {
-                "status": "done",
-                "current_stage": "finished",
-                "stage_detail": "song list refreshed",
-                "heartbeat": time.time(),
-                "progress": 100,
-                "song_progress": 100,
-                "done_count": 1,
-            }
-        )
+        app_progress({
+            "status": "pending_confirmation",
+            "current_stage": "validating cuts",
+            "stage_detail": "New full-session detection ready for comparison; current session unchanged",
+            "heartbeat": time.time(),
+            "progress": 100,
+            "song_progress": 100,
+            "done_count": 1,
+        })
         return 0
 
     state = load_render_state()
@@ -2939,7 +2991,7 @@ def worker() -> None:
             set_job(job, exit_code=code, termination=termination, finished_at=time.time(), stderr_path=str(stderr_path))
             with state_lock:
                 child_processes.pop(job["id"], None)
-            if job.get("kind") == "redetect" and code == 0:
+            if job.get("kind") == "redetect" and code == 0 and job.get("status") != "pending_confirmation":
                 with state_lock:
                     # The detector ran in the child process. Never leave the
                     # parent's old song list serving after that child has
@@ -2952,6 +3004,20 @@ def worker() -> None:
             if cancelled:
                 set_job(job, status="cancelled", error=None, current=None, current_stage="cancelled", stage_detail="Cancelled by user", progress=job.get("progress", 0))
                 append_log(job["id"], "Mixing stopped.")
+            elif code == 0 and job.get("kind") == "redetect" and job.get("status") == "pending_confirmation":
+                set_job(
+                    job,
+                    status="pending_confirmation",
+                    current=None,
+                    progress=100,
+                    song_progress=100,
+                    current_stage="validating cuts",
+                    stage_detail="New detection ready; confirmation required before replacing the current session",
+                    heartbeat=time.time(),
+                    done_count=1,
+                    total_count=1,
+                )
+                append_log(job["id"], "New detection is pending confirmation; current slot list was preserved.")
             elif code == 0:
                 song_count = len(job.get("songs", []))
                 pending_review = job.get("status") == "pending_review" or int(job.get("needs_review_count", 0) or 0) > 0
@@ -3068,7 +3134,8 @@ def api_cuts(song_id: int) -> Response:
     state = ensure_pipeline_state()
     if song_id < 1 or song_id > len(state["segments"]):
         return jsonify({"error": "song not found"}), 404
-    waveform = low_resolution_waveform()
+    selected = state["segments"][song_id - 1]
+    waveform = slot_waveform(float(selected.start), float(selected.end))
     markers = []
     for index, segment in enumerate(state["segments"], 1):
         markers.append({
@@ -3083,13 +3150,19 @@ def api_cuts(song_id: int) -> Response:
             "confidence": float(segment.speech_confidence or 0.0),
             "status": "valid" if pipeline.HARD_MIN_SONG_SECONDS <= segment.duration <= pipeline.HARD_MAX_SONG_SECONDS else "needs_review",
         })
-    selected = state["segments"][song_id - 1]
     return jsonify({
         "song_id": song_id,
         "waveform": waveform,
         "selection": {"start_sec": float(selected.start), "end_sec": float(selected.end)},
         "markers": markers,
         "bounds": {"min_sec": pipeline.HARD_MIN_SONG_SECONDS, "max_sec": pipeline.HARD_MAX_SONG_SECONDS},
+        "slot": {
+            "session_id": state.get("raw_songs", [{}])[song_id - 1].get("session_id"),
+            "slot_id": state.get("raw_songs", [{}])[song_id - 1].get("slot_id"),
+            "source_start": state.get("raw_songs", [{}])[song_id - 1].get("source_start"),
+            "source_end": state.get("raw_songs", [{}])[song_id - 1].get("source_end"),
+            "revision": state.get("raw_songs", [{}])[song_id - 1].get("revision", 0),
+        },
     })
 
 
@@ -3116,16 +3189,46 @@ def api_segment_selection(song_id: int) -> Response:
         saved = {"version": 1, "segments": {}}
     saved["version"] = 1
     saved.setdefault("segments", {})[str(song_id)] = {
+        "slot_id": (state.get("raw_songs", [{}])[song_id - 1].get("slot_id") if state.get("raw_songs") else None),
+        "session_id": (state.get("raw_songs", [{}])[song_id - 1].get("session_id") if state.get("raw_songs") else None),
+        "source_start": float(state.get("raw_songs", [{}])[song_id - 1].get("source_start", start)) if state.get("raw_songs") else start,
+        "source_end": float(state.get("raw_songs", [{}])[song_id - 1].get("source_end", end)) if state.get("raw_songs") else end,
         "start_sec": start,
         "end_sec": end,
         "source": "manual",
+        "revision": int(saved.get("revision", 0) or 0) + 1,
         "saved_at": time.time(),
     }
+    saved["revision"] = int(saved.get("revision", 0) or 0) + 1
     save_json_atomic(SEGMENT_SELECTIONS_PATH, saved)
+    # Update only this slot in the in-memory and persisted snapshot. Do not
+    # invalidate the whole detection list: saving a manual cut is not a new
+    # detection pass and must never collapse the session to one window.
+    updated = replace(
+        state["segments"][song_id - 1],
+        start=start,
+        end=end,
+        core_start=start,
+        core_end=end,
+        nominal_end=end,
+        boundary_source="manual-selection",
+        boundary_validation="manual-selection",
+        boundary_validation_reason="user timeline selection",
+    )
+    state["segments"][song_id - 1] = updated
+    if song_id <= len(state.get("raw_songs", [])):
+        row = state["raw_songs"][song_id - 1]
+        row["start"] = start; row["end"] = end; row["render_end"] = end
+        row["duration"] = duration; row["duration_text"] = fmt_time(duration)
+        row["manual_start"] = start; row["manual_end"] = end
+        row["revision"] = int(row.get("revision", 0) or 0) + 1
+        row["segment"] = asdict(updated)
     with state_lock:
         global pipeline_state, pipeline_state_signature
-        pipeline_state = None
-        pipeline_state_signature = None
+        pipeline_state = state
+        pipeline_state_signature = detection_state_signature()
+        if state.get("raw_songs") and all(hasattr(stem, "path") for stem in state.get("stems", [])):
+            save_detection_snapshot(state, pipeline_state_signature)
     append_log("ui", f"Saved manual cut for song {song_id}: {start:.3f}-{end:.3f}s")
     return jsonify({"ok": True, "song_id": song_id, "start_sec": start, "end_sec": end, "duration_sec": duration, "source": "manual"})
 
@@ -3362,6 +3465,63 @@ def api_redetect(allow_whisper: bool = True) -> Response:
     job_queue.put(job)
     append_log(job["id"], "Queued song search.")
     return jsonify(job)
+
+
+@app.get("/api/redetect/candidate")
+def api_redetect_candidate() -> Response:
+    candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
+    if not isinstance(candidate, dict):
+        return jsonify({"available": False})
+    current = load_json(DETECTION_STATE_PATH, {})
+    old_count = len(current.get("raw_songs", [])) if isinstance(current, dict) else 0
+    new_count = len(candidate.get("raw_songs", []))
+    return jsonify({
+        "available": True,
+        "old_count": old_count,
+        "new_count": new_count,
+        "old_slots": current.get("raw_songs", []) if isinstance(current, dict) else [],
+        "new_slots": candidate.get("raw_songs", []),
+    })
+
+
+@app.post("/api/redetect/commit")
+def api_redetect_commit() -> Response:
+    candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
+    if not isinstance(candidate, dict):
+        return jsonify({"error": "No pending full-session detection is available."}), 409
+    count = len(candidate.get("raw_songs", []))
+    if count < 2:
+        return jsonify({"error": f"Refusing to replace the current session with only {count} detected slot(s)."}), 409
+    save_json_atomic(DETECTION_STATE_PATH, candidate)
+    try:
+        REDETECTION_CANDIDATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        REDETECTION_BACKUP_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    with state_lock:
+        global pipeline_state, pipeline_state_signature
+        pipeline_state = None
+        pipeline_state_signature = None
+    append_log("ui", f"Confirmed replacement with full-session detection: {count} slots.")
+    return jsonify({"ok": True, "count": count})
+
+
+@app.post("/api/redetect/discard")
+def api_redetect_discard() -> Response:
+    for path in (REDETECTION_CANDIDATE_PATH,):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        REDETECTION_BACKUP_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    append_log("ui", "Discarded pending full-session detection; current session preserved.")
+    return jsonify({"ok": True})
 
 
 
