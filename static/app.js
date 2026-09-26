@@ -48,6 +48,13 @@ function renderBuildInfo() {
   if (node) node.textContent = `${version} · ${revision} · ${timestamp}`;
 }
 
+function renderSlotAudit() {
+  const node = $("#slotAudit"); const audit = appState?.slot_audit;
+  if (!node || !audit) return;
+  node.hidden = !audit.integrity_warning;
+  node.textContent = audit.integrity_warning || `Session ${audit.session_id || "unknown"}: ${audit.visible_slot_count} slots visible`;
+}
+
 function refreshSlotSummary() {
   if (!appState) return;
   const calibration = appState.detection_calibration || {};
@@ -573,6 +580,7 @@ async function loadState() {
     showToast(`Error loading folder: ${appState.last_error}`);
   }
   renderBuildInfo();
+  renderSlotAudit();
   refreshSlotSummary();
   syncOverrideSequenceFromState();
   const detected = visibleSongs().length;
@@ -879,7 +887,7 @@ function ensureCutSelector() {
   dialog.id = "cutSelectorDialog";
   dialog.innerHTML = `
     <form method="dialog" class="cut-selector-shell">
-      <div class="cut-selector-header"><div><h2>Edit Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><button type="button" id="cutClose" class="ghost" aria-label="Close">×</button></div>
+      <div class="cut-selector-header"><div><h2>Edit Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><div class="cut-slot-nav"><button type="button" id="cutPrevious" class="ghost">Previous</button><span id="cutSlotPosition">Slot 1 of 1</span><select id="cutSlotList" aria-label="All slots"></select><button type="button" id="cutNext" class="ghost">Next</button><button type="button" id="cutClose" class="ghost" aria-label="Close">×</button></div></div>
       <div class="cut-wave-wrap"><canvas id="cutWaveform" aria-label="Selected slot waveform"></canvas><div id="cutMarkers" class="cut-markers"></div><div id="cutSelection" class="cut-selection"><button type="button" class="cut-handle left" aria-label="Move start"></button><button type="button" class="cut-center" aria-label="Move selection"></button><button type="button" class="cut-handle right" aria-label="Move end"></button></div></div>
       <div class="cut-zoom-controls"><label>Zoom <input id="cutZoom" type="range" min="1" max="20" step="0.1" value="1"></label><button type="button" id="cutFit" class="ghost">Fit selected slot</button><button type="button" id="cutZoomSelection" class="ghost">Zoom to selection</button><label>Scroll <input id="cutPan" type="range" min="0" max="1000" step="1" value="0"></label></div>
       <div class="cut-readout"><label>Start <input id="cutStart" type="number" step="0.1"></label><label>End <input id="cutEnd" type="number" step="0.1"></label><strong>Duration <span id="cutDuration">—</span></strong><span id="cutValidation" class="cut-validation"></span></div>
@@ -902,6 +910,7 @@ async function openCutSelector(songId) {
   setCutLoading("Loading selected waveform", `Preparing slot ${songId}`, 40);
   ui.songId = songId;
   ui.data = data;
+  ui.allSlots = (data.markers || []).map((marker) => Number(marker.song_id)).filter(Number.isFinite);
   ui.sourceStart = Number(data.waveform.window_start_sec || data.selection.start_sec || 0);
   ui.sourceEnd = Number(data.waveform.window_end_sec || data.selection.end_sec || 0);
   ui.duration = Math.max(0, ui.sourceEnd - ui.sourceStart);
@@ -909,6 +918,10 @@ async function openCutSelector(songId) {
   ui.endValue = Number(data.selection.end_sec);
   ui.viewStart = ui.sourceStart; ui.viewEnd = ui.sourceEnd; ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue;
   ui.dialog.querySelector("#cutSelectorTitle").textContent = `Slot ${String(songId).padStart(2, "0")} · ${data.waveform.cached ? "waveform cache hit" : "waveform prepared"}`;
+  const slotIndex = Math.max(0, ui.allSlots.indexOf(Number(songId)));
+  ui.dialog.querySelector("#cutSlotPosition").textContent = `Slot ${slotIndex + 1} of ${ui.allSlots.length}`;
+  const slotList = ui.dialog.querySelector("#cutSlotList"); slotList.innerHTML = ui.allSlots.map((id, index) => `<option value="${id}">Slot ${index + 1} of ${ui.allSlots.length}</option>`).join(""); slotList.value = String(songId);
+  ui.dialog.querySelector("#cutPrevious").disabled = slotIndex <= 0; ui.dialog.querySelector("#cutNext").disabled = slotIndex >= ui.allSlots.length - 1;
   ui.dialog.querySelector("#cutEvidence").innerHTML = data.markers.filter((marker) => marker.song_id === songId).map((marker) => `<span class="cut-evidence-item ${marker.status}">${cutTime(marker.start_sec)}–${cutTime(marker.end_sec)} · ${esc(marker.boundary_source || "automatic proposal")} · ${marker.confidence ? `${Math.round(marker.confidence * 100)}%` : "no confidence"}</span>`).join("");
   drawCutEditor();
   ui.dialog.showModal();
@@ -978,6 +991,10 @@ function wireCutSelector(ui) {
   ui.pan.addEventListener("input", () => { const span = ui.viewEnd - ui.viewStart; const max = Math.max(0, ui.duration - span); ui.viewStart = ui.sourceStart + max * Number(ui.pan.value) / 1000; ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
   ui.dialog.querySelector("#cutFit").addEventListener("click", () => { ui.viewStart = ui.sourceStart; ui.viewEnd = ui.sourceEnd; drawCutEditor(); });
   ui.dialog.querySelector("#cutZoomSelection").addEventListener("click", () => { const span = Math.min(ui.duration, Math.max(ui.endValue - ui.startValue, (ui.endValue - ui.startValue) * 1.2)); const center = (ui.startValue + ui.endValue) / 2; ui.viewStart = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, center - span / 2)); ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
+  const navigate = async (offset) => { if (cutIsDirty() && !window.confirm("Discard unsaved cut changes before changing slots?")) return; const index = ui.allSlots.indexOf(Number(ui.songId)); const next = ui.allSlots[index + offset]; if (next) await openCutSelector(next); };
+  ui.dialog.querySelector("#cutPrevious").addEventListener("click", () => navigate(-1));
+  ui.dialog.querySelector("#cutNext").addEventListener("click", () => navigate(1));
+  ui.dialog.querySelector("#cutSlotList").addEventListener("change", (event) => { if (cutIsDirty() && !window.confirm("Discard unsaved cut changes before changing slots?")) { event.target.value = String(ui.songId); return; } openCutSelector(Number(event.target.value)); });
   ui.dialog.querySelector("#cutApply").addEventListener("click", async () => { setCutLoading("Applying cut changes", `Validating slot ${ui.songId}`, 30); const response = await fetch(`/api/segment-selection/${ui.songId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_sec: ui.startValue, end_sec: ui.endValue }) }); const result = await response.json().catch(() => ({})); if (!response.ok) { setCutLoading("Error", result.error || "Could not save selection."); return showToast(result.error || "Could not save selection."); } setCutLoading("Saving changes", `Saved slot ${ui.songId}; preserving all other slots`, 80); ui.dialog.close("saved"); ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue; await refreshState({ renderLarge: true }); if (ui.editAllQueue?.length) { const next = ui.editAllQueue.shift(); await openCutSelector(next); } else { setCutLoading("Finished", `Slot ${ui.songId} saved`, 100); setTimeout(clearCutLoading, 700); } showToast(`Saved cut ${cutTime(result.start_sec)}–${cutTime(result.end_sec)}.`); });
 }
 
@@ -2566,7 +2583,8 @@ async function refreshState(options = {}) {
   }
   appState = next;
   refreshSlotSummary();
-  renderBuildInfo();
+    renderBuildInfo();
+    renderSlotAudit();
   syncOverrideSequenceFromState();
   checkedSongs = new Set([...checkedSongs].filter((id) => appState.songs.some((song) => song.id === id && !song.skipped)));
   const detected = visibleSongs().length;

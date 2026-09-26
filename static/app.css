@@ -72,6 +72,8 @@ button:disabled {
 .cut-selector-shell { padding: 22px; }
 .cut-selector-header, .cut-selector-actions, .cut-readout { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .cut-selector-header { margin-bottom: 16px; }
+.cut-slot-nav { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.cut-slot-nav select { min-height: 34px; border: 1px solid var(--line); border-radius: 6px; background: #120f0d; color: var(--cream); padding: 5px 8px; }
 .cut-zoom-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 10px 0; color: var(--muted); }
 .cut-zoom-controls label { display: inline-flex; align-items: center; gap: 7px; }
 .cut-zoom-controls input { accent-color: var(--orange2); min-width: 150px; }

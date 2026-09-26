@@ -1683,6 +1683,17 @@ def public_state() -> dict[str, Any]:
             if entry.get("elapsed_seconds"):
                 render_seconds.append(float(entry["elapsed_seconds"]))
     songs = visible_songs(state, settings, history, disk, names)
+    raw_slots = state.get("raw_songs", [])
+    session_ids = sorted({str(item.get("session_id")) for item in raw_slots if item.get("session_id")})
+    slot_audit = {
+        "session_id": session_ids[0] if len(session_ids) == 1 else None,
+        "session_ids": session_ids,
+        "state_slot_count": len(raw_slots),
+        "backend_slot_count": len(songs),
+        "slot_ids": [item.get("slot_id") for item in raw_slots],
+        "visible_slot_count": len(songs),
+        "integrity_warning": "Persisted state contains only one slot; full-session re-detection is required before replacement." if len(raw_slots) == 1 else "",
+    }
     transitions = [
         {
             "id": int(song["id"]),
@@ -1729,6 +1740,7 @@ def public_state() -> dict[str, Any]:
         "last_error": last_load_error,
         "whisper": whisper_status,
         "detection_calibration": state.get("detection_calibration", {}),
+        "slot_audit": slot_audit,
         "matchering": {
             "available": pipeline.matchering_api is not None,
             "import_error": pipeline.MATCHERING_IMPORT_ERROR,

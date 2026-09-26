@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 APP_NAME="ZuckerMixer"
-APP_VERSION="2.1.7"
+APP_VERSION="2.1.8"
 APP_BUNDLE="$ROOT/dist/${APP_NAME}.app"
 DMG_ROOT="$ROOT/dist/dmg_root"
 DMG_PATH="$ROOT/dist/${APP_NAME}.dmg"
