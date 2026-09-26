@@ -1380,8 +1380,32 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     with contextlib.redirect_stdout(capture):
         stems = pipeline.inspect_stems(pipeline.SOURCE_DIR)
         segments, _ = pipeline.detect_segments(stems)
-        segments = apply_manual_splits(segments, load_manual_splits())
-        segments = apply_saved_segment_selections(segments)
+        source_duration = max((stem.offset_seconds + stem.timeline_duration for stem in stems), default=0.0)
+        if len(segments) == 1 and len(stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS:
+            # A one-window fallback after Whisper failure is not a complete
+            # session. Keep it diagnostic/review-only; never present it as a
+            # valid source segmentation or use it as a redetect input.
+            segments = [replace(
+                segments[0],
+                boundary_source="incomplete-source-segmentation",
+                boundary_validation="needs_review",
+                boundary_validation_reason=(
+                    f"Incomplete source segmentation: {len(stems)} original stems span "
+                    f"{source_duration:.1f}s but detection returned one slot"
+                ),
+            )]
+            pipeline.DETECTION_STRATEGY = {
+                **(pipeline.DETECTION_STRATEGY if isinstance(pipeline.DETECTION_STRATEGY, dict) else {}),
+                "id": "incomplete_source_segmentation",
+                "needs_review": True,
+                "reason": segments[0].boundary_validation_reason,
+            }
+        # A redetect candidate is an automatic view of the original session.
+        # Manual cuts remain a separate override layer and are reapplied only
+        # after the user confirms the candidate replacement.
+        if not pipeline.DETECTION_RESCAN_MODE:
+            segments = apply_manual_splits(segments, load_manual_splits())
+            segments = apply_saved_segment_selections(segments)
         # Public numbering is the stable session order. When the detector has
         # identified leading recorded material as SONG 0, expose that number
         # and continue 1, 2, 3... through the app and exported filenames.
@@ -1694,6 +1718,16 @@ def public_state() -> dict[str, Any]:
         "visible_slot_count": len(songs),
         "integrity_warning": "Persisted state contains only one slot; full-session re-detection is required before replacement." if len(raw_slots) == 1 else "",
     }
+    source_stems = state.get("stems", [])
+    source_duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in source_stems), default=0.0)
+    source_integrity = {
+        "status": "Incomplete source segmentation" if len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS else "ok",
+        "original_wav_required": True,
+        "stem_count": len(source_stems),
+        "duration_sec": source_duration,
+        "saved_slot_count": len(raw_slots),
+        "warning": "Source state incomplete; Original WAVs required; no destructive changes made." if len(raw_slots) == 1 else "",
+    }
     transitions = [
         {
             "id": int(song["id"]),
@@ -1741,6 +1775,7 @@ def public_state() -> dict[str, Any]:
         "whisper": whisper_status,
         "detection_calibration": state.get("detection_calibration", {}),
         "slot_audit": slot_audit,
+        "source_integrity": source_integrity,
         "matchering": {
             "available": pipeline.matchering_api is not None,
             "import_error": pipeline.MATCHERING_IMPORT_ERROR,
@@ -3493,6 +3528,9 @@ def api_redetect_candidate() -> Response:
         "new_count": new_count,
         "old_slots": current.get("raw_songs", []) if isinstance(current, dict) else [],
         "new_slots": candidate.get("raw_songs", []),
+        "source_stem_count": len(candidate.get("stems", [])),
+        "source_duration_sec": max((float(item.get("frames", 0)) / float(item.get("samplerate", 1)) + float(item.get("offset_seconds", 0.0)) for item in candidate.get("stems", []) if isinstance(item, dict)), default=0.0),
+        "warning": "Candidate slot count differs from the configured session target; review required before replacement." if new_count != int(load_settings().get("known_song_count") or pipeline.EXPECTED_SLOT_COUNT) else "",
     })
 
 

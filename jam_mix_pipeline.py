@@ -1176,6 +1176,31 @@ def transcribe_speech_candidates(
     ).hexdigest()[:16]
     transcript_cache_path = transcript_cache_root / f"jam_whisper_transcripts_{transcript_digest}.json"
     results: list[dict[str, object]] | None = None
+
+    def compatible_legacy_transcript() -> list[dict[str, object]] | None:
+        """Reuse a same-source transcript when a long Whisper pass times out.
+
+        The current source signature may differ only by the cache algorithm
+        prefix. The stem/file/frame/offset suffix and exact candidate windows
+        must still match, so this cannot mix sessions or selected-slot audio.
+        """
+        current_tail = cache_signature(stems).split("|", 1)[-1]
+        for legacy_path in sorted(transcript_cache_root.glob("jam_whisper_transcripts_*.json")):
+            if legacy_path == transcript_cache_path:
+                continue
+            try:
+                legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+                legacy_tail = str(legacy.get("signature") or "").split("|", 1)[-1]
+                if (
+                    legacy_tail == current_tail
+                    and legacy.get("windows") == [[float(start), float(end)] for start, end in windows]
+                    and isinstance(legacy.get("results"), list)
+                ):
+                    print(f"Reusing compatible same-source Whisper transcript after timeout: {legacy_path}", flush=True)
+                    return list(legacy["results"])
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+        return None
     try:
         # Re-detect is an explicit user command to redo the detection work.
         # The per-stem envelope cache remains reusable, but Whisper must see a
@@ -1232,14 +1257,24 @@ def transcribe_speech_candidates(
                     timeout=WHISPER_TIMEOUT_SECONDS,
                 )
             except subprocess.TimeoutExpired as exc:
-                LAST_WHISPER_STATUS = {
-                    "status": "timed_out",
-                    "timeout_seconds": WHISPER_TIMEOUT_SECONDS,
-                    "candidate_windows": len(requests),
-                    "stdout": str(exc.stdout or "")[-2000:],
-                    "stderr": str(exc.stderr or "")[-2000:],
-                }
-                raise RuntimeError(f"Whisper timed out after {WHISPER_TIMEOUT_SECONDS:.0f}s") from exc
+                legacy_results = compatible_legacy_transcript()
+                if legacy_results is not None:
+                    results = legacy_results
+                    LAST_WHISPER_STATUS = {
+                        "status": "available_cached",
+                        "candidate_windows": len(requests),
+                        "reason": "current Whisper pass timed out; reused compatible same-source transcript",
+                        "timeout_seconds": WHISPER_TIMEOUT_SECONDS,
+                    }
+                else:
+                    LAST_WHISPER_STATUS = {
+                        "status": "timed_out",
+                        "timeout_seconds": WHISPER_TIMEOUT_SECONDS,
+                        "candidate_windows": len(requests),
+                        "stdout": str(exc.stdout or "")[-2000:],
+                        "stderr": str(exc.stderr or "")[-2000:],
+                    }
+                    raise RuntimeError(f"Whisper timed out after {WHISPER_TIMEOUT_SECONDS:.0f}s") from exc
             except subprocess.CalledProcessError as exc:
                 LAST_WHISPER_STATUS = {
                     "status": "error",
@@ -1248,13 +1283,14 @@ def transcribe_speech_candidates(
                     "stderr": str(exc.stderr or "")[-2000:],
                 }
                 raise RuntimeError(f"Whisper exited with code {exc.returncode}") from exc
-            results = json.loads(output_json.read_text(encoding="utf-8"))
-            LAST_WHISPER_STATUS = {
-                "status": "available",
-                "candidate_windows": len(requests),
-                "stdout": str(completed.stdout or "")[-2000:],
-                "stderr": str(completed.stderr or "")[-2000:],
-            }
+            if results is None:
+                results = json.loads(output_json.read_text(encoding="utf-8"))
+                LAST_WHISPER_STATUS = {
+                    "status": "available",
+                    "candidate_windows": len(requests),
+                    "stdout": str(completed.stdout or "")[-2000:],
+                    "stderr": str(completed.stderr or "")[-2000:],
+                }
         try:
             transcript_cache_path.parent.mkdir(parents=True, exist_ok=True)
             transcript_cache_path.write_text(json.dumps({

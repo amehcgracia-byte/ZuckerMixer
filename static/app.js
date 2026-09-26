@@ -51,8 +51,9 @@ function renderBuildInfo() {
 function renderSlotAudit() {
   const node = $("#slotAudit"); const audit = appState?.slot_audit;
   if (!node || !audit) return;
-  node.hidden = !audit.integrity_warning;
-  node.textContent = audit.integrity_warning || `Session ${audit.session_id || "unknown"}: ${audit.visible_slot_count} slots visible`;
+  const integrity = appState?.source_integrity || {};
+  node.hidden = !(audit.integrity_warning || integrity.warning);
+  node.textContent = integrity.warning || audit.integrity_warning || `Session ${audit.session_id || "unknown"}: ${audit.visible_slot_count} slots visible`;
 }
 
 function refreshSlotSummary() {
@@ -3069,7 +3070,8 @@ async function reviewRedetectCandidate(job) {
   const response = await fetch("/api/redetect/candidate");
   const candidate = await response.json().catch(() => ({}));
   if (!candidate.available) return;
-  const approve = window.confirm(`Re-detect finished on the complete original session.\n\nCurrent slots: ${candidate.old_count}\nNew slots: ${candidate.new_count}\n\nReplace the current list only if this comparison is correct?\nCancel keeps all current and manual cuts.`);
+  const warning = candidate.warning ? `\nWARNING: ${candidate.warning}` : "";
+  const approve = window.confirm(`Re-detect finished on the complete original session.\n\nCurrent slots: ${candidate.old_count}\nCandidate slots: ${candidate.new_count}\nOriginal stems: ${candidate.source_stem_count || "?"}\nSource duration: ${cutTime(candidate.source_duration_sec || 0)}${warning}\n\nReplace the current list only if this comparison is correct?\nCancel keeps all current and manual cuts.`);
   const endpoint = approve ? "/api/redetect/commit" : "/api/redetect/discard";
   const result = await fetch(endpoint, { method: "POST" }).then((r) => r.json().catch(() => ({})));
   if (!approve) { showToast("Re-detect cancelled; current slots and manual cuts preserved."); return; }
