@@ -1101,7 +1101,19 @@ def speech_candidate_windows(
     timelines: dict[str, np.ndarray],
     session_end: float,
     boundary_probes: list[float] | None = None,
+    focus_regions: list[tuple[float, float]] | None = None,
 ) -> list[tuple[float, float]]:
+    if focus_regions:
+        windows: list[tuple[float, float]] = []
+        for region_start, region_end in focus_regions:
+            cursor = max(0.0, float(region_start))
+            end = min(float(session_end), float(region_end))
+            while cursor < end:
+                piece_end = min(end, cursor + 90.0)
+                if piece_end - cursor >= 2.0:
+                    windows.append((cursor, piece_end))
+                cursor = piece_end
+        return sorted(set(windows))
     voices = [stem for stem in stems if stem.role in {"vocal", "room"}]
     instruments = [stem for stem in stems if stem not in voices]
     if not voices or not instruments:
@@ -1147,11 +1159,14 @@ def transcribe_speech_candidates(
     timelines: dict[str, np.ndarray],
     session_end: float,
     boundary_probes: list[float] | None = None,
+    focus_regions: list[tuple[float, float]] | None = None,
+    timeout_seconds: float | None = None,
 ) -> tuple[list[dict[str, object]], list[Segment]]:
     global LAST_SPEECH_TRANSCRIPTIONS, LAST_WHISPER_STATUS
-    windows = speech_candidate_windows(stems, timelines, session_end, boundary_probes)
+    windows = speech_candidate_windows(stems, timelines, session_end, boundary_probes, focus_regions)
     LAST_SPEECH_TRANSCRIPTIONS = []
-    LAST_WHISPER_STATUS = {"status": "starting", "candidate_windows": len(windows)}
+    effective_timeout = float(timeout_seconds if timeout_seconds is not None else WHISPER_TIMEOUT_SECONDS)
+    LAST_WHISPER_STATUS = {"status": "starting", "candidate_windows": len(windows), "timeout_seconds": effective_timeout}
     whisper_python, worker = whisper_runtime_paths()
     if not whisper_python.exists() or not worker.exists():
         LAST_WHISPER_STATUS = {
@@ -1254,7 +1269,7 @@ def transcribe_speech_candidates(
                     check=True,
                     capture_output=True,
                     text=True,
-                    timeout=WHISPER_TIMEOUT_SECONDS,
+                    timeout=effective_timeout,
                 )
             except subprocess.TimeoutExpired as exc:
                 legacy_results = compatible_legacy_transcript()
@@ -1264,17 +1279,17 @@ def transcribe_speech_candidates(
                         "status": "available_cached",
                         "candidate_windows": len(requests),
                         "reason": "current Whisper pass timed out; reused compatible same-source transcript",
-                        "timeout_seconds": WHISPER_TIMEOUT_SECONDS,
+                        "timeout_seconds": effective_timeout,
                     }
                 else:
                     LAST_WHISPER_STATUS = {
                         "status": "timed_out",
-                        "timeout_seconds": WHISPER_TIMEOUT_SECONDS,
+                        "timeout_seconds": effective_timeout,
                         "candidate_windows": len(requests),
                         "stdout": str(exc.stdout or "")[-2000:],
                         "stderr": str(exc.stderr or "")[-2000:],
                     }
-                    raise RuntimeError(f"Whisper timed out after {WHISPER_TIMEOUT_SECONDS:.0f}s") from exc
+                    raise RuntimeError(f"Whisper timed out after {effective_timeout:.0f}s") from exc
             except subprocess.CalledProcessError as exc:
                 LAST_WHISPER_STATUS = {
                     "status": "error",

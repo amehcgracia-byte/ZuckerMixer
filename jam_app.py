@@ -51,6 +51,7 @@ DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
 EDITOR_HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "editor_history.json"
 REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
 REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
+SECOND_PASS_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "whisper_second_pass_candidate.json"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerPreviewCache"
 PREVIEW_DIR = PREVIEW_CACHE_ROOT / "default"
 CUT_AUDIO_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerCutAudioCache"
@@ -847,7 +848,7 @@ def save_manual_splits(values: list[float]) -> None:
 
 
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, EDITOR_HISTORY_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, PREVIEW_DIR
+    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, EDITOR_HISTORY_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, SECOND_PASS_CANDIDATE_PATH, PREVIEW_DIR
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.AUDIO_SCAN_REPORT = {
@@ -873,6 +874,7 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     EDITOR_HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "editor_history.json"
     REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
     REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
+    SECOND_PASS_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "whisper_second_pass_candidate.json"
     PREVIEW_DIR = PREVIEW_CACHE_ROOT / source_key
     return source
 
@@ -3283,7 +3285,7 @@ def api_cut_audio(song_id: int) -> Response:
         stems = state.get("stems", [])
         if not stems:
             return jsonify({"error": "No source stems available for playback."}), 404
-        sample_rate = int(round(float(stems[0].sample_rate)))
+        sample_rate = int(round(float(stems[0].samplerate)))
         frame_count = max(1, int(round((end - start) * sample_rate)))
         mix = np.zeros(frame_count, dtype=np.float32)
         used = 0
@@ -3403,6 +3405,7 @@ def api_editor_cut_operation() -> Response:
         history = {"undo": [], "redo": []}
     history.setdefault("undo", []); history.setdefault("redo", [])
     current = _editor_snapshot(state)
+    row_hints: list[dict[str, Any] | None] | None = None
     if operation in {"undo", "redo"}:
         source = history["undo"] if operation == "undo" else history["redo"]
         target = history["redo"] if operation == "undo" else history["undo"]
@@ -3412,7 +3415,7 @@ def api_editor_cut_operation() -> Response:
         _restore_editor_snapshot(state, source.pop())
     else:
         try:
-            at = float(payload.get("at_sec"))
+            at = float(payload.get("at_sec", payload.get("old_sec")))
         except (TypeError, ValueError):
             return jsonify({"error": "at_sec is required for this editor operation."}), 400
         index = next((i for i, segment in enumerate(state["segments"]) if segment.start < at < segment.end), None)
@@ -3423,6 +3426,25 @@ def api_editor_cut_operation() -> Response:
             left = replace(segment, end=at, core_end=at, nominal_end=at, boundary_source="manual-add-cut", boundary_validation="manual-selection", boundary_validation_reason="user added cut")
             right = replace(segment, start=at, core_start=at, boundary_source="manual-add-cut", boundary_validation="manual-selection", boundary_validation_reason="user added cut")
             state["segments"][index:index + 1] = [left, right]
+            row_hints = list(state.get("raw_songs", []))
+            row_hints[index:index + 1] = [state.get("raw_songs", [])[index] if index < len(state.get("raw_songs", [])) else None, None]
+        elif operation == "move":
+            try:
+                old_boundary = float(payload.get("old_sec"))
+                new_boundary = float(payload.get("new_sec"))
+            except (TypeError, ValueError):
+                return jsonify({"error": "old_sec and new_sec are required to move a cut."}), 400
+            pair = next((i for i in range(len(state["segments"]) - 1) if abs(state["segments"][i].end - old_boundary) <= 1.0), None)
+            if pair is None:
+                return jsonify({"error": "No slot boundary near the selected marker."}), 400
+            left, right = state["segments"][pair], state["segments"][pair + 1]
+            if not left.start + pipeline.HARD_MIN_SONG_SECONDS <= new_boundary <= right.end - pipeline.HARD_MIN_SONG_SECONDS:
+                return jsonify({"error": "The moved cut would create a slot outside the 8–13 minute safety range."}), 400
+            state["segments"][pair:pair + 2] = [
+                replace(left, end=new_boundary, core_end=new_boundary, nominal_end=new_boundary, boundary_source="manual-move-cut", boundary_validation="manual-selection", boundary_validation_reason="user moved shared cut"),
+                replace(right, start=new_boundary, core_start=new_boundary, boundary_source="manual-move-cut", boundary_validation="manual-selection", boundary_validation_reason="user moved shared cut"),
+            ]
+            row_hints = list(state.get("raw_songs", []))
         elif operation in {"delete", "merge"}:
             boundary = at
             pair = next((i for i in range(len(state["segments"]) - 1) if abs(state["segments"][i].end - boundary) <= 1.0), None)
@@ -3443,7 +3465,7 @@ def api_editor_cut_operation() -> Response:
     session_id = next((row.get("session_id") for row in old_rows if row.get("session_id")), session_id_for_signature(detection_state_signature()))
     rows = []
     for ordinal, segment in enumerate(state["segments"], 1):
-        old = next((candidate for candidate in old_rows if abs(float(candidate.get("source_start", candidate.get("start", -999999))) - segment.start) <= 0.01 and abs(float(candidate.get("source_end", candidate.get("end", -999999))) - segment.end) <= 0.01), None)
+        old = row_hints[ordinal - 1] if row_hints is not None and ordinal - 1 < len(row_hints) else next((candidate for candidate in old_rows if abs(float(candidate.get("source_start", candidate.get("start", -999999))) - segment.start) <= 0.01 and abs(float(candidate.get("source_end", candidate.get("end", -999999))) - segment.end) <= 0.01), None)
         row = dict(old or {})
         row.update({"id": ordinal, "session_id": row.get("session_id") or session_id, "slot_id": row.get("slot_id") or f"{session_id}:manual-slot-{ordinal:03d}", "start": segment.start, "end": segment.end, "source_start": row.get("source_start", segment.start), "source_end": row.get("source_end", segment.end), "duration": segment.duration, "duration_text": fmt_time(segment.duration), "render_end": segment.end, "segment": asdict(segment), "proposal_status": "manual", "revision": int(row.get("revision", 0) or 0) + 1})
         rows.append(row)
@@ -3750,6 +3772,63 @@ def api_redetect_discard() -> Response:
         pass
     append_log("ui", "Discarded pending full-session detection; current session preserved.")
     return jsonify({"ok": True})
+
+
+@app.post("/api/redetect/second-pass")
+def api_redetect_second_pass() -> Response:
+    """Run Whisper only in long uncovered source intervals and save proposals."""
+    state = ensure_pipeline_state()
+    stems = state.get("stems", [])
+    if not stems:
+        return jsonify({"error": "Original WAV stems are not loaded."}), 409
+    existing = sorted((float(segment.start), float(segment.end)) for segment in state.get("segments", []))
+    source_end = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in stems), default=0.0)
+    regions: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in existing:
+        if start - cursor >= 180.0:
+            regions.append((max(0.0, cursor - 30.0), min(source_end, start + 30.0)))
+        cursor = max(cursor, end)
+    if source_end - cursor >= 180.0:
+        regions.append((max(0.0, cursor - 30.0), source_end))
+    if not regions:
+        return jsonify({"ok": True, "status": "no_suspicious_intervals", "new_proposals": [], "missing_count": max(0, int(load_settings().get("known_song_count") or pipeline.EXPECTED_SLOT_COUNT) - len(existing))})
+    try:
+        app_progress({"current_stage": "second Whisper pass", "stage_detail": f"Scanning {len(regions)} uncovered interval(s)", "progress": 10, "song_progress": 10, "heartbeat": time.time()})
+        timelines = pipeline.load_cached_timelines_or_die(stems, "Whisper second pass")
+        _transcripts, focused_segments = pipeline.transcribe_speech_candidates(
+            stems, timelines, source_end, focus_regions=regions, timeout_seconds=240.0,
+        )
+    except Exception as exc:
+        candidate = {"status": "incomplete", "reason": f"{type(exc).__name__}: {exc}", "regions": regions, "new_proposals": []}
+        save_json_atomic(SECOND_PASS_CANDIDATE_PATH, candidate)
+        app_progress({"status": "error", "current_stage": "second Whisper pass", "stage_detail": candidate["reason"], "progress": 100, "song_progress": 100, "heartbeat": time.time()})
+        return jsonify({"ok": False, **candidate}), 200
+    new_proposals = []
+    proposal_session_id = next((str(row.get("session_id")) for row in state.get("raw_songs", []) if row.get("session_id")), session_id_for_signature(detection_state_signature()))
+    for segment in focused_segments:
+        if any(abs(float(segment.start) - start) < 25.0 for start, _end in existing):
+            continue
+        new_proposals.append({
+            "slot_id": f"{proposal_session_id}:whisper-second-pass-{len(new_proposals) + 1:03d}",
+            "start": float(segment.start),
+            "end": float(segment.end),
+            "duration": float(segment.duration),
+            "text": segment.speech_text,
+            "confidence": float(segment.speech_confidence or 0.0),
+            "reason": segment.speech_reason or "additional commentator presentation in uncovered interval",
+            "status": "needs_review",
+        })
+    candidate = {"status": "pending_confirmation", "regions": regions, "new_proposals": new_proposals, "missing_count": max(0, int(load_settings().get("known_song_count") or pipeline.EXPECTED_SLOT_COUNT) - len(existing) - len(new_proposals))}
+    save_json_atomic(SECOND_PASS_CANDIDATE_PATH, candidate)
+    app_progress({"status": "pending_confirmation", "current_stage": "second Whisper pass", "stage_detail": f"Found {len(new_proposals)} new proposal(s); manual review required", "progress": 100, "song_progress": 100, "heartbeat": time.time()})
+    return jsonify({"ok": True, **candidate})
+
+
+@app.get("/api/redetect/second-pass")
+def api_redetect_second_pass_status() -> Response:
+    candidate = load_json(SECOND_PASS_CANDIDATE_PATH, None)
+    return jsonify(candidate if isinstance(candidate, dict) else {"available": False})
 
 
 
