@@ -726,7 +726,13 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "target_lufs": target_lufs,
         "preview_master_gain_db": target_lufs - (-14.0),
         "mastering_intensity": str(song_overrides.get("mastering_intensity", "natural") if isinstance(song_overrides, dict) else "natural"),
-        "auto_mix_balance": mix_controls.get("balance", {}),
+        "auto_mix_balance": {
+            **(mix_controls.get("balance", {}) if isinstance(mix_controls.get("balance", {}), dict) else {}),
+            "role_balance": role_balance,
+            "guitar_original_level_db": role_balance.get("guitar_original_level_db"),
+            "guitar_reduction_db": role_balance.get("guitar_reduction_db", 0.0),
+            "guitar_reduction_reason": role_balance.get("guitar_reduction_reason", "no reliable vocal overlap evidence"),
+        },
         "auto_mix_method": "per-song active-envelope RMS power groups with vocal/harmonic overlap",
         "stems": stem_params,
     }
@@ -1394,8 +1400,8 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
                     "introduction_text": segment.speech_intro_text,
                     "boundary_source": segment.boundary_source,
                     "duration_rule": (
-                        "hard violation: >13 min / split required" if duration > pipeline.HARD_MAX_SONG_SECONDS
-                        else "hard violation: <8 min / merge required" if duration < pipeline.HARD_MIN_SONG_SECONDS
+                        "needs_review: >13 min / presented slot preserved; no automatic split" if duration > pipeline.HARD_MAX_SONG_SECONDS
+                        else "needs_review: <8 min / presented slot preserved; Select Cuts required" if duration < pipeline.HARD_MIN_SONG_SECONDS
                         else "normal duration"
                     ),
                     "acoustic_gap": next((item for item in boundary_audit if item.get("actual_used") in {segment.start, segment.end}), None),
@@ -1407,16 +1413,24 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     long_count = sum(duration > 15 * 60 for duration in durations)
     detected_count = len(raw_songs)
     session_end = max((stem.offset_seconds + stem.timeline_duration for stem in stems), default=0.0)
-    expected_count = pipeline.EXPECTED_SONG_COUNT
+    expected_count = pipeline.EXPECTED_SLOT_COUNT
     invalid_duration_count = sum(not pipeline.HARD_MIN_SONG_SECONDS <= duration <= pipeline.HARD_MAX_SONG_SECONDS for duration in durations)
+    needs_review_count = sum(
+        isinstance(song.get("segment"), dict)
+        and (
+            song["segment"].get("boundary_validation") == "needs_review"
+            or not pipeline.HARD_MIN_SONG_SECONDS <= float(song["duration"]) <= pipeline.HARD_MAX_SONG_SECONDS
+        )
+        for song in raw_songs
+    )
     if detected_count != expected_count:
-        calibration_warning = f"Found {detected_count} songs — required set is {expected_count}; detection repair is incomplete."
+        calibration_warning = f"Found {detected_count} commentator-led slots — target is approximately {expected_count}; review the slot list before export."
         calibration_level = "warning"
     elif invalid_duration_count:
-        calibration_warning = f"Found {detected_count} songs, but {invalid_duration_count} violate the hard 8–16 minute duration bounds."
+        calibration_warning = f"Found {detected_count} commentator-led slots, but {invalid_duration_count} violate the hard 8–13 minute duration bounds."
         calibration_level = "warning"
     else:
-        calibration_warning = f"Found {detected_count} songs — hard contract satisfied: {pipeline.HARD_MIN_SONG_SECONDS/60:.0f}–{pipeline.HARD_MAX_SONG_SECONDS/60:.0f} minutes each."
+        calibration_warning = f"Found {detected_count} commentator-led slots — duration contract satisfied: {pipeline.HARD_MIN_SONG_SECONDS/60:.0f}–{pipeline.HARD_MAX_SONG_SECONDS/60:.0f} minutes each."
         calibration_level = "ok"
     stems_payload = [
         {
@@ -1441,8 +1455,13 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
             "audio_scan": pipeline.audio_scan_report(),
             "detection_calibration": {
                 "count": detected_count,
-            "expected_minimum": pipeline.EXPECTED_SONG_COUNT,
-            "expected_target": expected_count,
+                "expected_minimum": pipeline.EXPECTED_SLOT_COUNT,
+                "expected_target": expected_count,
+                "unit": "commentator-led slot",
+                "ready_count": detected_count - needs_review_count,
+                "needs_review_count": needs_review_count,
+                "exported_count": 0,
+                "pending_count": needs_review_count,
                 "invalid_duration_count": invalid_duration_count,
                 "longer_than_15_minutes": long_count,
                 "level": calibration_level,
@@ -1475,7 +1494,7 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
     finally:
         pipeline.DETECTION_RESCAN_MODE = False
     app_progress({"current_stage": "detecting songs", "stage_detail": "detection state ready", "heartbeat": time.time(), "progress": 90})
-    append_log(job_id, f"Found {len(state['raw_songs'])} song sections.")
+    append_log(job_id, f"Found {len(state['raw_songs'])} commentator-led slots.")
     return state
 
 
@@ -1498,7 +1517,7 @@ def visible_songs(
         item["custom_name"] = custom_name
         display_number = item.get("assigned_song_number") if item.get("assigned_song_number") is not None else item.get("spoken_song_number") or segment_id
         item["display_number"] = display_number
-        item["display_title"] = custom_name or f"Song {int(display_number):02d}"
+        item["display_title"] = custom_name or f"Slot {int(display_number):02d}"
         if item.get("number_mismatch"):
             item["number_warning"] = f"Absolute song number {int(display_number)} overrides detected position {segment_id}; inferred positions fill the gaps."
         user_skipped = segment_id in skipped

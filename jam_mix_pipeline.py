@@ -111,7 +111,10 @@ SUSPICIOUS_SHORT_SONG_SECONDS = 5 * 60.0
 SUSPICIOUS_LONG_SONG_SECONDS = 20 * 60.0
 HARD_MIN_SONG_SECONDS = 8 * 60.0
 HARD_MAX_SONG_SECONDS = 13 * 60.0
-EXPECTED_SONG_COUNT = 27
+# This recording is presented in roughly 26 commentator-led slots.  The
+# count is a calibration target, never a reason to invent acoustic cuts.
+EXPECTED_SONG_COUNT = 26
+EXPECTED_SLOT_COUNT = 26
 RHYTHM_ANALYSIS_MAX_SECONDS = 300.0
 RHYTHM_ANALYSIS_SR = 11025
 RHYTHM_ONSET_TOLERANCE_BEATS = 0.16
@@ -207,7 +210,7 @@ DETECTION_CACHE_ROOT: Path | None = None
 LEGACY_DETECTION_CACHE: Path | None = None
 DETECTION_CACHE_ALGORITHM_VERSION = "20260926-global-boundary-timeline-v5"
 SPEECH_DETECTION_ALGORITHM_VERSION = "20260827-whisper-v1"
-SPEECH_TRANSCRIPTION_CACHE_VERSION = "20260902-full-session-segmentation-v2"
+SPEECH_TRANSCRIPTION_CACHE_VERSION = "20260926-commentator-slots-v3"
 WHISPER_MODEL_SIZE = os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")
 WHISPER_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "90"))
 WHISPER_ENV = Path(__file__).resolve().parent / ".whisperenv"
@@ -1013,6 +1016,63 @@ def announcement_start(item: dict[str, object]) -> float:
     return base
 
 
+def select_commentator_announcements(results: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Keep one real presenter intro per slot, not every Whisper continuation.
+
+    Whisper candidate windows overlap deliberately so a quiet announcement is
+    not missed.  Their results therefore contain duplicates and conversational
+    fragments.  A boundary is eligible only when the transcript has an
+    introduction trigger, a spoken slot number, or an instrument assignment.
+    Nearby eligible results are one presentation and are collapsed without
+    moving its first-word timestamp later.
+    """
+    eligible: list[dict[str, object]] = []
+    for item in results:
+        if not item.get("announcement") or not item.get("text"):
+            continue
+        text = str(item.get("text") or "")
+        if not (
+            item.get("spoken_song_number") is not None
+            or _introduction_trigger(text)
+            or item.get("musician_labels")
+        ):
+            continue
+        candidate = dict(item)
+        candidate["announcement_start"] = float(item.get("announcement_start", item.get("start", 0.0)))
+        eligible.append(candidate)
+    eligible.sort(key=lambda item: float(item["announcement_start"]))
+
+    clusters: list[list[dict[str, object]]] = []
+    for item in eligible:
+        # A long presenter introduction is commonly split into several
+        # Whisper windows with pauses and side comments. A new slot cannot be
+        # validly less than eight minutes after the previous one, so collapse
+        # nearby eligible fragments within this conservative 150 s envelope.
+        if not clusters or float(item["announcement_start"]) - float(clusters[-1][-1]["announcement_start"]) > 150.0:
+            clusters.append([item])
+        else:
+            clusters[-1].append(item)
+
+    selected: list[dict[str, object]] = []
+    for cluster in clusters:
+        representative = max(
+            cluster,
+            key=lambda item: (
+                1 if item.get("spoken_song_number") is not None else 0,
+                1 if item.get("musician_labels") else 0,
+                float(item.get("speech_confidence", 0.0)),
+                len(str(item.get("text") or "")),
+            ),
+        )
+        first_word = min(float(item["announcement_start"]) for item in cluster)
+        representative = dict(representative)
+        representative["announcement_start"] = first_word
+        representative["intro_first_word_timestamp"] = first_word
+        representative["deduplicated_transcript_count"] = len(cluster)
+        selected.append(representative)
+    return selected
+
+
 def _introduction_trigger(text: str) -> bool:
     low = text.lower()
     return bool(
@@ -1232,7 +1292,8 @@ def transcribe_speech_candidates(
         LAST_WHISPER_STATUS = {"status": "unavailable", "reason": "no transcriptions returned"}
         raise RuntimeError("Whisper is mandatory for detection but produced no transcriptions.")
     print(f"WHISPER STORE CONFIRMED: LAST_SPEECH_TRANSCRIPTIONS={len(LAST_SPEECH_TRANSCRIPTIONS)}", flush=True)
-    announcement_windows = [item for item in results if item.get("announcement") and item.get("text")]
+    announcement_windows = select_commentator_announcements(results)
+    LAST_WHISPER_STATUS["eligible_introductions"] = len(announcement_windows)
     if len(announcement_windows) < 2:
         LAST_WHISPER_STATUS = {
             "status": "unavailable",
@@ -1256,6 +1317,68 @@ def transcribe_speech_candidates(
     for item in results:
         print(f"WHISPER {fmt_time(float(item['start']))}-{fmt_time(float(item['end']))}: {item.get('text','')}", flush=True)
     return results, segments
+
+
+def finalize_presented_slot_segments(
+    announcements: list[dict[str, object]],
+    session_end: float,
+    lead_in_seconds: float = 0.5,
+) -> list[Segment]:
+    """Build one export window per commentator presentation.
+
+    A slot is a social/editorial unit, not a detected song.  The next
+    presentation closes the current slot even when the slot contains two
+    musical pieces or isolated instrument entrances.  Duration violations
+    remain visible for Select Cuts; they are never repaired by an acoustic
+    split.
+    """
+    # Production callers pass the complete Whisper store. Keep normalized
+    # rows usable for Select Cuts and focused unit tests.
+    if any("announcement" in item for item in announcements):
+        announcements = select_commentator_announcements(announcements)
+    ordered = sorted(
+        [item for item in announcements if item.get("text")],
+        key=lambda item: float(item.get("announcement_start", item.get("start", 0.0))),
+    )
+    slots: list[Segment] = []
+    for index, item in enumerate(ordered):
+        first_word = float(item.get("announcement_start", item.get("start", 0.0)))
+        start = max(0.0, first_word - lead_in_seconds)
+        if index + 1 < len(ordered):
+            next_first_word = float(ordered[index + 1].get("announcement_start", ordered[index + 1].get("start", 0.0)))
+            end = max(start, next_first_word - lead_in_seconds)
+        else:
+            end = float(session_end)
+        confidence = float(item.get("speech_confidence") or 0.0)
+        reasons: list[str] = []
+        if confidence < 0.45:
+            reasons.append(f"commentator confidence {confidence:.2f} below 0.45")
+        if not str(item.get("speech_intro_text") or item.get("text") or "").strip():
+            reasons.append("commentator presentation text unavailable")
+        if end - start < HARD_MIN_SONG_SECONDS:
+            reasons.append(f"slot duration {end - start:.1f}s below 8:00")
+        elif end - start > HARD_MAX_SONG_SECONDS:
+            reasons.append(f"slot duration {end - start:.1f}s above 13:00; slot not split automatically")
+        labels = tuple(sorted((str(k), str(v)) for k, v in dict(item.get("musician_labels") or {}).items()))
+        slots.append(Segment(
+            start,
+            end,
+            core_start=start,
+            core_end=end,
+            nominal_end=end,
+            boundary_source="whisper-presented-slot",
+            boundary_validation="needs_review" if reasons else "valid",
+            boundary_validation_reason="; ".join(reasons),
+            speech_text=str(item.get("text") or ""),
+            speech_reason=str(item.get("announcement_reason") or "commentator presentation"),
+            speech_intro_text=str(item.get("speech_intro_text") or item.get("text") or ""),
+            speech_intro_start=first_word,
+            speech_confidence=confidence,
+            spoken_song_number=item.get("spoken_song_number"),
+            spoken_last=bool(item.get("spoken_last")),
+            musician_labels=labels,
+        ))
+    return slots
 
 
 def verify_rendered_announcement(path: Path, segment: Segment, song_index: int) -> dict[str, object]:
@@ -1889,6 +2012,20 @@ def validate_final_render_boundaries(
     for index, segment in enumerate(segments):
         cut = float(segment.end)
         number = int(numbers[index])
+        if segment.boundary_validation == "needs_review":
+            audit.append({
+                "song": number,
+                "cut_seconds": cut,
+                "cut_sample": int(round(cut * stems[0].samplerate)),
+                "sample_rate": int(stems[0].samplerate),
+                "active_instruments": [],
+                "active_voices": [],
+                "safe": False,
+                "needs_review": True,
+                "reason": segment.boundary_validation_reason or "commentator-led slot requires Select Cuts review",
+                "duration_seconds": float(segment.duration),
+            })
+            continue
         min_cut = float(segment.start) + HARD_MIN_SONG_SECONDS
         max_cut = min(float(segment.start) + HARD_MAX_SONG_SECONDS, session_end)
         if index + 1 < len(segments):
@@ -1898,9 +2035,14 @@ def validate_final_render_boundaries(
         safe, active_instruments, active_voices = _boundary_activity(
             cut, stems, shared_timelines, radius_seconds=3.0, diagnostic=True
         )
-        accepted_cut = cut if safe and HARD_MIN_SONG_SECONDS <= cut - float(segment.start) <= HARD_MAX_SONG_SECONDS else None
+        slot_duration_valid = HARD_MIN_SONG_SECONDS <= cut - float(segment.start) <= HARD_MAX_SONG_SECONDS
+        # A commentator edge is authoritative.  Instrument activity at that
+        # edge is diagnostic and must not move the slot into the next
+        # presentation; only the slot's confidence/duration can block it.
+        semantic_slot_edge = segment.boundary_source == "whisper-presented-slot"
+        accepted_cut = cut if (slot_duration_valid and (safe or semantic_slot_edge)) else None
         search = {"lower": min_cut, "upper": max_cut, "radius_seconds": 120.0}
-        if accepted_cut is None and max_cut >= min_cut:
+        if accepted_cut is None and not semantic_slot_edge and max_cut >= min_cut:
             candidate, candidate_instruments, candidate_voices = _nearest_valid_boundary(
                 cut, min_cut, max_cut, stems, shared_timelines,
                 search_seconds=120.0, validation_radius_seconds=3.0,
@@ -2722,10 +2864,12 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     )
     print_mc_breaks(mc_breaks)
     if whisper_available and len(whisper_segments) < 2:
-        raise RuntimeError(
-            "Transcript-first detection requires at least two introduction boundaries; "
-            f"Whisper supplied {len(whisper_segments)}. Acoustic segmentation is diagnostic only."
-        )
+        LAST_WHISPER_STATUS = {
+            **LAST_WHISPER_STATUS,
+            "status": "needs_review",
+            "reason": f"only {len(whisper_segments)} commentator presentation(s) detected; acoustic fallback disabled",
+        }
+        whisper_available = False
     if whisper_available:
         # Transcript-first invariant: this ordered list is the complete accepted
         # segmentation. No acoustic, duration, numbering, or correction pass may
@@ -2743,22 +2887,40 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
             "whisper": LAST_WHISPER_STATUS,
         }
     else:
-        # The acoustic proposal is sufficient to register songs and render a
-        # reviewable result. Whisper remains diagnostic and must never remove
-        # songs or block the source-loading path.
-        segments = list(probe_segments or [])
-        if not segments:
-            segments = auto_calibrate_drum_fallback(
-                stems, timelines, session_end, voice_stems, instrument_stems, mc_data,
-            )
+        # Without a sufficiently trusted commentator transcript there is no
+        # defensible slot boundary. Do not replace it with drum/acoustic or
+        # fixed-clock windows; expose one conservative review block instead.
+        segments = provisional_segments_from_metadata(stems)
         DETECTION_STRATEGY = {
-            "id": "acoustic_fallback",
-            "label": "Acoustic song proposals; Whisper optional",
+            "id": "commentator_missing_review",
+            "label": "Commentator-led slots unavailable; Select Cuts required",
             "detected_count": len(segments),
             "whisper": LAST_WHISPER_STATUS,
             "rhythm_equivalent_sources": rhythm_names,
             "needs_review": True,
         }
+        return segments, mc_mask.astype(np.float32)
+
+    # Whisper/VAD is authoritative for this recording.  Return the presented
+    # slots before any acoustic duration-repair pass can split a slot into
+    # multiple songs.  Activity remains diagnostic only.
+    segments = finalize_presented_slot_segments(whisper_transcripts, session_end)
+    DETECTION_STRATEGY.update({
+        "id": "commentator_presented_slots",
+        "label": "One global slot per commentator presentation",
+        "detected_count": len(segments),
+        "target_slot_count": EXPECTED_SLOT_COUNT,
+        "whisper_candidate_count": len(whisper_transcripts),
+        "whisper_boundary_count": len(segments),
+        "slot_unit": "commentator-led slot; never split on internal instrument activity",
+        "needs_review_slots": [index for index, segment in enumerate(segments, 1) if segment.boundary_validation == "needs_review"],
+    })
+    print(
+        f"COMMENTATOR SLOTS: accepted {len(segments)} presented slots; "
+        f"target approximately {EXPECTED_SLOT_COUNT}; internal songs are not split", flush=True,
+    )
+    return segments, mc_mask.astype(np.float32)
+
     if not mc_breaks:
         acoustic_fallback_segments = auto_calibrate_drum_fallback(stems, timelines, session_end, voice_stems, instrument_stems, mc_data)
         inferred_count = sum(segment.boundary_source == "stage-clock-inferred" for segment in acoustic_fallback_segments)
@@ -5433,7 +5595,7 @@ def vocal_harmonic_balance(
     vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room"}]
     harmonic_names = [
         name for name, role in effective_roles.items()
-        if role in {"keys", "keys_l", "keys_r", "synth", "guitar"}
+        if role in {"keys", "keys_l", "keys_r", "synth"}
     ]
     vocal_level = group_active_level_db(vocal_names, active_levels_db)
     harmonic_level = group_active_level_db(harmonic_names, active_levels_db)
@@ -5550,7 +5712,16 @@ def per_song_role_balance_corrections(
         "role_reasons": role_reasons,
         "role_levels_db": role_levels,
         "vocal_group_level_db": vocal_level,
-        "role_balance_method": "per-song active vocal overlap by guitar and keys groups",
+        "guitar_original_level_db": role_levels.get("guitar"),
+        "guitar_reduction_db": min(
+            (float(role_corrections[name]) for name in role_groups["guitar"]),
+            default=0.0,
+        ),
+        "guitar_reduction_reason": next(
+            (role_reasons[name] for name in role_groups["guitar"] if role_reasons.get(name)),
+            "no reliable vocal overlap evidence",
+        ),
+        "role_balance_method": "per-song vocal-active envelope balance; guitar correction is independent from keys/harmonic correction",
     }
 
 

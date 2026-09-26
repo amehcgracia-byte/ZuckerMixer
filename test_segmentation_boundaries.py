@@ -108,6 +108,19 @@ class SegmentationBoundaryTests(unittest.TestCase):
         self.assertEqual(audit[0]["accepted_cut_seconds"], 520.0)
         self.assertEqual(audit[0]["per_stem_samples"]["Guit.wav"], 60000)
 
+    def test_commentator_presentations_define_slots_without_internal_splits(self):
+        announcements = [
+            {"start": 10.0, "end": 20.0, "announcement_start": 10.0, "text": "First presentation", "speech_intro_text": "First presentation", "speech_confidence": 0.9},
+            {"start": 900.0, "end": 910.0, "announcement_start": 900.0, "text": "Second presentation", "speech_intro_text": "Second presentation", "speech_confidence": 0.9},
+        ]
+        result = pipeline.finalize_presented_slot_segments(announcements, 1200.0)
+        self.assertEqual(len(result), 2)
+        self.assertAlmostEqual(result[0].start, 9.5)
+        self.assertAlmostEqual(result[0].end, 899.5)
+        self.assertEqual(result[0].boundary_source, "whisper-presented-slot")
+        self.assertEqual(result[0].boundary_validation, "needs_review")
+        self.assertIn("above 13:00", result[0].boundary_validation_reason)
+
 
 if __name__ == "__main__":
     unittest.main()

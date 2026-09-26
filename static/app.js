@@ -47,6 +47,17 @@ function renderBuildInfo() {
   if (node) node.textContent = `${version} · ${revision} · ${timestamp}`;
 }
 
+function refreshSlotSummary() {
+  if (!appState) return;
+  const calibration = appState.detection_calibration || {};
+  const songs = visibleSongs();
+  calibration.exported_count = songs.filter((song) => song.latest_render).length;
+  calibration.pending_count = Math.max(0, Number(calibration.count || songs.length) - calibration.exported_count);
+  calibration.ready_count = songs.filter((song) => song.render_valid).length;
+  calibration.needs_review_count = songs.filter((song) => song.needs_review || !song.render_valid).length;
+  appState.detection_calibration = calibration;
+}
+
 const names = {
   kick: "Kick",
   snare: "Snare",
@@ -561,6 +572,7 @@ async function loadState() {
     showToast(`Error loading folder: ${appState.last_error}`);
   }
   renderBuildInfo();
+  refreshSlotSummary();
   syncOverrideSequenceFromState();
   const detected = visibleSongs().length;
   const review = visibleSongs().filter((song) => song.render_valid === false).length;
@@ -746,12 +758,16 @@ function renderCutTools() {
         ? `<div class="scan-warning">Whisper unavailable; song proposals remain available.</div>`
         : "";
     const scanError = scan.error ? `<div class="scan-warning">Error loading folder: ${esc(scan.error)}</div>` : "";
+    const calibration = appState?.detection_calibration || {};
+    const slotSummary = calibration.count
+      ? `<div class="scan-summary">Total slots detected: ${calibration.count} · Slots ready: ${calibration.ready_count ?? 0} · Slots needs_review: ${calibration.needs_review_count ?? 0} · Slots exported: ${calibration.exported_count ?? 0} · Slots pending: ${calibration.pending_count ?? 0}</div>`
+      : "";
     if (scan.fragment_warning) {
       const aligned = Array.isArray(scan.aligned_files) ? scan.aligned_files : [];
       const fragments = Array.isArray(scan.fragment_files) ? scan.fragment_files : [];
       scanNode.innerHTML = `
         <strong class="scan-warning">${esc(scan.fragment_warning)}</strong>
-        ${scanStatus}${scanError}<span>Using all decodable files${includedWarningText}.</span>
+        ${scanStatus}${scanError}${slotSummary}<span>Using all decodable files${includedWarningText}.</span>
         <details>
           <summary>Show included/excluded files</summary>
           <div><strong>Included files (${accepted.length}; aligned exports detected: ${aligned.length})</strong><br>${accepted.map((item) => esc(item.file)).join("<br>") || "none"}</div>
@@ -760,7 +776,7 @@ function renderCutTools() {
         </details>
       `;
     } else {
-      scanNode.innerHTML = `${scanStatus} <span>Audio scan: accepted ${accepted.length}${esc(acceptedText)}${esc(skippedText)}</span>${scanError}${whisperStatus}`;
+      scanNode.innerHTML = `${scanStatus}${slotSummary} <span>Audio scan: accepted ${accepted.length}${esc(acceptedText)}${esc(skippedText)}</span>${scanError}${whisperStatus}`;
     }
   }
   const signature = transitionsSignature(appState.transitions);
@@ -798,7 +814,7 @@ function renderSongs() {
       : "not mixed yet";
     const mixSource = song.latest_render?.mix_source || "Automatic mix";
     const checked = checkedSongs.has(song.id) ? "checked" : "";
-    const label = song.skipped ? `Skipped section ${song.id}` : `Song ${String(song.index).padStart(2, "0")}`;
+    const label = song.skipped ? `Skipped section ${song.id}` : `Slot ${String(song.index).padStart(2, "0")}`;
     const titleText = song.custom_name ? `${label} — ${song.custom_name}` : `${label} — ${song.duration_text}`;
     card.innerHTML = `
       <div class="song-main">
@@ -811,10 +827,12 @@ function renderSongs() {
             <span class="pill">${key}</span>
             <span class="pill">${mixInfo}</span>
             ${song.latest_render ? `<span class="pill mix-source">${esc(mixSource)}</span>` : ""}
+            ${song.needs_review ? '<span class="pill warn">Needs review</span>' : ""}
             ${song.skipped ? `<span class="pill">${song.skip_reason || "skipped"}</span>` : ""}
           </div>
           <div class="song-sub">${esc(song.time)}</div>
           ${song.segment?.speech_text ? `<div class="song-sub whisper-log"><strong>Announcer:</strong> ${esc(song.segment.speech_text)}</div>` : ""}
+          ${song.needs_review ? `<div class="song-sub scan-warning"><strong>Needs review:</strong> ${esc(song.segment?.boundary_validation_reason || song.render_validation || "slot requires review")}</div>` : ""}
           ${song.suspicious || song.number_mismatch ? `<details class="decision-evidence"><summary>Why this boundary?</summary><div>Spoken number: ${esc(song.decision_evidence?.spoken_number ?? "none")} · Introduction: ${song.decision_evidence?.introduction_found ? "found" : "not found"} · Duration rule: ${esc(song.decision_evidence?.duration_rule || "not flagged")} · Boundary: ${esc(song.decision_evidence?.boundary_source || "unknown")}</div></details>` : ""}
           <label class="title-edit">
             <span title="Rename">✎</span>
@@ -957,6 +975,7 @@ function fineTuneHtml(song) {
         </div>
       </div>
       <div class="fine-body">
+        <div class="auto-mix-balance" data-auto-mix-balance="${song.id}"></div>
         <div class="faders" data-faders="${song.id}"></div>
         <div class="simple-sliders">
           <label>Echo <input data-simple="delay_send_db" type="range" min="-18" max="12" step="0.5"><span></span></label>
@@ -1011,6 +1030,14 @@ async function loadActiveStemFaders(root, songIndex) {
     if (song) {
       song.active_stems = data.active_stems || [];
       song.mix_params = data.mix_params || null;
+      const balance = data.mix_params?.auto_mix_balance || {};
+      const guitar = balance.guitar_reduction_db;
+      const original = balance.guitar_original_level_db;
+      const reason = balance.guitar_reduction_reason || "no reliable vocal overlap evidence";
+      const summary = root.querySelector(`[data-auto-mix-balance="${songIndex}"]`);
+      if (summary && Number.isFinite(Number(guitar))) {
+        summary.textContent = `Auto-Mix guitars: original ${Number(original).toFixed(1)} dB · reduction ${Number(guitar).toFixed(1)} dB · ${reason}`;
+      }
     }
     renderFaders(root, songIndex);
   } catch (_err) {
@@ -2507,6 +2534,7 @@ async function refreshState(options = {}) {
     });
   }
   appState = next;
+  refreshSlotSummary();
   renderBuildInfo();
   syncOverrideSequenceFromState();
   checkedSongs = new Set([...checkedSongs].filter((id) => appState.songs.some((song) => song.id === id && !song.skipped)));
