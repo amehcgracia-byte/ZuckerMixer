@@ -891,6 +891,7 @@ function ensureCutSelector() {
       <div class="cut-selector-header"><div><h2>Edit Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><div class="cut-slot-nav"><button type="button" id="cutPrevious" class="ghost">Previous</button><span id="cutSlotPosition">Slot 1 of 1</span><select id="cutSlotList" aria-label="All slots"></select><button type="button" id="cutNext" class="ghost">Next</button><button type="button" id="cutClose" class="ghost" aria-label="Close">×</button></div></div>
       <div class="cut-wave-wrap"><canvas id="cutWaveform" aria-label="Selected slot waveform"></canvas><div id="cutMarkers" class="cut-markers"></div><div id="cutSelection" class="cut-selection"><button type="button" class="cut-handle left" aria-label="Move start"></button><button type="button" class="cut-center" aria-label="Move selection"></button><button type="button" class="cut-handle right" aria-label="Move end"></button></div></div>
       <div class="cut-zoom-controls"><label>Zoom <input id="cutZoom" type="range" min="1" max="20" step="0.1" value="1"></label><button type="button" id="cutFit" class="ghost">Fit selected slot</button><button type="button" id="cutZoomSelection" class="ghost">Zoom to selection</button><label>Scroll <input id="cutPan" type="range" min="0" max="1000" step="1" value="0"></label></div>
+      <div class="cut-editor-tools"><button type="button" id="cutPlayheadAdd" class="ghost">Add cut at playhead</button><button type="button" id="cutDelete" class="ghost">Delete cut</button><button type="button" id="cutMerge" class="ghost">Merge</button><button type="button" id="cutUndo" class="ghost">Undo</button><button type="button" id="cutRedo" class="ghost">Redo</button><audio id="cutAudio" controls preload="none"></audio><span id="cutPlayheadReadout" class="muted">Playhead —</span></div>
       <div class="cut-readout"><label>Start <input id="cutStart" type="number" step="0.1"></label><label>End <input id="cutEnd" type="number" step="0.1"></label><strong>Duration <span id="cutDuration">—</span></strong><span id="cutValidation" class="cut-validation"></span></div>
       <div id="cutEvidence" class="cut-evidence"></div>
       <div class="cut-selector-actions"><button id="cutApply" type="button" class="accent">Save Changes</button></div>
@@ -912,8 +913,10 @@ async function openCutSelector(songId) {
   ui.songId = songId;
   ui.data = data;
   ui.allSlots = (data.markers || []).map((marker) => Number(marker.song_id)).filter(Number.isFinite);
-  ui.sourceStart = Number(data.waveform.window_start_sec || data.selection.start_sec || 0);
-  ui.sourceEnd = Number(data.waveform.window_end_sec || data.selection.end_sec || 0);
+  ui.slotWindowStart = Number(data.waveform.window_start_sec || data.selection.start_sec || 0);
+  ui.slotWindowEnd = Number(data.waveform.window_end_sec || data.selection.end_sec || 0);
+  ui.sourceStart = Number(data.global_waveform?.window_start_sec || 0);
+  ui.sourceEnd = Number(data.global_waveform?.window_end_sec || ui.slotWindowEnd);
   ui.duration = Math.max(0, ui.sourceEnd - ui.sourceStart);
   ui.startValue = Number(data.selection.start_sec);
   ui.endValue = Number(data.selection.end_sec);
@@ -924,6 +927,8 @@ async function openCutSelector(songId) {
   const slotList = ui.dialog.querySelector("#cutSlotList"); slotList.innerHTML = ui.allSlots.map((id, index) => `<option value="${id}">Slot ${index + 1} of ${ui.allSlots.length}</option>`).join(""); slotList.value = String(songId);
   ui.dialog.querySelector("#cutPrevious").disabled = slotIndex <= 0; ui.dialog.querySelector("#cutNext").disabled = slotIndex >= ui.allSlots.length - 1;
   ui.dialog.querySelector("#cutEvidence").innerHTML = data.markers.filter((marker) => marker.song_id === songId).map((marker) => `<span class="cut-evidence-item ${marker.status}">${cutTime(marker.start_sec)}–${cutTime(marker.end_sec)} · ${esc(marker.boundary_source || "automatic proposal")} · ${marker.confidence ? `${Math.round(marker.confidence * 100)}%` : "no confidence"}</span>`).join("");
+  const audio = ui.dialog.querySelector("#cutAudio"); if (audio) { audio.src = `/api/cuts/audio/${songId}`; audio.load(); }
+  setCutLoading("Rendering waveform", `Rendering complete-session waveform for slot ${songId}`, 70);
   drawCutEditor();
   ui.dialog.showModal();
   setCutLoading("Finished", `Slot ${songId} ready for precise editing`, 100);
@@ -956,10 +961,11 @@ function drawCutEditor() {
   canvas.style.height = `${height}px`;
   const ctx = canvas.getContext("2d"); ctx.scale(devicePixelRatio, devicePixelRatio);
   ctx.fillStyle = "#100e0c"; ctx.fillRect(0, 0, width, height);
-  const peaks = ui.data.waveform.peaks || [];
+  const globalWaveform = ui.data.global_waveform || ui.data.waveform;
+  const peaks = globalWaveform.peaks || [];
   const visibleStart = ui.viewStart ?? ui.sourceStart ?? 0; const visibleEnd = ui.viewEnd ?? ui.sourceEnd ?? ui.duration; const visibleSpan = Math.max(0.001, visibleEnd - visibleStart);
   ctx.strokeStyle = "#eca35e"; ctx.globalAlpha = .8; ctx.beginPath();
-  peaks.forEach((value, index) => { const seconds = (ui.sourceStart + index / Math.max(1, peaks.length - 1) * ui.duration); if (seconds < visibleStart || seconds > visibleEnd) return; const x = (seconds - visibleStart) / visibleSpan * width; const y = height / 2 - Number(value) * (height * .42); ctx.moveTo(x, height / 2 + Number(value) * (height * .42)); ctx.lineTo(x, y); }); ctx.stroke(); ctx.globalAlpha = 1;
+  peaks.forEach((value, index) => { const seconds = (Number(globalWaveform.window_start_sec || 0) + index / Math.max(1, peaks.length - 1) * Number(globalWaveform.duration_sec || ui.duration)); if (seconds < visibleStart || seconds > visibleEnd) return; const x = (seconds - visibleStart) / visibleSpan * width; const y = height / 2 - Number(value) * (height * .42); ctx.moveTo(x, height / 2 + Number(value) * (height * .42)); ctx.lineTo(x, y); }); ctx.stroke(); ctx.globalAlpha = 1;
   const x = (seconds) => Math.max(0, Math.min(width, (Number(seconds) - visibleStart) / visibleSpan * width));
   const sx = x(ui.startValue), ex = x(ui.endValue);
   ctx.fillStyle = "rgba(200,111,47,.23)"; ctx.fillRect(sx, 0, Math.max(0, ex - sx), height);
@@ -971,8 +977,11 @@ function drawCutEditor() {
   const valid = duration >= 480 && duration <= 780;
   const validation = ui.dialog.querySelector("#cutValidation"); validation.textContent = valid ? "Valid selection" : "Selection must be between 8:00 and 13:00"; validation.className = `cut-validation ${valid ? "valid" : "invalid"}`;
   ui.dialog.querySelector("#cutApply").disabled = !valid;
-  const markers = ui.dialog.querySelector("#cutMarkers"); markers.innerHTML = (ui.data.markers || []).filter((marker) => marker.song_id === ui.songId).flatMap((marker) => [marker.start_sec, marker.end_sec, marker.comment_start_sec]).filter((value) => Number.isFinite(Number(value)) && Number(value) >= visibleStart && Number(value) <= visibleEnd).map((value) => `<i style="left:${x(value) / width * 100}%" title="Boundary ${cutTime(value)}"></i>`).join("");
+  const markers = ui.dialog.querySelector("#cutMarkers"); markers.innerHTML = (ui.data.markers || []).flatMap((marker) => [[marker.start_sec, marker.song_id === ui.songId ? "selected" : ""], [marker.end_sec, marker.song_id === ui.songId ? "selected" : ""], [marker.comment_start_sec, "comment"]]).filter(([value]) => Number.isFinite(Number(value)) && Number(value) >= visibleStart && Number(value) <= visibleEnd).map(([value, kind]) => `<i class="${kind}" style="left:${x(value) / width * 100}%" title="Slot boundary ${cutTime(value)}"></i>`).join("");
   if (ui.zoom) ui.zoom.value = Math.max(1, Math.min(20, ui.duration / visibleSpan));
+  if (ui.playhead == null) ui.playhead = ui.startValue;
+  const playhead = x(ui.playhead); ctx.strokeStyle = "#79d7c4"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(playhead, 0); ctx.lineTo(playhead, height); ctx.stroke();
+  const readout = ui.dialog.querySelector("#cutPlayheadReadout"); if (readout) readout.textContent = `Playhead ${cutTime(ui.playhead)}`;
 }
 
 function installCutDrag(element, mode) {
@@ -990,8 +999,15 @@ function wireCutSelector(ui) {
   [ui.start, ui.end].forEach((input) => input.addEventListener("input", () => { ui.startValue = Number(ui.start.value); ui.endValue = Number(ui.end.value); drawCutEditor(); }));
   ui.zoom.addEventListener("input", () => { const span = ui.duration / Number(ui.zoom.value); const center = (ui.viewStart + ui.viewEnd) / 2; ui.viewStart = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, center - span / 2)); ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
   ui.pan.addEventListener("input", () => { const span = ui.viewEnd - ui.viewStart; const max = Math.max(0, ui.duration - span); ui.viewStart = ui.sourceStart + max * Number(ui.pan.value) / 1000; ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
-  ui.dialog.querySelector("#cutFit").addEventListener("click", () => { ui.viewStart = ui.sourceStart; ui.viewEnd = ui.sourceEnd; drawCutEditor(); });
+  ui.dialog.querySelector("#cutFit").addEventListener("click", () => { ui.viewStart = ui.slotWindowStart; ui.viewEnd = ui.slotWindowEnd; drawCutEditor(); });
   ui.dialog.querySelector("#cutZoomSelection").addEventListener("click", () => { const span = Math.min(ui.duration, Math.max(ui.endValue - ui.startValue, (ui.endValue - ui.startValue) * 1.2)); const center = (ui.startValue + ui.endValue) / 2; ui.viewStart = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, center - span / 2)); ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
+  ui.canvas.addEventListener("click", (event) => { const rect = ui.canvas.getBoundingClientRect(); ui.playhead = ui.viewStart + Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) * (ui.viewEnd - ui.viewStart); drawCutEditor(); });
+  const editorOperation = async (operation) => { setCutLoading("Applying cut changes", `${operation} at ${cutTime(ui.playhead || ui.startValue)}`, 35); const response = await fetch("/api/editor-cut-operation", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation, at_sec: ui.playhead || ui.startValue }) }); const result = await response.json().catch(() => ({})); if (!response.ok) { setCutLoading("Error", result.error || `Could not ${operation}.`); return showToast(result.error || `Could not ${operation}.`); } setCutLoading("Validating cuts", `${result.slot_count} slots preserved`, 80); await refreshState({ renderLarge: true }); await openCutSelector(Math.min(Number(ui.songId), result.slot_count)); setCutLoading("Finished", `Global editor updated; ${result.slot_count} slots remain`, 100); setTimeout(clearCutLoading, 700); };
+  ui.dialog.querySelector("#cutPlayheadAdd").addEventListener("click", () => editorOperation("add"));
+  ui.dialog.querySelector("#cutDelete").addEventListener("click", () => editorOperation("delete"));
+  ui.dialog.querySelector("#cutMerge").addEventListener("click", () => editorOperation("merge"));
+  ui.dialog.querySelector("#cutUndo").addEventListener("click", () => editorOperation("undo"));
+  ui.dialog.querySelector("#cutRedo").addEventListener("click", () => editorOperation("redo"));
   const navigate = async (offset) => { if (cutIsDirty() && !window.confirm("Discard unsaved cut changes before changing slots?")) return; const index = ui.allSlots.indexOf(Number(ui.songId)); const next = ui.allSlots[index + offset]; if (next) await openCutSelector(next); };
   ui.dialog.querySelector("#cutPrevious").addEventListener("click", () => navigate(-1));
   ui.dialog.querySelector("#cutNext").addEventListener("click", () => navigate(1));

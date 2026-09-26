@@ -77,6 +77,8 @@ button:disabled {
 .cut-zoom-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 10px 0; color: var(--muted); }
 .cut-zoom-controls label { display: inline-flex; align-items: center; gap: 7px; }
 .cut-zoom-controls input { accent-color: var(--orange2); min-width: 150px; }
+.cut-editor-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.cut-editor-tools audio { max-width: 280px; height: 34px; }
 .cut-wave-wrap { position: relative; min-height: 190px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: #100e0c; }
 #cutWaveform { display: block; width: 100%; height: 190px; }
 .cut-selection { position: absolute; inset: 0 auto 0 0; border-left: 3px solid var(--orange2); border-right: 3px solid var(--orange2); pointer-events: none; background: rgba(200,111,47,.12); }
@@ -86,6 +88,8 @@ button:disabled {
 .cut-center:active { cursor: grabbing; }
 .cut-markers { position: absolute; inset: 0; pointer-events: none; }
 .cut-markers i { position: absolute; top: 0; bottom: 0; width: 1px; background: #9c8bd6; opacity: .75; }
+.cut-markers i.selected { width: 3px; background: var(--orange2); opacity: .95; }
+.cut-markers i.comment { background: #79d7c4; }
 .cut-readout { justify-content: flex-start; margin-top: 14px; }
 .cut-readout label { display: grid; gap: 4px; color: var(--muted); }
 .cut-readout input { width: 130px; min-height: 36px; border: 1px solid var(--line); border-radius: 6px; background: #120f0d; color: var(--cream); padding: 7px; }

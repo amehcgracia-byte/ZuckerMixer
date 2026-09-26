@@ -48,10 +48,12 @@ WAVEFORM_CACHE_PATH = ACTIVE_SOURCE_STATE_ROOT / "waveform_cache.json"
 MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
 SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
 DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
+EDITOR_HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "editor_history.json"
 REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
 REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerPreviewCache"
 PREVIEW_DIR = PREVIEW_CACHE_ROOT / "default"
+CUT_AUDIO_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerCutAudioCache"
 JOB_STATUS_DIR = STATE_ROOT / "job_status"
 JOB_STATUS_DIR.mkdir(parents=True, exist_ok=True)
 LIFECYCLE_LOG_PATH = STATE_ROOT / "redetect_worker_lifecycle.jsonl"
@@ -845,7 +847,7 @@ def save_manual_splits(values: list[float]) -> None:
 
 
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, PREVIEW_DIR
+    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, EDITOR_HISTORY_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, PREVIEW_DIR
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.AUDIO_SCAN_REPORT = {
@@ -868,6 +870,7 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
     SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
     DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
+    EDITOR_HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "editor_history.json"
     REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
     REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
     PREVIEW_DIR = PREVIEW_CACHE_ROOT / source_key
@@ -988,16 +991,22 @@ def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int
     return (str(source), tuple(mtimes), tuple(files))
 
 
-def apply_saved_segment_selections(segments: list[pipeline.Segment]) -> list[pipeline.Segment]:
+def apply_saved_segment_selections(segments: list[pipeline.Segment], raw_songs: list[dict[str, Any]] | None = None) -> list[pipeline.Segment]:
     """Apply explicit timeline selections without reusing invalid windows."""
     payload = load_json(SEGMENT_SELECTIONS_PATH, {})
     saved = payload.get("segments", {}) if isinstance(payload, dict) else {}
     if not isinstance(saved, dict):
         return segments
     result = list(segments)
+    raw_by_slot_id = {
+        str(row.get("slot_id")): index
+        for index, row in enumerate(raw_songs or [])
+        if row.get("slot_id")
+    }
     for raw_id, selection in saved.items():
         try:
-            index = int(raw_id) - 1
+            slot_id = selection.get("slot_id") if isinstance(selection, dict) else None
+            index = raw_by_slot_id.get(str(slot_id), int(raw_id) - 1)
             start = float(selection["start_sec"])
             end = float(selection["end_sec"])
         except (KeyError, TypeError, ValueError):
@@ -1077,6 +1086,43 @@ def slot_waveform(start_sec: float, end_sec: float, points: int = 1400) -> dict[
     values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
     result = {"window_start_sec": start_sec, "window_end_sec": end_sec, "duration_sec": duration, "peaks": values, "cached": False}
     cache.setdefault("slots", {})[key] = result
+    save_json_atomic(WAVEFORM_CACHE_PATH, cache)
+    return result
+
+
+def full_session_waveform(points: int = 1800) -> dict[str, Any]:
+    """Return a cached low-resolution envelope for the complete session."""
+    identity = _waveform_identity()
+    cache = load_json(WAVEFORM_CACHE_PATH, {})
+    if not isinstance(cache, dict) or cache.get("identity") != identity:
+        cache = {"identity": identity, "version": 2, "slots": {}}
+    existing = cache.get("global")
+    if isinstance(existing, dict) and len(existing.get("peaks", [])):
+        return {**existing, "cached": True}
+    state = ensure_pipeline_state()
+    end_sec = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in state["stems"]), default=0.0)
+    envelope = np.zeros(points, dtype=np.float32)
+    # The global editor's visual envelope is presentation-only. Use the
+    # shortest available original stem as a representative timeline so
+    # opening the editor never scans tens of gigabytes from every channel.
+    # Detection and rendering still use every stem.
+    visual_stems = sorted(state["stems"], key=lambda item: float(item.timeline_duration))[:1]
+    for stem in visual_stems:
+        try:
+            with sf.SoundFile(str(stem.path)) as audio_file:
+                total = max(1, int(audio_file.frames))
+                for index in range(points):
+                    frame = min(total - 1, int(index / max(1, points - 1) * total))
+                    audio_file.seek(frame)
+                    block = audio_file.read(min(512, total - frame), dtype="float32", always_2d=True)
+                    if len(block):
+                        envelope[index] = max(envelope[index], float(np.max(np.abs(block))))
+        except (OSError, RuntimeError, ValueError):
+            continue
+    peak = float(np.max(envelope)) if len(envelope) else 0.0
+    values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
+    result = {"window_start_sec": 0.0, "window_end_sec": end_sec, "duration_sec": end_sec, "peaks": values, "cached": False}
+    cache["global"] = result
     save_json_atomic(WAVEFORM_CACHE_PATH, cache)
     return result
 
@@ -1432,6 +1478,9 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
                 "manual_end": None,
                 "revision": 0,
                 "detection_version": getattr(pipeline, "SPEECH_TRANSCRIPTION_CACHE_VERSION", "unknown"),
+                "proposal_status": "needs_review" if segment.boundary_validation == "needs_review" else ("manual" if segment.boundary_source == "manual-selection" else "auto"),
+                "cut_reason": segment.speech_reason or segment.boundary_source,
+                "whisper_confidence": float(segment.speech_confidence or 0.0),
                 "start": segment.start,
                 "end": segment.end,
                 "duration": duration,
@@ -1720,13 +1769,17 @@ def public_state() -> dict[str, Any]:
     }
     source_stems = state.get("stems", [])
     source_duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in source_stems), default=0.0)
+    expected_slot_count = int(settings.get("known_song_count") or pipeline.EXPECTED_SLOT_COUNT)
+    incomplete_source = len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS
+    count_mismatch = len(raw_slots) != expected_slot_count
     source_integrity = {
-        "status": "Incomplete source segmentation" if len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS else "ok",
+        "status": "Incomplete source segmentation" if incomplete_source else ("Needs review: candidate count differs from configured target" if count_mismatch else "ok"),
         "original_wav_required": True,
         "stem_count": len(source_stems),
         "duration_sec": source_duration,
         "saved_slot_count": len(raw_slots),
-        "warning": "Source state incomplete; Original WAVs required; no destructive changes made." if len(raw_slots) == 1 else "",
+        "expected_slot_count": expected_slot_count,
+        "warning": ("Source state incomplete; Original WAVs required; no destructive changes made." if incomplete_source else (f"Current slots: {len(raw_slots)}; configured target: {expected_slot_count}. Review Whisper proposals before export." if count_mismatch else "")),
     }
     transitions = [
         {
@@ -3183,6 +3236,7 @@ def api_cuts(song_id: int) -> Response:
         return jsonify({"error": "song not found"}), 404
     selected = state["segments"][song_id - 1]
     waveform = slot_waveform(float(selected.start), float(selected.end))
+    global_waveform = full_session_waveform()
     markers = []
     for index, segment in enumerate(state["segments"], 1):
         markers.append({
@@ -3200,6 +3254,7 @@ def api_cuts(song_id: int) -> Response:
     return jsonify({
         "song_id": song_id,
         "waveform": waveform,
+        "global_waveform": global_waveform,
         "selection": {"start_sec": float(selected.start), "end_sec": float(selected.end)},
         "markers": markers,
         "bounds": {"min_sec": pipeline.HARD_MIN_SONG_SECONDS, "max_sec": pipeline.HARD_MAX_SONG_SECONDS},
@@ -3211,6 +3266,53 @@ def api_cuts(song_id: int) -> Response:
             "revision": state.get("raw_songs", [{}])[song_id - 1].get("revision", 0),
         },
     })
+
+
+@app.get("/api/cuts/audio/<int:song_id>")
+def api_cut_audio(song_id: int) -> Response:
+    """Provide a temporary downmix of only the selected source slot for playback."""
+    state = ensure_pipeline_state()
+    if song_id < 1 or song_id > len(state["segments"]):
+        return Response(status=404)
+    segment = state["segments"][song_id - 1]
+    start, end = float(segment.start), float(segment.end)
+    signature = hashlib.sha256(f"{Path(pipeline.SOURCE_DIR).resolve()}:{start:.3f}:{end:.3f}".encode()).hexdigest()[:24]
+    CUT_AUDIO_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = CUT_AUDIO_CACHE_ROOT / f"{signature}.wav"
+    if not path.exists():
+        stems = state.get("stems", [])
+        if not stems:
+            return jsonify({"error": "No source stems available for playback."}), 404
+        sample_rate = int(round(float(stems[0].sample_rate)))
+        frame_count = max(1, int(round((end - start) * sample_rate)))
+        mix = np.zeros(frame_count, dtype=np.float32)
+        used = 0
+        for stem in stems:
+            try:
+                with sf.SoundFile(str(stem.path)) as audio_file:
+                    sr = float(audio_file.samplerate)
+                    local_start = max(0, int(round((start - float(stem.offset_seconds)) * sr)))
+                    audio_file.seek(local_start)
+                    remaining = frame_count
+                    cursor = 0
+                    while remaining > 0:
+                        block = audio_file.read(min(262144, remaining), dtype="float32", always_2d=True)
+                        if len(block) == 0:
+                            break
+                        mix[cursor:cursor + len(block)] += np.mean(block, axis=1).astype(np.float32)
+                        cursor += len(block)
+                        remaining -= len(block)
+                used += 1
+            except (OSError, RuntimeError, ValueError):
+                continue
+        if used == 0:
+            return jsonify({"error": "Source stems could not be read for playback."}), 404
+        mix /= max(1, used)
+        peak = float(np.max(np.abs(mix))) if len(mix) else 0.0
+        if peak > 0.95:
+            mix *= 0.95 / peak
+        sf.write(path, mix, sample_rate, subtype="PCM_16")
+    return ranged_file_response(path, mimetype="audio/wav")
 
 
 @app.post("/api/segment-selection/<int:song_id>")
@@ -3278,6 +3380,82 @@ def api_segment_selection(song_id: int) -> Response:
             save_detection_snapshot(state, pipeline_state_signature)
     append_log("ui", f"Saved manual cut for song {song_id}: {start:.3f}-{end:.3f}s")
     return jsonify({"ok": True, "song_id": song_id, "start_sec": start, "end_sec": end, "duration_sec": duration, "source": "manual"})
+
+
+def _editor_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    return {"segments": [asdict(segment) for segment in state.get("segments", [])], "raw_songs": state.get("raw_songs", [])}
+
+
+def _restore_editor_snapshot(state: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    segments = [pipeline.Segment(**item) for item in snapshot.get("segments", [])]
+    state["segments"] = segments
+    state["raw_songs"] = snapshot.get("raw_songs", [])
+
+
+@app.post("/api/editor-cut-operation")
+def api_editor_cut_operation() -> Response:
+    """Apply one explicit global-editor operation without running detection."""
+    payload = request.get_json(force=True, silent=True) or {}
+    operation = str(payload.get("operation") or "").strip().lower()
+    state = ensure_pipeline_state()
+    history = load_json(EDITOR_HISTORY_PATH, {"undo": [], "redo": []})
+    if not isinstance(history, dict):
+        history = {"undo": [], "redo": []}
+    history.setdefault("undo", []); history.setdefault("redo", [])
+    current = _editor_snapshot(state)
+    if operation in {"undo", "redo"}:
+        source = history["undo"] if operation == "undo" else history["redo"]
+        target = history["redo"] if operation == "undo" else history["undo"]
+        if not source:
+            return jsonify({"error": f"Nothing to {operation}."}), 409
+        target.append(current)
+        _restore_editor_snapshot(state, source.pop())
+    else:
+        try:
+            at = float(payload.get("at_sec"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "at_sec is required for this editor operation."}), 400
+        index = next((i for i, segment in enumerate(state["segments"]) if segment.start < at < segment.end), None)
+        if operation == "add":
+            if index is None:
+                return jsonify({"error": "Playhead is not inside a slot."}), 400
+            segment = state["segments"][index]
+            left = replace(segment, end=at, core_end=at, nominal_end=at, boundary_source="manual-add-cut", boundary_validation="manual-selection", boundary_validation_reason="user added cut")
+            right = replace(segment, start=at, core_start=at, boundary_source="manual-add-cut", boundary_validation="manual-selection", boundary_validation_reason="user added cut")
+            state["segments"][index:index + 1] = [left, right]
+        elif operation in {"delete", "merge"}:
+            boundary = at
+            pair = next((i for i in range(len(state["segments"]) - 1) if abs(state["segments"][i].end - boundary) <= 1.0), None)
+            if pair is None:
+                return jsonify({"error": "No slot boundary near the playhead."}), 400
+            left, right = state["segments"][pair], state["segments"][pair + 1]
+            state["segments"][pair:pair + 2] = [replace(left, end=right.end, core_end=right.end, nominal_end=right.end, boundary_source="manual-merge", boundary_validation="manual-selection", boundary_validation_reason="user merged adjacent slots")]
+        else:
+            return jsonify({"error": f"Unknown editor operation: {operation}"}), 400
+        history["undo"].append(current)
+        history["undo"] = history["undo"][-20:]
+        history["redo"] = []
+
+    # Rebuild only the editor rows. Match unchanged rows by their original
+    # interval, never by ordinal, so inserting a cut cannot rename every
+    # following slot.
+    old_rows = state.get("raw_songs", [])
+    session_id = next((row.get("session_id") for row in old_rows if row.get("session_id")), session_id_for_signature(detection_state_signature()))
+    rows = []
+    for ordinal, segment in enumerate(state["segments"], 1):
+        old = next((candidate for candidate in old_rows if abs(float(candidate.get("source_start", candidate.get("start", -999999))) - segment.start) <= 0.01 and abs(float(candidate.get("source_end", candidate.get("end", -999999))) - segment.end) <= 0.01), None)
+        row = dict(old or {})
+        row.update({"id": ordinal, "session_id": row.get("session_id") or session_id, "slot_id": row.get("slot_id") or f"{session_id}:manual-slot-{ordinal:03d}", "start": segment.start, "end": segment.end, "source_start": row.get("source_start", segment.start), "source_end": row.get("source_end", segment.end), "duration": segment.duration, "duration_text": fmt_time(segment.duration), "render_end": segment.end, "segment": asdict(segment), "proposal_status": "manual", "revision": int(row.get("revision", 0) or 0) + 1})
+        rows.append(row)
+    state["raw_songs"] = rows
+    with state_lock:
+        global pipeline_state, pipeline_state_signature
+        pipeline_state = state
+        pipeline_state_signature = detection_state_signature()
+        save_detection_snapshot(state, pipeline_state_signature)
+    save_json_atomic(EDITOR_HISTORY_PATH, history)
+    append_log("ui", f"Global editor operation {operation} applied at {payload.get('at_sec')}")
+    return jsonify({"ok": True, "operation": operation, "slot_count": len(state["segments"]), "segments": [{"start": s.start, "end": s.end} for s in state["segments"]]})
 
 
 @app.post("/api/overrides")
