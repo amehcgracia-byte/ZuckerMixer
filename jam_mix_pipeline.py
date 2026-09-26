@@ -205,7 +205,7 @@ RENDER_CHUNK_SECONDS = 300.0
 DETECTION_CACHE = Path(".jam_detection_envelopes.npz")
 DETECTION_CACHE_ROOT: Path | None = None
 LEGACY_DETECTION_CACHE: Path | None = None
-DETECTION_CACHE_ALGORITHM_VERSION = "20260902-full-session-segmentation-v4"
+DETECTION_CACHE_ALGORITHM_VERSION = "20260926-global-boundary-timeline-v5"
 SPEECH_DETECTION_ALGORITHM_VERSION = "20260827-whisper-v1"
 SPEECH_TRANSCRIPTION_CACHE_VERSION = "20260902-full-session-segmentation-v2"
 WHISPER_MODEL_SIZE = os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")
@@ -1867,22 +1867,50 @@ def validate_final_render_boundaries(
     stems: list[Stem],
     segments: list[Segment],
     song_numbers: list[int] | None = None,
+    timelines: dict[str, np.ndarray] | None = None,
 ) -> list[dict[str, object]]:
     """Non-bypassable last check before any render is allowed.
 
-    It inspects the actual source samples around every proposed song end.
-    Two or more independently active instrument stems at a cut means the
-    boundary is unsafe. The caller must abort the render; this function never
-    moves or softens the boundary.
+    It inspects the same global, offset-aware envelope timeline used by
+    detection. Unsafe cuts are returned as review rows; they are never
+    softened and this function never raises a batch-fatal exception.
+
+    A nearby replacement is accepted only when the replacement is on the
+    same global timeline, quiet on every stem, and leaves an 8--13 minute
+    window. The caller must apply accepted_cut_seconds to the shared edge of
+    the adjacent windows before rendering.
     """
     audit: list[dict[str, object]] = []
     numbers = song_numbers or list(range(1, len(segments) + 1))
-    instruments = [stem for stem in stems if stem.role not in {"vocal", "room"}]
+    if not stems:
+        return audit
+    shared_timelines = timelines if timelines is not None else load_cached_timelines_or_die(stems, "Final cut gate")
+    session_end = max(float(stem.offset_seconds + stem.timeline_duration) for stem in stems)
     for index, segment in enumerate(segments):
         cut = float(segment.end)
+        number = int(numbers[index])
+        min_cut = float(segment.start) + HARD_MIN_SONG_SECONDS
+        max_cut = min(float(segment.start) + HARD_MAX_SONG_SECONDS, session_end)
+        if index + 1 < len(segments):
+            next_segment = segments[index + 1]
+            min_cut = max(min_cut, float(next_segment.end) - HARD_MAX_SONG_SECONDS)
+            max_cut = min(max_cut, float(next_segment.end) - HARD_MIN_SONG_SECONDS)
+        safe, active_instruments, active_voices = _boundary_activity(
+            cut, stems, shared_timelines, radius_seconds=3.0, diagnostic=True
+        )
+        accepted_cut = cut if safe and HARD_MIN_SONG_SECONDS <= cut - float(segment.start) <= HARD_MAX_SONG_SECONDS else None
+        search = {"lower": min_cut, "upper": max_cut, "radius_seconds": 120.0}
+        if accepted_cut is None and max_cut >= min_cut:
+            candidate, candidate_instruments, candidate_voices = _nearest_valid_boundary(
+                cut, min_cut, max_cut, stems, shared_timelines,
+                search_seconds=120.0, validation_radius_seconds=3.0,
+            )
+            if candidate is not None:
+                accepted_cut = float(candidate)
+                active_instruments, active_voices = candidate_instruments, candidate_voices
         if segment.boundary_source == "metadata-provisional":
             audit.append({
-                "song": int(numbers[index]),
+                "song": number,
                 "cut_seconds": cut,
                 "cut_sample": int(round(cut * stems[0].samplerate)),
                 "active_instruments": [],
@@ -1891,36 +1919,32 @@ def validate_final_render_boundaries(
                 "reason": "Whisper unavailable; metadata-only proposal requires Select Cuts review",
             })
             continue
-        start = max(float(segment.start), cut - 2.0)
-        end = min(max(stem.timeline_duration for stem in stems), cut + 0.25)
-        active: list[dict[str, object]] = []
-        for stem in instruments:
-            chunk = read_stem_chunk(stem, Segment(start, end), 0, max(1, int(round((end - start) * stem.samplerate))))
-            if chunk is None or len(chunk) < 8:
-                continue
-            mono = np.asarray(chunk if chunk.ndim == 1 else np.mean(chunk, axis=1), dtype=np.float64)
-            mono = np.nan_to_num(mono, nan=0.0, posinf=0.0, neginf=0.0)
-            split = max(1, int(len(mono) * 0.70))
-            tail_rms = rms_dbfs(mono[:split])
-            near_rms = rms_dbfs(mono[split:])
-            baseline_chunk = read_stem_chunk(
-                stem, Segment(max(float(segment.start), cut - 32.0), max(float(segment.start), cut - 12.0)),
-                0, max(1, int(round(min(20.0, cut - max(float(segment.start), cut - 32.0)) * stem.samplerate))),
-            )
-            baseline = rms_dbfs(np.asarray(baseline_chunk if baseline_chunk is not None else mono, dtype=np.float64))
-            threshold = max(-52.0, baseline + 5.0)
-            if near_rms >= threshold or (tail_rms >= threshold and near_rms >= -55.0):
-                active.append({"stem": stem.path.name, "tail_rms_dbfs": round(tail_rms, 2), "near_cut_rms_dbfs": round(near_rms, 2), "baseline_rms_dbfs": round(baseline, 2), "threshold_dbfs": round(threshold, 2)})
-        row = {"song": int(numbers[index]), "cut_seconds": cut,
-               "cut_sample": int(round(cut * stems[0].samplerate)),
-               "active_instruments": active, "safe": len(active) < 2}
+        active = list(active_instruments)
+        safe_final = accepted_cut is not None
+        row = {
+            "song": number,
+            "cut_seconds": cut,
+            "accepted_cut_seconds": accepted_cut,
+            "cut_sample": int(round(cut * stems[0].samplerate)),
+            "accepted_cut_sample": int(round(accepted_cut * stems[0].samplerate)) if accepted_cut is not None else None,
+            "sample_rate": int(stems[0].samplerate),
+            "per_stem_samples": {stem.path.name: int(round((cut - stem.offset_seconds) * stem.samplerate)) for stem in stems},
+            "active_instruments": active,
+            "active_voices": list(active_voices),
+            "safe": safe_final,
+            "needs_review": not safe_final,
+            "search": search,
+            "duration_seconds": float(segment.duration),
+            "accepted_duration_seconds": (accepted_cut - float(segment.start)) if accepted_cut is not None else None,
+        }
+        if not safe_final:
+            row["reason"] = f"active {', '.join(active) if active else 'music'} at proposed end"
         audit.append(row)
-        if len(active) >= 2:
-            raise RuntimeError(
-                "FINAL CUT GATE REJECTED render: "
-                f"song {numbers[index]} ends at {fmt_time(cut)} while multiple instruments are active: "
-                + ", ".join(str(item["stem"]) for item in active)
-            )
+        print(
+            f"FINAL CUT GATE {'PASSED' if safe_final else 'REJECTED'}: song {number} "
+            f"proposed={fmt_time(cut)} accepted={fmt_time(accepted_cut) if accepted_cut is not None else 'needs_review'} "
+            f"active={active}", flush=True,
+        )
     return audit
 
 

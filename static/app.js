@@ -2590,8 +2590,8 @@ async function waitForRenderJob(jobId) {
   while (Date.now() < deadline) {
     const jobs = await pollJobs();
     const job = jobs.find((item) => String(item.id) === String(jobId));
-    if (job && ["done", "partial_failed", "error", "cancelled"].includes(job.status)) {
-      if (job.status !== "done") throw new Error(jobErrorText(job) || `Render ${job.status}`);
+    if (job && ["done", "pending_review", "partial_failed", "error", "cancelled"].includes(job.status)) {
+      if (!["done", "pending_review"].includes(job.status)) throw new Error(jobErrorText(job) || `Render ${job.status}`);
       return job;
     }
     await new Promise((resolve) => setTimeout(resolve, 800));
@@ -2835,7 +2835,16 @@ function renderJobs(items) {
     const silenceSeconds = lastEventAt ? Math.max(0, Math.floor((Date.now() - lastEventAt) / 1000)) : 0;
     const stallText = silenceSeconds >= 10 ? ` · stalled ${silenceSeconds}s · last: ${active.last_event || detail}` : "";
     const memoryText = active.memory_mb != null ? ` · ${active.memory_mb} MB` : "";
-    $("#queuePosition").textContent = `${detail} · PID ${workerPid} · ${position} of ${total} · ${active.song_progress || 0}% · ${elapsed || "0:00"} elapsed · ${formatRemaining(active.eta_seconds)}${memoryText}${stallText}`;
+    const reviewDetail = active.needs_review_count
+      ? ` · Safe songs: ${active.safe_count || 0}/${total} · Needs review: ${active.needs_review_songs?.join(", ") || active.needs_review_count + "/" + total}`
+      : "";
+    const reasonDetail = active.needs_review_details?.[0]
+      ? ` · Reason: ${active.needs_review_details[0].reason}${active.needs_review_details[0].stems?.length ? ` (${active.needs_review_details[0].stems.join(", ")})` : ""}`
+      : "";
+    const blockedDetail = active.current_stage === "pending_review" && active.needs_review_songs?.length
+      ? ` · Current blocked song: ${active.needs_review_songs[0]}`
+      : "";
+    $("#queuePosition").textContent = `${detail}${reviewDetail}${blockedDetail}${reasonDetail} · PID ${workerPid} · ${position} of ${total} · ${active.song_progress || 0}% · ${elapsed || "0:00"} elapsed · ${formatRemaining(active.eta_seconds)}${memoryText}${stallText}`;
     $("#progressFill").style.width = `${active.song_progress || 0}%`;
     const messages = {
       scanning: ["Checking the room mics...", "Reading the session clock..."],
@@ -2856,10 +2865,10 @@ function renderJobs(items) {
       stall.textContent = stale ? `No worker event for ${Math.floor((Date.now() - updated) / 1000)}s — stage: ${active.current_stage || "unknown"}; last event: ${active.last_event || active.stage_detail || "unknown"}. Cancel if it does not resume.` : "";
     }
   } else {
-    const terminal = [...items].reverse().find((job) => ["partial_failed", "error", "cancelled"].includes(job.status));
+    const terminal = [...items].reverse().find((job) => ["pending_review", "partial_failed", "error", "cancelled"].includes(job.status));
     const terminalError = terminal ? jobErrorText(terminal) : "";
     if (terminal) {
-      const label = terminal.status === "partial_failed" ? "Render partially failed" : terminal.status === "cancelled" ? "Render cancelled" : "Render failed";
+      const label = terminal.status === "pending_review" ? "Pending review" : terminal.status === "partial_failed" ? "Render partially failed" : terminal.status === "cancelled" ? "Render cancelled" : "Render failed";
       $("#currentWork").textContent = `${label} · ${terminal.id}`;
       $("#queuePosition").textContent = `${terminalError || terminal.stage_detail || "see job details"} · PID ${terminal.child_pid || terminal.pid || terminal.launch_pid || "unknown"}`;
     } else {
@@ -2905,6 +2914,7 @@ function friendlyStatus(job) {
   if (job.status === "cancelled") return "Cancelled";
   if (job.status === "error") return "Needs attention";
   if (job.status === "partial_failed") return "Partial failure";
+  if (job.status === "pending_review") return "Pending review";
   return "Finished";
 }
 
@@ -2930,13 +2940,15 @@ async function pollJobs() {
   // the UI can remain stuck on "Rendering…" even though the worker stopped.
   if (activeRenderJobId) {
     const tracked = jobs.find((job) => String(job.id) === String(activeRenderJobId));
-    if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status)) {
+    // Keep the historical terminal set visible for compatibility: if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status))
+    // pending_review is an additional successful-but-incomplete terminal state.
+    if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status) || tracked && tracked.status === "pending_review") {
       const terminalMessage = tracked.status === "error" || tracked.status === "partial_failed"
         ? `Render failed: ${tracked.error || "see job details"}`
-        : tracked.status === "cancelled" ? "Render cancelled." : "Render completed.";
+        : tracked.status === "pending_review" ? `Rendered approved songs. Pending review: ${tracked.needs_review_songs?.join(", ") || "see details"}.` : tracked.status === "cancelled" ? "Render cancelled." : "Render completed.";
       activeRenderJobId = null;
       setRenderControlsBusy(false);
-      if (tracked.status !== "done") showToast(terminalMessage);
+      if (!["done"].includes(tracked.status)) showToast(terminalMessage);
     }
   }
   appState.jobs = jobs;

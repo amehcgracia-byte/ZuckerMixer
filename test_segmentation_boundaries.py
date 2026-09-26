@@ -92,6 +92,22 @@ class SegmentationBoundaryTests(unittest.TestCase):
         timelines = {"stem.wav": np.concatenate([np.ones(80), np.zeros(20)])}
         self.assertLess(pipeline.active_session_end_from_timelines([stem], timelines, 2000.0), 2000.0)
 
+    def test_final_gate_uses_shared_timeline_and_returns_review_instead_of_raising(self):
+        import numpy as np
+
+        stems = [
+            pipeline.Stem(Path("Guit.wav"), "Guit", "guitar", 100, 1, 100000, 1000.0, 100000, 0.0, "test"),
+            pipeline.Stem(Path("Snare.wav"), "Snare", "snare", 100, 1, 100000, 1000.0, 100000, 0.0, "test"),
+        ]
+        timelines = {stem.path.name: np.zeros(1000, dtype=float) for stem in stems}
+        for timeline in timelines.values():
+            timeline[590:603] = 1.0
+        segments = [pipeline.Segment(0.0, 600.0), pipeline.Segment(600.0, 1000.0)]
+        audit = pipeline.validate_final_render_boundaries(stems, segments, [21, 22], timelines)
+        self.assertTrue(audit[0]["needs_review"] is False)
+        self.assertEqual(audit[0]["accepted_cut_seconds"], 520.0)
+        self.assertEqual(audit[0]["per_stem_samples"]["Guit.wav"], 60000)
+
 
 if __name__ == "__main__":
     unittest.main()
