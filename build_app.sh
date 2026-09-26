@@ -147,7 +147,9 @@ EOF
 
   BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   SOURCE_REVISION="${ZUCKER_SOURCE_REVISION_OVERRIDE:-nogit}"
-  if [[ -z "${ZUCKER_SOURCE_REVISION_OVERRIDE:-}" ]] && git rev-parse --show-toplevel >/dev/null 2>&1; then
+  if [[ -n "${ZUCKER_SOURCE_REVISION_OVERRIDE:-}" ]]; then
+    SOURCE_REVISION="$ZUCKER_SOURCE_REVISION_OVERRIDE"
+  elif git rev-parse --show-toplevel >/dev/null 2>&1; then
     SOURCE_REVISION="$(git rev-parse HEAD)"
     if ! git diff --quiet -- . ':!build' ':!dist'; then
       SOURCE_REVISION+="-dirty"
