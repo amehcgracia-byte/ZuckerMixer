@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 APP_NAME="ZuckerMixer"
-APP_VERSION="2.1.10"
+APP_VERSION="2.1.11"
 APP_BUNDLE="$ROOT/dist/${APP_NAME}.app"
 DMG_ROOT="$ROOT/dist/dmg_root"
 DMG_PATH="$ROOT/dist/${APP_NAME}.dmg"
@@ -146,8 +146,8 @@ EOF
   "$BUILD_PYINSTALLER" --version >/dev/null || die "PyInstaller did not install correctly in .buildenv"
 
   BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  SOURCE_REVISION="nogit"
-  if git rev-parse --show-toplevel >/dev/null 2>&1; then
+  SOURCE_REVISION="${ZUCKER_SOURCE_REVISION_OVERRIDE:-nogit}"
+  if [[ -z "${ZUCKER_SOURCE_REVISION_OVERRIDE:-}" ]] && git rev-parse --show-toplevel >/dev/null 2>&1; then
     SOURCE_REVISION="$(git rev-parse HEAD)"
     if ! git diff --quiet -- . ':!build' ':!dist'; then
       SOURCE_REVISION+="-dirty"
