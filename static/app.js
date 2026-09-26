@@ -44,8 +44,10 @@ function renderBuildInfo() {
   const timestamp = build.build_timestamp || "development build";
   const revision = build.source_revision || "unbuilt";
   const version = build.app_version || "development";
+  const appHash = build.app_js_sha256 || "unavailable";
+  const pid = build.runtime_pid || "unknown";
   const node = $("#buildInfo");
-  if (node) node.textContent = `${version} · ${revision} · ${timestamp}`;
+  if (node) node.textContent = `ZuckerMixer ${version} · commit ${revision} · app.js ${appHash} · PID ${pid} · ${timestamp}`;
 }
 
 function renderSlotAudit() {

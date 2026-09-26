@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZuckerMixer</title>
     <link rel="icon" href="/static/zucker_logo_orange.png">
-    <link rel="stylesheet" href="/static/app.css?v=20260718-debounce">
+    <link rel="stylesheet" href="/static/app.css?v={{ static_version }}">
   </head>
   <body>
     <header class="topbar">
@@ -141,6 +141,6 @@
         setInterval(pollAnalysis, 1000);
       })();
     </script>
-    <script src="/static/app.js?v=20260926-slot-editing"></script>
+    <script src="/static/app.js?v={{ static_version }}"></script>
   </body>
 </html>

@@ -304,6 +304,20 @@ def load_build_metadata() -> dict[str, str]:
 BUILD_METADATA = load_build_metadata()
 
 
+def runtime_build_metadata() -> dict[str, str]:
+    """Identify the exact frozen resources serving the current WebView."""
+    payload = dict(BUILD_METADATA)
+    for name, key in (("app.js", "app_js_sha256"), ("app.css", "app_css_sha256")):
+        path = RESOURCE_ROOT / "static" / name
+        try:
+            payload[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            payload[key] = "unavailable"
+    payload["runtime_pid"] = str(os.getpid())
+    payload["runtime_bundle"] = str(RESOURCE_ROOT)
+    return payload
+
+
 def json_default(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -1732,7 +1746,7 @@ def _loading_state(error: str = "") -> dict[str, Any]:
         "segmentation_status": "not_available",
         "last_error": error,
         "whisper": pipeline.LAST_WHISPER_STATUS,
-        "build": BUILD_METADATA,
+        "build": runtime_build_metadata(),
     }
 
 
@@ -1836,7 +1850,7 @@ def public_state() -> dict[str, Any]:
             "import_error": pipeline.MATCHERING_IMPORT_ERROR,
             "reference": settings.get("matchering_reference", ""),
         },
-        "build": BUILD_METADATA,
+        "build": runtime_build_metadata(),
     }
 
 
@@ -3177,7 +3191,11 @@ def worker() -> None:
 
 @app.get("/")
 def index() -> str:
-    return render_template("index.html")
+    build = runtime_build_metadata()
+    return render_template(
+        "index.html",
+        static_version=f"{build.get('app_version', 'dev')}-{build.get('source_revision', 'unbuilt')}-{build.get('app_js_sha256', '')[:16]}",
+    )
 
 
 @app.get("/favicon.ico")
