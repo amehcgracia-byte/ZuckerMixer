@@ -734,7 +734,7 @@ function renderCutTools() {
   }
   const knownCountNode = $("#knownSongCount");
   if (knownCountNode && document.activeElement !== knownCountNode) {
-    knownCountNode.value = appState?.settings?.known_song_count ?? "";
+    knownCountNode.value = appState?.source_config?.expected_song_count ?? appState?.settings?.known_song_count ?? "";
   }
   const referenceNode = $("#matcheringReference");
   if (referenceNode && document.activeElement !== referenceNode) {
