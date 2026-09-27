@@ -133,6 +133,11 @@ AUTO_MIX_MAX_BOOST_DB = 0.0
 # capture would otherwise disappear. All other roles can only be attenuated
 # automatically. These limits are per song, never session-global.
 AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0}
+# Deliberate first-pass guitar trim: guitars were repeatedly masking vocals
+# in the user's real sessions. This is applied before per-song caps and is
+# included in the analysis signature so old plans cannot survive unnoticed.
+AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -3.0}
+AUTO_MIX_PROFILE_VERSION = 2
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -5544,7 +5549,7 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
     elif role == "vocal":
         bands = [("low", "highpass", 115, 0.707, 0.0), ("mid", "peaking", 3000, 0.9, 2.0), ("air", "highshelf", 11000, 0.707, 1.0)]
     elif role == "guitar":
-        bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 250, 1.0, -2.0), ("fixed", "peaking", 2800, 1.0, 1.0), ("air", "highshelf", 10000, 0.707, 0.0)]
+        bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 250, 1.0, -2.0), ("fixed", "peaking", 2800, 1.0, 0.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role in {"keys", "keys_l", "keys_r"}:
         bands = [("low", "highpass", 80, 0.707, 0.0), ("mid", "peaking", 320, 1.0, -2.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role in {"sax", "horn"}:
@@ -5642,7 +5647,7 @@ def base_level_db(role: str) -> float:
         "keys_l": -7.0,
         "keys_r": -7.0,
         "keys": -8.0,
-        "guitar": -7.5,
+        "guitar": -10.5,
         "synth": -11.0,
         "sax": -8.0,
         "horn": -8.0,
@@ -5664,7 +5669,7 @@ def automatic_makeup_gain_db(
     """
     requested = TARGET_TRACK_RMS_DBFS - float(raw_rms_db)
     cap = MAX_DRUM_MAKEUP_GAIN_DB if role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
-    gain = min(requested, cap) + base_level_db(role)
+    gain = min(requested, cap) + base_level_db(role) + AUTO_MIX_ROLE_TRIMS_DB.get(role, 0.0)
     if role_norm_db is not None and raw_rms_db > -90.0:
         # Move unusually loud/quiet performances toward the session's own
         # role norm without erasing genuine dynamics.
@@ -5725,7 +5730,7 @@ def per_song_auto_mix_gain_db(
     """Calculate a bounded balance correction for one stem in one song."""
     reference = float(accompaniment_reference_db) if accompaniment_reference_db is not None else TARGET_TRACK_RMS_DBFS
     target = reference + (2.0 if role == "vocal" else 0.5 if role == "bass" else 0.0)
-    requested = target - float(stem_active_level_db)
+    requested = target - float(stem_active_level_db) + AUTO_MIX_ROLE_TRIMS_DB.get(role, 0.0)
     upper = float(AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(role, AUTO_MIX_MAX_BOOST_DB))
     return float(np.clip(requested, AUTO_MIX_MAX_ATTENUATION_DB, upper))
 

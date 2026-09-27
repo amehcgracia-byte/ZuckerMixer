@@ -964,7 +964,7 @@ function clearCutLoading() { const box = $("#loadingStatus"); if (box && !docume
 function cutIsDirty() { const ui = cutSelector; return Boolean(ui && (Math.abs(ui.startValue - ui.originalStart) > 0.05 || Math.abs(ui.endValue - ui.originalEnd) > 0.05)); }
 function closeCutSelector() { if (!cutIsDirty() || window.confirm("Discard unsaved cut changes?")) { cutSelector.dialog.close("cancel"); clearCutLoading(); } }
 async function editAllCuts() {
-  const slots = visibleSongs().filter((song) => !song.skipped).map((song) => Number(song.id));
+  const slots = (appState.songs || []).filter((song) => Number.isFinite(Number(song.id))).map((song) => Number(song.id));
   if (!slots.length) return showToast("No slots available for Edit All.");
   cutSelector = null;
   const ui = ensureCutSelector();
