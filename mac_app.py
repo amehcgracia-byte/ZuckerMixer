@@ -125,13 +125,23 @@ def main() -> None:
                 "ZuckerMixer needs ffmpeg to create MP3 files.\n\nInstall it in Terminal with:\n\nbrew install ffmpeg",
             )
 
-    def on_closing() -> None:
+    def on_closing() -> bool:
+        if jam_app.has_active_jobs():
+            proceed = window.create_confirmation_dialog(
+                "Trabajos en curso",
+                "Hay una mezcla o análisis ejecutándose. Si cierras ahora se cancelará; "
+                "los resultados ya guardados se conservarán. ¿Cerrar?",
+            )
+            if not proceed:
+                return False
         threading.Thread(target=jam_app.stop_server, daemon=True).start()
+        return True
 
     window.events.loaded += on_loaded
     window.events.closing += on_closing
     webview.start(debug=False)
-    jam_app.wait_for_jobs_to_stop()
+    # Closing the WebView must never wait forever for Whisper/ffmpeg.
+    jam_app.wait_for_jobs_to_stop(timeout_seconds=5.0)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,6 @@ import json
 import math
 import mimetypes
 import os
-import pickle
 import queue
 import re
 import resource
@@ -54,6 +53,7 @@ REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
 SECOND_PASS_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "whisper_second_pass_candidate.json"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerPreviewCache"
 PREVIEW_DIR = PREVIEW_CACHE_ROOT / "default"
+SOURCE_CONFIG_PATH = ACTIVE_SOURCE_STATE_ROOT / "session_config.json"
 CUT_AUDIO_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerCutAudioCache"
 JOB_STATUS_DIR = STATE_ROOT / "job_status"
 JOB_STATUS_DIR.mkdir(parents=True, exist_ok=True)
@@ -756,12 +756,11 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "stems": stem_params,
     }
     plan_signature = mix_plan_signature(segment_id, segment, song_overrides)
-    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"mix_analysis_{segment_id}_{plan_signature}.pkl"
-    with cache_path.open("wb") as cache_file:
-        pickle.dump(analysis_cache, cache_file, protocol=pickle.HIGHEST_PROTOCOL)
+    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"mix_analysis_{segment_id}_{plan_signature}.npz"
+    pipeline.save_analysis_cache(cache_path, analysis_cache)
     plan["analysis_cache_path"] = str(cache_path)
     plan["analysis_cache_signature"] = plan_signature
-    plan["analysis_cache_version"] = 1
+    plan["analysis_cache_version"] = 2
     plan["effective_dsp_plan_hash"] = plan_signature
     save_mix_plan(segment_id, segment, song_overrides, plan)
     return plan
@@ -845,6 +844,49 @@ def save_settings(settings: dict[str, Any]) -> None:
     save_json(SETTINGS_PATH, settings)
 
 
+def default_source_config() -> dict[str, Any]:
+    return {
+        "config_version": 1,
+        "expected_song_count": None,
+        "min_song_seconds": 90.0,
+        "max_song_seconds": 4 * 3600.0,
+        "structural_min_song_seconds": 90.0,
+        "structural_max_song_seconds": 4 * 3600.0,
+        "structural_close_song_seconds": 90.0,
+        "min_final_song_seconds": 90.0,
+        "suspicious_short_song_seconds": 5 * 60.0,
+        "suspicious_long_song_seconds": 20 * 60.0,
+        "whisper_model": os.environ.get("ZUCKER_WHISPER_MODEL", "tiny"),
+        "whisper_timeout_seconds": float(os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "90")),
+        "ear_confirmed_splits": [],
+        "sanity_anchors": [],
+    }
+
+
+def load_source_config() -> dict[str, Any]:
+    config = load_json(SOURCE_CONFIG_PATH, {})
+    if not isinstance(config, dict):
+        config = {}
+    merged = default_source_config()
+    merged.update(config)
+    # Preserve a legacy target only for the source that owned the old setting.
+    if not SOURCE_CONFIG_PATH.exists():
+        legacy = load_settings()
+        legacy_source = str(legacy.get("source_folder") or "").strip()
+        if legacy_source and Path(legacy_source).expanduser().resolve() == Path(pipeline.SOURCE_DIR).expanduser().resolve():
+            raw_count = legacy.get("known_song_count")
+            if raw_count not in (None, ""):
+                try:
+                    merged["expected_song_count"] = int(raw_count)
+                except (TypeError, ValueError):
+                    pass
+    return merged
+
+
+def save_source_config(config: dict[str, Any]) -> None:
+    save_json(SOURCE_CONFIG_PATH, {**default_source_config(), **dict(config), "config_version": 1})
+
+
 def load_manual_splits() -> list[float]:
     payload = load_json(MANUAL_SPLITS_PATH, {"splits": []})
     values = payload.get("splits", []) if isinstance(payload, dict) else payload
@@ -862,7 +904,7 @@ def save_manual_splits(values: list[float]) -> None:
 
 
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, EDITOR_HISTORY_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, SECOND_PASS_CANDIDATE_PATH, PREVIEW_DIR
+    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, EDITOR_HISTORY_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, SECOND_PASS_CANDIDATE_PATH, PREVIEW_DIR, SOURCE_CONFIG_PATH
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.AUDIO_SCAN_REPORT = {
@@ -890,6 +932,8 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
     SECOND_PASS_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "whisper_second_pass_candidate.json"
     PREVIEW_DIR = PREVIEW_CACHE_ROOT / source_key
+    SOURCE_CONFIG_PATH = ACTIVE_SOURCE_STATE_ROOT / "session_config.json"
+    pipeline.configure_detection_profile(load_source_config())
     return source
 
 
@@ -1004,7 +1048,7 @@ def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int
                     except (OSError, ValueError):
                         continue
     files.sort()
-    return (str(source), tuple(mtimes), tuple(files))
+    return (f"{source}|profile={pipeline.DETECTION_PROFILE_SIGNATURE}", tuple(mtimes), tuple(files))
 
 
 def apply_saved_segment_selections(segments: list[pipeline.Segment], raw_songs: list[dict[str, Any]] | None = None) -> list[pipeline.Segment]:
@@ -1397,17 +1441,9 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     global pipeline_state, pipeline_state_signature
     settings = load_settings()
     pipeline.AUDIO_SCAN_MODE = str(settings.get("audio_scan_mode") or "auto")
-    raw_known_count = settings.get("known_song_count")
-    try:
-        pipeline.KNOWN_SONG_COUNT = int(raw_known_count) if raw_known_count not in (None, "") else None
-    except (TypeError, ValueError):
-        pipeline.KNOWN_SONG_COUNT = None
-    # The source-specific setting is the contract for this session. Keep the
-    # pipeline's hard-validation/reporting target in sync with it so a valid
-    # 24-song session is not reported as stale/incorrect against the generic
-    # 27-song default.
-    pipeline.EXPECTED_SONG_COUNT = pipeline.KNOWN_SONG_COUNT or 27
     configure_source_folder(settings.get("source_folder") or pipeline.SOURCE_DIR)
+    source_config = load_source_config()
+    pipeline.configure_detection_profile(source_config)
     signature = detection_state_signature()
     with state_lock:
         if pipeline_state is not None and pipeline_state_signature == signature:
@@ -1736,6 +1772,7 @@ def _loading_state(error: str = "") -> dict[str, Any]:
         "stems": stem_info,
         "overrides": load_json(OVERRIDES_PATH, {"songs": {}}),
         "settings": settings,
+        "source_config": load_source_config(),
         "jobs": current_jobs(),
         "output_dir": str(out_dir()),
         "average_render_seconds": 180.0,
@@ -1785,9 +1822,9 @@ def public_state() -> dict[str, Any]:
     }
     source_stems = state.get("stems", [])
     source_duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in source_stems), default=0.0)
-    expected_slot_count = int(settings.get("known_song_count") or pipeline.EXPECTED_SLOT_COUNT)
+    expected_slot_count = pipeline.EXPECTED_SLOT_COUNT
     incomplete_source = len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS
-    count_mismatch = len(raw_slots) != expected_slot_count
+    count_mismatch = expected_slot_count is not None and len(raw_slots) != expected_slot_count
     source_integrity = {
         "status": "Incomplete source segmentation" if incomplete_source else ("Needs review: candidate count differs from configured target" if count_mismatch else "ok"),
         "original_wav_required": True,
@@ -1833,6 +1870,7 @@ def public_state() -> dict[str, Any]:
         "stems": state["stem_info"],
         "overrides": overrides,
         "settings": settings,
+        "source_config": load_source_config(),
         "jobs": current_jobs(),
         "output_dir": str(out_dir()),
         "average_render_seconds": sum(render_seconds) / len(render_seconds) if render_seconds else 180.0,
@@ -3625,6 +3663,8 @@ def api_settings() -> Response:
         with state_lock:
             pipeline_state = None
             pipeline_state_signature = None
+    source_config = load_source_config()
+    source_config_changed = False
     if "audio_scan_mode" in payload:
         mode = str(payload.get("audio_scan_mode") or "auto")
         if mode not in {"auto", "aligned_only", "all"}:
@@ -3635,18 +3675,45 @@ def api_settings() -> Response:
         with state_lock:
             pipeline_state = None
             pipeline_state_signature = None
-    if "known_song_count" in payload:
-        raw_count = payload.get("known_song_count")
+    if "known_song_count" in payload or "expected_song_count" in payload:
+        raw_count = payload.get("expected_song_count", payload.get("known_song_count"))
         if raw_count in (None, ""):
-            settings["known_song_count"] = None
+            source_config["expected_song_count"] = None
         else:
             try:
                 count = int(raw_count)
             except (TypeError, ValueError):
-                return jsonify({"error": "known song count must be a whole number"}), 400
-            if not 1 <= count <= 200:
-                return jsonify({"error": "known song count must be between 1 and 200"}), 400
-            settings["known_song_count"] = count
+                return jsonify({"error": "expected song count must be a whole number"}), 400
+            if count < 1:
+                return jsonify({"error": "expected song count must be positive"}), 400
+            source_config["expected_song_count"] = count
+        source_config_changed = True
+    for key in ("min_song_seconds", "max_song_seconds", "structural_min_song_seconds", "structural_max_song_seconds", "structural_close_song_seconds", "min_final_song_seconds", "suspicious_short_song_seconds", "suspicious_long_song_seconds", "whisper_timeout_seconds"):
+        if key not in payload:
+            continue
+        try:
+            value = float(payload[key])
+        except (TypeError, ValueError):
+            return jsonify({"error": f"{key} must be numeric"}), 400
+        if value <= 0:
+            return jsonify({"error": f"{key} must be positive"}), 400
+        source_config[key] = value
+        source_config_changed = True
+    if "whisper_model" in payload:
+        model = str(payload.get("whisper_model") or "").strip()
+        if not model:
+            return jsonify({"error": "whisper_model cannot be empty"}), 400
+        source_config["whisper_model"] = model
+        source_config_changed = True
+    for key in ("ear_confirmed_splits", "sanity_anchors"):
+        if key in payload:
+            if not isinstance(payload[key], list):
+                return jsonify({"error": f"{key} must be a list"}), 400
+            source_config[key] = payload[key]
+            source_config_changed = True
+    if source_config_changed:
+        save_source_config(source_config)
+        pipeline.configure_detection_profile(source_config)
         with state_lock:
             pipeline_state = None
             pipeline_state_signature = None
@@ -3656,7 +3723,7 @@ def api_settings() -> Response:
             return jsonify({"error": "Matchering reference file not found"}), 400
         settings["matchering_reference"] = str(Path(reference).expanduser().resolve()) if reference else ""
     save_settings(settings)
-    return jsonify({"ok": True, "settings": settings})
+    return jsonify({"ok": True, "settings": settings, "source_config": load_source_config()})
 
 
 @app.post("/api/reset-automatic/<int:song_id>")

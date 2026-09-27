@@ -5,7 +5,15 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 APP_NAME="ZuckerMixer"
-APP_VERSION="2.1.13"
+VERSION_FILE="$ROOT/VERSION"
+if [[ -n "${ZUCKER_APP_VERSION:-}" ]]; then
+  APP_VERSION="$ZUCKER_APP_VERSION"
+elif [[ -f "$VERSION_FILE" ]]; then
+  APP_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+else
+  APP_VERSION="development"
+fi
+[[ -n "$APP_VERSION" ]] || APP_VERSION="development"
 APP_BUNDLE="$ROOT/dist/${APP_NAME}.app"
 DMG_ROOT="$ROOT/dist/dmg_root"
 DMG_PATH="$ROOT/dist/${APP_NAME}.dmg"
