@@ -3842,8 +3842,6 @@ def api_redetect(allow_whisper: bool = True) -> Response:
     return jsonify(job)
 
 
-@app.get("/api/redetect/candidate")
-
 def configured_slot_target() -> int | None:
     raw = getattr(pipeline, "EXPECTED_SLOT_COUNT", None)
     if raw in (None, ""):
@@ -3854,6 +3852,7 @@ def configured_slot_target() -> int | None:
         return None
 
 
+@app.get("/api/redetect/candidate")
 def api_redetect_candidate() -> Response:
     candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
     if not isinstance(candidate, dict):
