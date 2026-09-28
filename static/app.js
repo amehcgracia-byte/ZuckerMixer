@@ -3444,7 +3444,7 @@ if (typeof document !== "undefined") {
   // request. This keeps the analysis indicator live even while /api/state is
   // busy scanning and transcribing the source folder.
   pollJobs().catch((err) => console.warn("[initial jobs poll failed]", err));
-  setInterval(() => pollJobs().catch((err) => console.warn("[jobs poll failed]", err)), 1000);
+  setInterval(() => pollJobs().catch((err) => console.warn("[jobs poll failed]", err)), 3000);
   loadState();
   setTimeout(pollingLoop, 2000);
 }
