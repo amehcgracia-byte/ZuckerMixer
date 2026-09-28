@@ -8,6 +8,18 @@
     <link rel="stylesheet" href="/static/app.css?v={{ static_version }}">
   </head>
   <body>
+    <div id="loadingOverlay" hidden aria-live="polite">
+      <div class="loading-stage">
+        <img class="loading-stage-gif" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
+        <h2 id="loadingOverlayTitle">Working...</h2>
+        <p id="loadingOverlayDetail">Please wait...</p>
+        <p id="loadingOverlayFun" class="progress-fun"></p>
+        <div class="loading-stage-progress">
+          <div class="progress-track"><div id="loadingOverlayProgressFill"></div></div>
+          <span id="loadingOverlayPercent">0%</span>
+        </div>
+      </div>
+    </div>
     <header class="topbar">
       <div class="brand">
         <img src="/static/zucker_logo_orange.png" alt="ZuckerSession">
@@ -25,7 +37,6 @@
         <p id="songCount">Loading songs...</p>
         <p id="slotAudit" class="scan-warning" hidden></p>
         <div id="loadingStatus" class="loading-status" hidden>
-          <img class="loading-gif loading-status-gif" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="" aria-hidden="true">
           <strong id="loadingLabel">Scanning source folder...</strong>
           <span id="loadingDetail"></span>
           <div class="progress-track"><div id="loadingProgressFill"></div></div>
@@ -79,9 +90,6 @@
           <button id="secondWhisperPass" class="big ghost">Second Whisper pass</button>
         </div>
         <div class="progress-box">
-          <div class="loading-animation" aria-hidden="true">
-            <img class="loading-gif" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
-          </div>
           <div class="progress-text">
             <strong id="currentWork">Ready</strong>
             <span id="queuePosition">Ready</span>
