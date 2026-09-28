@@ -56,8 +56,27 @@ function renderSlotAudit() {
   const node = $("#slotAudit"); const audit = appState?.slot_audit;
   if (!node || !audit) return;
   const integrity = appState?.source_integrity || {};
-  node.hidden = !(audit.integrity_warning || integrity.warning);
-  node.textContent = integrity.warning || audit.integrity_warning || `Session ${audit.session_id || "unknown"}: ${audit.visible_slot_count} slots visible`;
+  const calibration = appState?.detection_calibration || {};
+  const strategy = calibration.strategy || {};
+  const whisper = appState?.whisper || strategy.whisper || {};
+  const candidatePending = Boolean(
+    appState?.candidate_pending
+    || appState?.segmentation_status === "candidate_pending"
+    || calibration.candidate_pending
+    || strategy.candidate_only
+  );
+  const transcriptCount = Number(whisper.transcript_count ?? whisper.completed_windows ?? 0);
+  const candidateWindows = Number(whisper.candidate_windows ?? 0);
+  const introductions = Number(
+    whisper.eligible_introductions
+    ?? strategy.whisper_eligible_introductions
+    ?? 0
+  );
+  const diagnostic = candidatePending
+    ? `Candidate pending review — not a valid single-song session. Whisper: ${candidateWindows ? `${transcriptCount}/${candidateWindows}` : transcriptCount || "—"} windows; eligible introductions: ${introductions}; visible diagnostic slots: ${audit.visible_slot_count}.`
+    : "";
+  node.hidden = !(candidatePending || audit.integrity_warning || integrity.warning);
+  node.textContent = diagnostic || integrity.warning || audit.integrity_warning || `Session ${audit.session_id || "unknown"}: ${audit.visible_slot_count} slots visible`;
 }
 
 function refreshSlotSummary() {
