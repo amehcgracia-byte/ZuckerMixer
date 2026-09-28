@@ -6704,7 +6704,7 @@ def measure_encoded_lufs(path: Path) -> float:
     )
     if result.returncode != 0:
         return float("nan")
-    matches = re.findall(r"\\bI:\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*LUFS", result.stderr or "")
+    matches = re.findall(r"\bI:\s*([-+]?\d+(?:\.\d+)?)\s*LUFS", result.stderr or "")
     if matches:
         return float(matches[-1])
     # Keep a compatibility fallback for FFmpeg builds that omit the summary
