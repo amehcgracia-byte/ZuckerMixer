@@ -3121,8 +3121,19 @@ function renderLoadingOverlay() {
     if (state.kind === "redetect" || state.current_stage === "transcribing speech") {
       const completed = Number(state.whisper_completed_windows || 0);
       const total = Number(state.whisper_total_windows || state.candidate_windows || 0);
+      const calibrationCurrent = Number(state.calibration_current || 0);
+      const calibrationTotal = Number(state.calibration_total || 0);
       const stageLabel = state.current_stage === "transcribing speech" ? "Whisper" : (state.current_stage || "Process");
-      renderLabel.textContent = total ? `${stageLabel} · ${completed}/${total}` : stageLabel;
+      const modelLoading = state.current_stage === "transcribing speech"
+        && !state.whisper_model_ready
+        && /loading|starting|runtime/i.test(String(state.stage_detail || ""));
+      renderLabel.textContent = modelLoading
+        ? `${stageLabel} · loading model`
+        : calibrationTotal
+          ? `${stageLabel} · ${calibrationCurrent}/${calibrationTotal}`
+          : total
+            ? `${stageLabel} · ${completed}/${total}`
+            : stageLabel;
     } else {
       const current = state.current_item || (state.current ? `Song ${String(state.current).padStart(2, "0")}` : "Current process");
       const total = state.total_count || (Array.isArray(state.songs) ? state.songs.length : "");

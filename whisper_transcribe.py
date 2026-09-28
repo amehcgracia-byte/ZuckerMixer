@@ -15,10 +15,11 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path, required=True)
     args = parser.parse_args()
 
-    from faster_whisper import WhisperModel
-
     requests = json.loads(args.input_json.read_text(encoding="utf-8"))
     total = len(requests)
+    print(json.dumps({"event": "worker_started", "total": total}), flush=True)
+    from faster_whisper import WhisperModel
+    print(json.dumps({"event": "runtime_ready", "total": total}), flush=True)
     print(json.dumps({"event": "model_loading", "total": total}), flush=True)
     model = WhisperModel(
         args.model,

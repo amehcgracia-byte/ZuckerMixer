@@ -195,6 +195,7 @@ SPEECH_DETECTION_ALGORITHM_VERSION = "20260827-whisper-v1"
 SPEECH_TRANSCRIPTION_CACHE_VERSION = "20260926-commentator-slots-v3"
 WHISPER_MODEL_SIZE = os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")
 WHISPER_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_IDLE_TIMEOUT_SECONDS", os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "300")))
+WHISPER_MODEL_START_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_MODEL_START_TIMEOUT_SECONDS", "60"))
 WHISPER_ENV = Path(__file__).resolve().parent / ".whisperenv"
 LAST_SPEECH_TRANSCRIPTIONS: list[dict[str, object]] = []
 LAST_WHISPER_STATUS: dict[str, object] = {"status": "not_started"}
@@ -1444,6 +1445,8 @@ def transcribe_speech_candidates(
             completed_windows = 0
             total_windows = max(1, len(requests))
             idle_timeout = max(180.0, float(effective_timeout or 300.0))
+            model_start_timeout = max(30.0, WHISPER_MODEL_START_TIMEOUT_SECONDS)
+            model_ready = False
             watchdog_reason = ""
             while process.poll() is None:
                 while True:
@@ -1458,15 +1461,18 @@ def transcribe_speech_candidates(
                     except (TypeError, ValueError):
                         continue
                     event_name = str(event.get("event") or "")
-                    if event_name in {"model_loading", "model_ready"}:
+                    if event_name in {"worker_started", "runtime_ready", "model_loading", "model_ready"}:
                         last_worker_activity = time.monotonic()
+                        model_ready = model_ready or event_name == "model_ready"
+                        stage_detail = {
+                            "worker_started": "Whisper worker started",
+                            "runtime_ready": "Whisper runtime loaded; loading model",
+                            "model_loading": "Whisper is loading the model",
+                            "model_ready": f"Whisper ready — processing {total_windows} windows",
+                        }.get(event_name, "Whisper starting")
                         report_progress({
                             "current_stage": "transcribing speech",
-                            "stage_detail": (
-                                "Whisper is loading the model"
-                                if event_name == "model_loading"
-                                else f"Whisper ready — processing {total_windows} windows"
-                            ),
+                            "stage_detail": stage_detail,
                             "progress": 70,
                             "process_progress": 0,
                             "song_progress": 0,
@@ -1475,6 +1481,7 @@ def transcribe_speech_candidates(
                             "candidate_windows": total_windows,
                             "whisper_completed_windows": completed_windows,
                             "whisper_total_windows": total_windows,
+                            "whisper_model_ready": model_ready,
                             "heartbeat": time.time(),
                         })
                     elif event_name == "window_complete":
@@ -1498,6 +1505,14 @@ def transcribe_speech_candidates(
                             "whisper_total_windows": total_windows,
                             "heartbeat": time.time(),
                         })
+                elapsed_total = time.monotonic() - whisper_started
+                if not model_ready and elapsed_total >= model_start_timeout:
+                    watchdog_reason = (
+                        f"Whisper model did not become ready after {int(elapsed_total)}s; "
+                        f"automatic fallback before window {completed_windows + 1}/{total_windows}"
+                    )
+                    process.kill()
+                    break
                 idle_seconds = time.monotonic() - last_worker_activity
                 if idle_seconds >= idle_timeout:
                     watchdog_reason = (
@@ -1533,6 +1548,8 @@ def transcribe_speech_candidates(
                     LAST_WHISPER_STATUS = {
                         "status": "timed_out",
                         "idle_timeout_seconds": idle_timeout,
+                        "model_start_timeout_seconds": model_start_timeout,
+                        "model_ready": model_ready,
                         "candidate_windows": total_windows,
                         "completed_windows": completed_windows,
                         "reason": watchdog_reason,
@@ -3713,7 +3730,7 @@ def auto_calibrate_detection(
         score = 100.0 - 100.0 * count_error - undercount_penalty - 25.0 * min(median_error, 2.0) - 20.0 * long_fraction
         if best is None or score > best[0]:
             best = (score, (voice, minimum, gap), data, segments)
-        report_progress({"current_stage": "calibrating detection", "stage_detail": f"Testing boundary sensitivity {config_index} of {len(configs)}", "progress": 82 + int(config_index / len(configs) * 10), "song_progress": 82 + int(config_index / len(configs) * 10), "heartbeat": time.time()})
+        report_progress({"current_stage": "calibrating detection", "stage_detail": f"Testing boundary sensitivity {config_index} of {len(configs)}", "progress": 82 + int(config_index / len(configs) * 10), "process_progress": int(config_index / len(configs) * 100), "song_progress": int(config_index / len(configs) * 100), "calibration_current": config_index, "calibration_total": len(configs), "heartbeat": time.time()})
     assert best is not None
     score, selected, data, segments = best
     MC_VOICE_ACTIVE_WITHIN_DB, MC_BREAK_MIN_SECONDS, MC_SCAN_MERGE_GAP_SECONDS = selected
@@ -3892,7 +3909,7 @@ def auto_calibrate_drum_fallback(
         })
         if best is None or score > best[0]:
             best = (score, threshold, gap, segments)
-        report_progress({"current_stage": "calibrating drum fallback", "stage_detail": f"Testing drum silence threshold/gap {index} of {total}", "progress": 92 + int(index / total * 6), "song_progress": 92 + int(index / total * 6), "heartbeat": time.time()})
+        report_progress({"current_stage": "calibrating drum fallback", "stage_detail": f"Testing drum silence threshold/gap {index} of {total}", "progress": 92 + int(index / total * 6), "process_progress": int(index / total * 100), "song_progress": int(index / total * 100), "calibration_current": index, "calibration_total": total, "heartbeat": time.time()})
     if best is None:
         return []
     score, threshold, gap, segments = best
