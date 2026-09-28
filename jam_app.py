@@ -1534,6 +1534,8 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
             pipeline.DETECTION_STRATEGY = {
                 **(pipeline.DETECTION_STRATEGY if isinstance(pipeline.DETECTION_STRATEGY, dict) else {}),
                 "id": "incomplete_source_segmentation",
+                "candidate_only": True,
+                "session_segmentation_usable": False,
                 "needs_review": True,
                 "reason": segments[0].boundary_validation_reason,
             }
@@ -1554,6 +1556,13 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     session_id = session_id_for_signature(signature)
     raw_songs = []
     strategy = getattr(pipeline, "DETECTION_STRATEGY", {})
+    candidate_pending = bool(
+        isinstance(strategy, dict)
+        and (
+            strategy.get("candidate_only")
+            or strategy.get("session_segmentation_usable") is False
+        )
+    )
     boundary_audit = strategy.get("boundary_audit", []) if isinstance(strategy, dict) else []
     for index, segment in enumerate(segments, 1):
         nominal_end = segment.nominal_end if segment.nominal_end is not None else segment.end
@@ -1643,9 +1652,13 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
             "stem_info": stems_payload,
             "active_stems_by_song": {},
             "audio_scan": pipeline.audio_scan_report(),
+            "segmentation_status": "candidate_pending" if candidate_pending else "ready",
+            "candidate_pending": candidate_pending,
             "detection_calibration": {
                 "count": detected_count,
                 "expected_minimum": pipeline.EXPECTED_SLOT_COUNT,
+                "candidate_pending": candidate_pending,
+                "session_segmentation_usable": not candidate_pending,
                 "expected_target": expected_count,
                 "unit": "commentator-led slot",
                 "ready_count": detected_count - needs_review_count,
@@ -1901,14 +1914,26 @@ def public_state() -> dict[str, Any]:
     expected_slot_count = pipeline.EXPECTED_SLOT_COUNT
     incomplete_source = len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS
     count_mismatch = expected_slot_count is not None and len(raw_slots) != expected_slot_count
+    candidate_pending = bool(
+        state.get("candidate_pending")
+        or state.get("detection_calibration", {}).get("candidate_pending")
+    )
     source_integrity = {
-        "status": "Incomplete source segmentation" if incomplete_source else ("Needs review: candidate count differs from configured target" if count_mismatch else "ok"),
+        "status": (
+            "Candidate pending review"
+            if candidate_pending
+            else ("Incomplete source segmentation" if incomplete_source else ("Needs review: candidate count differs from configured target" if count_mismatch else "ok"))
+        ),
         "original_wav_required": True,
         "stem_count": len(source_stems),
         "duration_sec": source_duration,
         "saved_slot_count": len(raw_slots),
         "expected_slot_count": expected_slot_count,
-        "warning": ("Source state incomplete; Original WAVs required; no destructive changes made." if incomplete_source else (f"Current slots: {len(raw_slots)}; configured target: {expected_slot_count}. Review Whisper proposals before export." if count_mismatch else "")),
+        "warning": (
+            "Whisper completed, but the slot list is only a review candidate; it is not a valid single-song session. Original WAVs and Edit Cuts are required."
+            if candidate_pending
+            else ("Source state incomplete; Original WAVs required; no destructive changes made." if incomplete_source else (f"Current slots: {len(raw_slots)}; configured target: {expected_slot_count}. Review Whisper proposals before export." if count_mismatch else ""))
+        ),
     }
     transitions = [
         {
@@ -1953,7 +1978,8 @@ def public_state() -> dict[str, Any]:
         "ffmpeg": ffmpeg_status(),
         "source_folder": str(pipeline.SOURCE_DIR),
         "audio_scan": state.get("audio_scan") or pipeline.audio_scan_report(),
-        "segmentation_status": "ready",
+        "segmentation_status": "candidate_pending" if candidate_pending else "ready",
+        "candidate_pending": candidate_pending,
         "last_error": last_load_error,
         "whisper": whisper_status,
         "detection_calibration": state.get("detection_calibration", {}),
