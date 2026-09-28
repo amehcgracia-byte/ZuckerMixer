@@ -3062,26 +3062,30 @@ function renderLoadingOverlay() {
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
   if (!busy) return;
-
   const stage = String(state.current_stage || state.stage || "").toLowerCase();
   const isRenderTask = ["render", "mix"].includes(String(state.kind || "").toLowerCase());
   const title = state.kind === "cut" ? (state.label || "Loading editor") :
     (state.status === "stopping" ? "Finishing the current task..." :
-      stage === "redetecting" || stage === "detecting songs" ? "Finding songs..." : "Working...");
+      stage.includes("preparing") || stage === "waiting" ? "Preparing the session..." :
+      stage.includes("redetect") || stage.includes("detecting") ? "Finding songs..." : "Working...");
   const detail = state.detail || state.stage_detail || "Please wait...";
   const progress = Number(state.kind === "redetect" ? state.progress : (state.progress ?? state.song_progress ?? 0));
   const renderProgress = Number(state.song_progress ?? 0);
   const messages = {
+    preparing: ["Opening the original session...", "Keeping every stem aligned..."],
     scanning: ["Checking the room mics...", "Reading the session clock..."],
-    "analyzing stems": ["Listening to the drummer...", "Counting the groove..."],
+    "analyzing stems": ["Listening to the drummer...", "Comparing the parallel stems..."],
+    "reading cached envelopes": ["Reusing the audio map...", "Reading cached activity envelopes..."],
+    "transcribing speech": ["Listening to the commentator...", "Waiting for Whisper's transcript..."],
     "detecting songs": ["Finding where the MC talks...", "Looking for the next song..."],
-    "second whisper pass": ["Asking Whisper to listen again...", "Looking for the missing introductions..."],
+    "validating cuts": ["Checking the proposed boundaries...", "Preparing the cuts for review..."],
     mixing: ["Balancing the band...", "Giving every stem its place..."],
     mastering: ["Making it loud enough for the bar...", "Polishing the final bounce..."],
     encoding: ["Packing the mix for listening...", "Putting the finishing label on it..."],
     loading: ["Warming up the tape machine...", "Finding the exact waveform..."],
   };
-  const choices = messages[stage] || (state.kind === "cut" ? messages.loading : ["Keeping the session moving...", "The band is still tuning..."]);
+  const messageKey = Object.keys(messages).find((key) => stage.includes(key));
+  const choices = messages[messageKey] || (state.kind === "cut" ? messages.loading : ["Keeping the session moving...", "The band is still tuning..."]);
   const fun = choices[Math.floor(Date.now() / 5000) % choices.length];
   const safeProgress = Math.max(0, Math.min(100, Number.isFinite(progress) ? progress : 0));
   const safeRenderProgress = Math.max(0, Math.min(100, Number.isFinite(renderProgress) ? renderProgress : 0));
@@ -3094,6 +3098,10 @@ function renderLoadingOverlay() {
   const renderLabel = $("#loadingRenderLabel");
   const renderFill = $("#loadingRenderProgressFill");
   const renderPercent = $("#loadingRenderPercent");
+  const phaseList = $("#loadingPhaseList");
+  const activityAge = $("#loadingActivityAge");
+  const health = $("#loadingOverlayHealth");
+  const songStates = $("#loadingSongStates");
   if (titleNode) titleNode.textContent = title;
   if (detailNode) detailNode.textContent = detail;
   if (funNode) funNode.textContent = fun;
@@ -3107,6 +3115,65 @@ function renderLoadingOverlay() {
   }
   if (renderFill) renderFill.style.width = String(safeRenderProgress) + "%";
   if (renderPercent) renderPercent.textContent = String(Math.round(safeRenderProgress)) + "%";
+  const phases = [
+    ["prepare", "Prepare original session"],
+    ["scan", "Scan WAV stems"],
+    ["cache", "Read audio envelopes"],
+    ["analyze", "Analyze instruments"],
+    ["whisper", "Transcribe commentator"],
+    ["merge", "Merge song boundaries"],
+    ["review", "Prepare cuts"],
+  ];
+  const phaseIndex = Number.isFinite(Number(state.phase_index)) ? Number(state.phase_index) : (
+    stage.includes("prepar") || stage === "waiting" ? 0 :
+    stage.includes("scanning") ? 1 :
+    stage.includes("cached") || stage.includes("envelope") ? 2 :
+    stage.includes("analyz") || stage.includes("activity") ? 3 :
+    stage.includes("transcrib") || stage.includes("whisper") ? 4 :
+    stage.includes("validat") ? 6 : 5
+  );
+  if (phaseList) {
+    phaseList.innerHTML = phases.map((phase, index) => {
+      const cls = index < phaseIndex ? "done" : index === phaseIndex ? "active" : "";
+      const mark = index < phaseIndex ? "✓" : index === phaseIndex ? "●" : "○";
+      return `<div class="loading-phase ${cls}"><span class="loading-phase-mark">${mark}</span><span>${phase[1]}</span></div>`;
+    }).join("");
+  }
+  if (songStates) {
+    const rows = Array.isArray(state.batch_summary?.songs) ? state.batch_summary.songs : [];
+    if (rows.length) {
+      songStates.innerHTML = rows.map((row) => {
+        const number = row.song ?? row.index ?? row.id ?? "?";
+        const status = String(row.status || row.state || "queued").toLowerCase();
+        const cls = status.includes("fail") || status.includes("error") ? "error" : status === "done" || status === "completed" ? "done" : Number(number) === Number(state.current) ? "active" : "";
+        return `<div class="loading-song-state ${cls}"><span>Song ${String(number).padStart(2, "0")}</span><span>${esc(row.detail || row.status || row.state || "queued")}</span></div>`;
+      }).join("");
+    } else if (isRenderTask && Array.isArray(state.songs) && state.songs.length) {
+      const current = Number(state.current);
+      songStates.innerHTML = state.songs.map((number) => {
+        const cls = Number(number) === current ? "active" : (Number(number) <= Number(state.done_count || 0) ? "done" : "");
+        return `<div class="loading-song-state ${cls}"><span>Song ${String(number).padStart(2, "0")}</span><span>${cls === "active" ? "working" : cls === "done" ? "done" : "queued"}</span></div>`;
+      }).join("");
+    } else {
+      const facts = [
+        state.stem_count ? `${state.stem_count} stems` : "",
+        state.candidate_windows ? `${state.candidate_windows} speech windows` : "",
+        state.transcript_count ? `${state.transcript_count} transcripts` : "",
+        state.candidate_count ? `${state.candidate_count} song candidates` : "",
+      ].filter(Boolean);
+      songStates.innerHTML = facts.length ? `<div class="loading-song-state"><span>Detection status</span><span>${esc(facts.join(" · "))}</span></div>` : "";
+    }
+  }
+  const lastUpdate = Number(state.progress_updated_at || state.heartbeat || state.updated_at || 0) * 1000;
+  const age = lastUpdate ? Math.max(0, Math.floor((Date.now() - lastUpdate) / 1000)) : 0;
+  if (activityAge) activityAge.textContent = age ? `updated ${age}s ago` : "updating now";
+  if (health) {
+    const stale = age >= 12;
+    health.classList.toggle("stale", stale);
+    health.textContent = stale
+      ? `No new worker event for ${age}s. Still in “${state.current_stage || "unknown"}”; the process may be reading a large source or blocked.`
+      : (state.last_event || detail || "Worker is active.");
+  }
 }
 
 function setLoadingOverlayJob(job) {
@@ -3259,9 +3326,12 @@ async function pollJobs() {
     doneCount: job.done_count,
     totalCount: job.total_count,
   })));
-  // The live job poll starts before the initial state request. Do not let a
-  // fast /api/jobs response dereference the not-yet-hydrated state object.
-  if (!appState) return jobs;
+  // The live job poll starts before the initial state request. Render the
+  // loading overlay even before /api/state has finished hydrating.
+  if (!appState) {
+    renderJobs(jobs);
+    return jobs;
+  }
   // A native save-dialog callback can interrupt the original promise chain.
   // Always release the controls when the tracked job is terminal, otherwise
   // the UI can remain stuck on "Rendering…" even though the worker stopped.

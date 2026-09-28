@@ -1678,6 +1678,15 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
     if is_redetect and had_previous_snapshot:
         shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_BACKUP_PATH)
     append_log(job_id, "Searching again from a clean deterministic detection pass; suspicious regions will be rescanned.")
+    app_progress({
+        "current_stage": "preparing session",
+        "stage_detail": "Preparing full original session — loading source signature and source configuration",
+        "progress": 3,
+        "song_progress": 3,
+        "phase_index": 0,
+        "phase_total": 7,
+        "heartbeat": time.time(),
+    })
     pipeline.DETECTION_RESCAN_MODE = True
     with state_lock:
         pipeline_state = None
@@ -2820,12 +2829,14 @@ def _run_child_job(job_path: Path) -> int:
         app_progress(
             {
                 "status": "running",
-                "current_stage": "detecting songs",
-                "stage_detail": "reading cached envelopes",
+                "current_stage": "preparing session",
+                "stage_detail": "Preparing full original session — checking source signature",
                 "started": time.time(),
                 "heartbeat": time.time(),
-                "progress": 5,
-                "song_progress": 10,
+                "progress": 2,
+                "song_progress": 2,
+                "phase_index": 0,
+                "phase_total": 7,
             }
         )
         rebuild_detection_state(job_id)

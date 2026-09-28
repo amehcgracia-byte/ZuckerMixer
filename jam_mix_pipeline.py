@@ -838,7 +838,7 @@ def inspect_stems(source_dir: Path) -> list[Stem]:
     total_bytes = sum(max(0, path.stat().st_size) for path in paths)
     bytes_done = 0
     scan_started = time.perf_counter()
-    report_progress({"current_stage": "scanning folder", "stage_detail": f"Scanning source folder — 0 of {len(paths)} files", "progress": 1, "song_progress": 1, "elapsed_seconds": 0.0, "eta_seconds": None, "bytes_read": 0, "bytes_total": total_bytes, "heartbeat": time.time()})
+    report_progress({"current_stage": "scanning folder", "stage_detail": f"Scanning source folder — 0 of {len(paths)} files", "progress": 8, "song_progress": 8, "phase_index": 1, "phase_total": 7, "stem_count": len(paths), "elapsed_seconds": 0.0, "eta_seconds": None, "bytes_read": 0, "bytes_total": total_bytes, "heartbeat": time.time()})
     for file_index, path in enumerate(paths, 1):
         try:
             info = sf.info(str(path))
@@ -1403,45 +1403,65 @@ def transcribe_speech_candidates(
             input_json, output_json = temp_dir / "requests.json", temp_dir / "results.json"
             input_json.write_text(json.dumps(requests), encoding="utf-8")
             model_dir = Path.home() / "Library" / "Application Support" / "ZuckerMixer" / "whisper"
-            report_progress({"current_stage": "transcribing speech", "stage_detail": f"Whisper: {len(requests)} candidate windows", "progress": 84, "song_progress": 84, "heartbeat": time.time()})
+            report_progress({"current_stage": "transcribing speech", "stage_detail": f"Preparing Whisper for {len(requests)} commentator windows", "progress": 70, "song_progress": 70, "phase_index": 4, "phase_total": 7, "candidate_windows": len(requests), "heartbeat": time.time()})
             command = [str(whisper_python), str(worker), "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
-            try:
-                completed = subprocess.run(
-                    command,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=effective_timeout,
-                )
-            except subprocess.TimeoutExpired as exc:
-                legacy_results = compatible_legacy_transcript()
-                if legacy_results is not None:
-                    results = legacy_results
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            whisper_started = time.monotonic()
+            while process.poll() is None:
+                elapsed = time.monotonic() - whisper_started
+                report_progress({
+                    "current_stage": "transcribing speech",
+                    "stage_detail": f"Whisper is transcribing {len(requests)} windows — {int(elapsed)}s elapsed",
+                    "progress": 72,
+                    "song_progress": 72,
+                    "phase_index": 4,
+                    "phase_total": 7,
+                    "candidate_windows": len(requests),
+                    "elapsed_seconds": elapsed,
+                    "heartbeat": time.time(),
+                })
+                if elapsed >= effective_timeout:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    legacy_results = compatible_legacy_transcript()
+                    if legacy_results is not None:
+                        results = legacy_results
+                        LAST_WHISPER_STATUS = {
+                            "status": "available_cached",
+                            "candidate_windows": len(requests),
+                            "reason": "current Whisper pass timed out; reused compatible same-source transcript",
+                            "timeout_seconds": effective_timeout,
+                        }
+                    else:
+                        LAST_WHISPER_STATUS = {
+                            "status": "timed_out",
+                            "timeout_seconds": effective_timeout,
+                            "candidate_windows": len(requests),
+                            "stdout": str(stdout or "")[-2000:],
+                            "stderr": str(stderr or "")[-2000:],
+                        }
+                        raise RuntimeError(f"Whisper timed out after {effective_timeout:.0f}s")
+                    break
+                time.sleep(2)
+            else:
+                stdout, stderr = process.communicate()
+                if process.returncode != 0:
                     LAST_WHISPER_STATUS = {
-                        "status": "available_cached",
-                        "candidate_windows": len(requests),
-                        "reason": "current Whisper pass timed out; reused compatible same-source transcript",
-                        "timeout_seconds": effective_timeout,
+                        "status": "error",
+                        "returncode": process.returncode,
+                        "stdout": str(stdout or "")[-2000:],
+                        "stderr": str(stderr or "")[-2000:],
                     }
-                else:
-                    LAST_WHISPER_STATUS = {
-                        "status": "timed_out",
-                        "timeout_seconds": effective_timeout,
-                        "candidate_windows": len(requests),
-                        "stdout": str(exc.stdout or "")[-2000:],
-                        "stderr": str(exc.stderr or "")[-2000:],
-                    }
-                    raise RuntimeError(f"Whisper timed out after {effective_timeout:.0f}s") from exc
-            except subprocess.CalledProcessError as exc:
-                LAST_WHISPER_STATUS = {
-                    "status": "error",
-                    "returncode": exc.returncode,
-                    "stdout": str(exc.stdout or "")[-2000:],
-                    "stderr": str(exc.stderr or "")[-2000:],
-                }
-                raise RuntimeError(f"Whisper exited with code {exc.returncode}") from exc
+                    raise RuntimeError(f"Whisper exited with code {process.returncode}")
+                completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
             if results is None:
                 results = json.loads(output_json.read_text(encoding="utf-8"))
+                report_progress({"current_stage": "transcribing speech", "stage_detail": f"Whisper returned {len(results)} transcript windows", "progress": 88, "song_progress": 88, "phase_index": 4, "phase_total": 7, "transcript_count": len(results), "heartbeat": time.time()})
                 LAST_WHISPER_STATUS = {
                     "status": "available",
                     "candidate_windows": len(requests),
@@ -1481,6 +1501,7 @@ def transcribe_speech_candidates(
         # introduction-less song and trip the structural invariant.
         result["speech_intro_text"] = " ".join(intro_texts).strip() or (text if result["announcement"] else "")
     LAST_SPEECH_TRANSCRIPTIONS = results
+    report_progress({"current_stage": "merging song boundaries", "stage_detail": f"Classifying {len(results)} transcript windows and extracting introductions", "progress": 91, "song_progress": 91, "phase_index": 5, "phase_total": 7, "transcript_count": len(results), "heartbeat": time.time()})
     if not LAST_SPEECH_TRANSCRIPTIONS:
         LAST_WHISPER_STATUS = {"status": "unavailable", "reason": "no transcriptions returned"}
         raise RuntimeError("Whisper is mandatory for detection but produced no transcriptions.")
@@ -2979,9 +3000,10 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         return segments, np.array([], dtype=np.float32)
 
     print("\nSONG DETECTION")
-    report_progress({"current_stage": "analyzing stems", "stage_detail": f"analyzing {len(stems)} stems before detecting song boundaries", "progress": 82, "song_progress": 82, "heartbeat": time.time()})
+    report_progress({"current_stage": "reading cached envelopes", "stage_detail": f"Reading cached activity envelopes for {len(stems)} parallel stems", "progress": 24, "song_progress": 24, "phase_index": 2, "phase_total": 7, "stem_count": len(stems), "heartbeat": time.time()})
     print("Loading cached per-stem RMS envelopes for MC-break detection...", flush=True)
     timelines = load_cached_timelines_or_die(stems, "Detection")
+    report_progress({"current_stage": "analyzing stems", "stage_detail": f"Comparing activity across {len(stems)} stems", "progress": 38, "song_progress": 38, "phase_index": 3, "phase_total": 7, "stem_count": len(stems), "heartbeat": time.time()})
     durations = sorted(s.offset_seconds + s.timeline_duration for s in stems)
     metadata_session_end = max(durations)
     session_end = active_session_end_from_timelines(stems, timelines, metadata_session_end)
@@ -3010,6 +3032,7 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     if not instrument_stems:
         raise RuntimeError("No instrument stems found for MC-break detection.")
 
+    report_progress({"current_stage": "analyzing stems", "stage_detail": "Finding commentator transition candidates", "progress": 54, "song_progress": 54, "phase_index": 3, "phase_total": 7, "heartbeat": time.time()})
     mc_data, calibrated_segments = auto_calibrate_detection(voice_stems, instrument_stems, timelines, session_end)
     probe_segments = calibrated_segments
     if not probe_segments:
