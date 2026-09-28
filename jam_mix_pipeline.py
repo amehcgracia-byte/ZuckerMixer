@@ -195,7 +195,9 @@ SPEECH_DETECTION_ALGORITHM_VERSION = "20260827-whisper-v1"
 SPEECH_TRANSCRIPTION_CACHE_VERSION = "20260926-commentator-slots-v3"
 WHISPER_MODEL_SIZE = os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")
 WHISPER_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_IDLE_TIMEOUT_SECONDS", os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "300")))
-WHISPER_MODEL_START_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_MODEL_START_TIMEOUT_SECONDS", "60"))
+# Model construction may include a first-run model download or CPU
+# initialization. Do not count the process-import time against this watchdog.
+WHISPER_MODEL_START_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_MODEL_START_TIMEOUT_SECONDS", "180"))
 WHISPER_ENV = Path(__file__).resolve().parent / ".whisperenv"
 LAST_SPEECH_TRANSCRIPTIONS: list[dict[str, object]] = []
 LAST_WHISPER_STATUS: dict[str, object] = {"status": "not_started"}
@@ -1447,6 +1449,7 @@ def transcribe_speech_candidates(
             idle_timeout = max(180.0, float(effective_timeout or 300.0))
             model_start_timeout = max(30.0, WHISPER_MODEL_START_TIMEOUT_SECONDS)
             model_ready = False
+            model_loading_started: float | None = None
             watchdog_reason = ""
             while process.poll() is None:
                 while True:
@@ -1463,6 +1466,8 @@ def transcribe_speech_candidates(
                     event_name = str(event.get("event") or "")
                     if event_name in {"worker_started", "runtime_ready", "model_loading", "model_ready"}:
                         last_worker_activity = time.monotonic()
+                        if event_name == "model_loading" and model_loading_started is None:
+                            model_loading_started = time.monotonic()
                         model_ready = model_ready or event_name == "model_ready"
                         stage_detail = {
                             "worker_started": "Whisper worker started",
@@ -1505,11 +1510,17 @@ def transcribe_speech_candidates(
                             "whisper_total_windows": total_windows,
                             "heartbeat": time.time(),
                         })
-                elapsed_total = time.monotonic() - whisper_started
-                if not model_ready and elapsed_total >= model_start_timeout:
+                # Runtime import and model construction are separate phases.
+                # Start the model watchdog when the worker explicitly reports
+                # model_loading, so a first-run download/CPU initialization is
+                # not mistaken for a dead Whisper worker.
+                model_watch_started = model_loading_started or whisper_started
+                model_elapsed = time.monotonic() - model_watch_started
+                if not model_ready and model_elapsed >= model_start_timeout:
                     watchdog_reason = (
-                        f"Whisper model did not become ready after {int(elapsed_total)}s; "
-                        f"automatic fallback before window {completed_windows + 1}/{total_windows}"
+                        f"Whisper model did not become ready after {int(model_elapsed)}s "
+                        f"of model loading; automatic fallback before window "
+                        f"{completed_windows + 1}/{total_windows}"
                     )
                     process.kill()
                     break
