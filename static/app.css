@@ -778,8 +778,8 @@ button:active:not(:disabled), button.active { transform: translateY(0); backgrou
 .loading-phase.done { color: #b9e6b6; border-color: rgba(127, 218, 152, .42); }
 .loading-phase.active { color: var(--cream); border-color: var(--orange2); background: rgba(200, 111, 47, .32); }
 .loading-phase-mark { width: 1.2em; text-align: center; font-weight: 900; }
-.loading-song-states { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 5px; max-height: 120px; overflow: auto; }
-.loading-song-state { display: flex; justify-content: space-between; gap: 8px; padding: 6px 8px; border-radius: 6px; background: rgba(12, 10, 8, .42); color: var(--muted); font-size: .75rem; }
+.loading-song-states { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 5px; max-height: 210px; min-height: 28px; overflow: auto; scrollbar-color: rgba(236, 163, 94, .7) rgba(12, 10, 8, .35); }
+.loading-song-state { display: flex; justify-content: space-between; gap: 8px; padding: 6px 8px; border-radius: 6px; background: rgba(12, 10, 8, .42); color: var(--muted); font-size: .75rem; }\n.loading-song-state span:last-child { overflow-wrap: anywhere; text-align: right; }\n.loading-song-state:not(.active):not(.done):not(.error) { opacity: .76; }
 .loading-song-state.active { color: var(--cream); outline: 1px solid rgba(236, 163, 94, .62); }
 .loading-song-state.done { color: #b9e6b6; }
 .loading-song-state.error { color: #ffb09d; }
