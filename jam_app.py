@@ -1675,7 +1675,11 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
     global pipeline_state, pipeline_state_signature
     is_redetect = job_id != "detect"
     had_previous_snapshot = DETECTION_STATE_PATH.exists()
+    previous_count = 0
     if is_redetect and had_previous_snapshot:
+        previous_snapshot = load_json(DETECTION_STATE_PATH, {})
+        if isinstance(previous_snapshot, dict):
+            previous_count = len(previous_snapshot.get("raw_songs", []) or [])
         shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_BACKUP_PATH)
     append_log(job_id, "Searching again from a clean deterministic detection pass; suspicious regions will be rescanned.")
     app_progress({
@@ -1697,11 +1701,35 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
         candidate_count = len(state.get("raw_songs", []))
         if is_redetect:
             if candidate_count < 2:
+                incomplete_reason = (
+                    f"Fresh detection produced only {candidate_count} slot(s); "
+                    f"the current session with {previous_count} slot(s) was preserved."
+                )
+                # Keep the one-slot result as a diagnostic candidate, but never
+                # let it replace the usable session or turn a recoverable
+                # Whisper miss into a worker crash.
+                if DETECTION_STATE_PATH.exists():
+                    shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
                 if REDETECTION_BACKUP_PATH.exists():
                     shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
-                raise RuntimeError(
-                    f"Re-detect produced only {candidate_count} slot(s); previous session preserved and not replaced."
-                )
+                append_log(job_id, "INCOMPLETE REDetect: " + incomplete_reason)
+                app_progress({
+                    "status": "pending_review",
+                    "current_stage": "pending_review",
+                    "stage_detail": incomplete_reason,
+                    "warning": incomplete_reason,
+                    "candidate_count": candidate_count,
+                    "previous_count": previous_count,
+                    "heartbeat": time.time(),
+                    "progress": 100,
+                    "song_progress": 100,
+                })
+                incomplete_state = dict(state)
+                incomplete_state["_redetect_outcome"] = "incomplete"
+                incomplete_state["_redetect_candidate_count"] = candidate_count
+                incomplete_state["_redetect_previous_count"] = previous_count
+                incomplete_state["_redetect_warning"] = incomplete_reason
+                return incomplete_state
             shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
             if REDETECTION_BACKUP_PATH.exists():
                 shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
@@ -2839,16 +2867,31 @@ def _run_child_job(job_path: Path) -> int:
                 "phase_total": 7,
             }
         )
-        rebuild_detection_state(job_id)
-        app_progress({
-            "status": "pending_confirmation",
-            "current_stage": "validating cuts",
-            "stage_detail": "New full-session detection ready for comparison; current session unchanged",
-            "heartbeat": time.time(),
-            "progress": 100,
-            "song_progress": 100,
-            "done_count": 1,
-        })
+        redetect_result = rebuild_detection_state(job_id)
+        if redetect_result.get("_redetect_outcome") == "incomplete":
+            warning = str(redetect_result.get("_redetect_warning") or "Fresh detection was incomplete; current session preserved.")
+            app_progress({
+                "status": "pending_review",
+                "current_stage": "pending_review",
+                "stage_detail": warning,
+                "warning": warning,
+                "candidate_count": redetect_result.get("_redetect_candidate_count", 0),
+                "previous_count": redetect_result.get("_redetect_previous_count", 0),
+                "heartbeat": time.time(),
+                "progress": 100,
+                "song_progress": 100,
+                "done_count": 1,
+            })
+        else:
+            app_progress({
+                "status": "pending_confirmation",
+                "current_stage": "validating cuts",
+                "stage_detail": "New full-session detection ready for comparison; current session unchanged",
+                "heartbeat": time.time(),
+                "progress": 100,
+                "song_progress": 100,
+                "done_count": 1,
+            })
         return 0
 
     state = load_render_state()
