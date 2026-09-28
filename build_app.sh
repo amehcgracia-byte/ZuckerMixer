@@ -16,7 +16,7 @@ fi
 [[ -n "$APP_VERSION" ]] || APP_VERSION="development"
 APP_BUNDLE="$ROOT/dist/${APP_NAME}.app"
 DMG_ROOT="$ROOT/dist/dmg_root"
-DMG_PATH="$ROOT/dist/${APP_NAME}.dmg"
+DMG_PATH="$ROOT/dist/${APP_NAME}-${APP_VERSION}.dmg"
 LOGO_SRC="$ROOT/static/zucker_logo_orange.png"
 ICONSET="$ROOT/build/zucker.iconset"
 ICNS="$ROOT/zucker.icns"
@@ -292,7 +292,7 @@ cp "$DMG_BG" "$DMG_ROOT/.background/background.png" || die "Could not copy DMG b
 if command -v create-dmg >/dev/null 2>&1; then
   rm -f "$DMG_ROOT/Applications"
   create-dmg \
-    --volname "$APP_NAME" \
+    --volname "${APP_NAME} ${APP_VERSION}" \
     --volicon "$ICNS" \
     --background "$DMG_BG" \
     --window-pos 200 120 \
@@ -308,7 +308,7 @@ else
   ln -s /Applications "$DMG_ROOT/Applications" || die "Could not create Applications symlink"
   SetFile -a C "$DMG_ROOT" 2>/dev/null || true
   hdiutil create \
-    -volname "$APP_NAME" \
+    -volname "${APP_NAME} ${APP_VERSION}" \
     -srcfolder "$DMG_ROOT" \
     -ov \
     -format UDZO \
