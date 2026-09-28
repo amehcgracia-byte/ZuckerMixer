@@ -81,6 +81,20 @@ app = Flask(
     template_folder=str(RESOURCE_ROOT / "templates"),
 )
 
+
+@app.after_request
+def add_static_cache_headers(response: Response) -> Response:
+    """Cache versioned UI assets while leaving API responses uncached."""
+    if request.path.startswith("/static/") or request.path == "/favicon.ico":
+        if request.args.get("v"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            # Unversioned media (the loading GIF/logo) gets a short cache so
+            # asset replacements become visible without a hard refresh.
+            response.headers["Cache-Control"] = "public, max-age=3600, must-revalidate"
+    return response
+
+
 state_lock = threading.RLock()
 pipeline_state_build_lock = threading.Lock()
 job_queue: queue.Queue[dict[str, Any]] = queue.Queue()
