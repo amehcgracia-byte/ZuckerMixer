@@ -3076,7 +3076,7 @@ async function resetSongToAutomatic(songId) {
 function renderLoadingOverlay() {
   const overlay = $("#loadingOverlay");
   if (!overlay) return;
-  const state = loadingOverlayJob || loadingOverlayCut;
+  // A cut-editor load is local and must not be obscured by a background\n  // Whisper/redetect job. Once the editor is ready, the background job can\n  // become visible again.\n  const state = loadingOverlayCut || loadingOverlayJob;
   const busy = Boolean(state);
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
@@ -3186,19 +3186,38 @@ function renderLoadingOverlay() {
     }).join("");
   }
   if (songStates) {
-    const rows = Array.isArray(state.batch_summary?.songs) ? state.batch_summary.songs : [];
-    if (rows.length) {
-      songStates.innerHTML = rows.map((row) => {
+    const summaryRows = Array.isArray(state.batch_summary?.songs) ? state.batch_summary.songs : [];
+    const requested = Array.isArray(state.songs) ? state.songs : [];
+    const summaryByNumber = new Map(summaryRows.map((row) => {
+      const number = Number(row.song ?? row.index ?? row.id);
+      return [Number.isFinite(number) ? number : String(row.song ?? row.index ?? row.id ?? ""), row];
+    }));
+    const queueRows = requested.length
+      ? requested.map((number, index) => {
+        const numericNumber = Number(number);
+        const summary = summaryByNumber.get(numericNumber);
+        if (summary) return { ...summary, song: number };
+        const isCurrent = numericNumber === Number(state.current);
+        const isDone = !isCurrent && index < Number(state.done_count || 0);
+        return {
+          song: number,
+          status: isCurrent ? "working" : isDone ? "done" : "queued",
+          detail: isCurrent ? "working" : isDone ? "done" : "queued",
+        };
+      })
+      : summaryRows;
+    if (queueRows.length) {
+      songStates.innerHTML = queueRows.map((row) => {
         const number = row.song ?? row.index ?? row.id ?? "?";
         const status = String(row.status || row.state || "queued").toLowerCase();
-        const cls = status.includes("fail") || status.includes("error") ? "error" : status === "done" || status === "completed" ? "done" : Number(number) === Number(state.current) ? "active" : "";
+        const cls = status.includes("fail") || status.includes("error")
+          ? "error"
+          : status === "done" || status === "completed"
+            ? "done"
+            : Number(number) === Number(state.current)
+              ? "active"
+              : "";
         return `<div class="loading-song-state ${cls}"><span>Song ${String(number).padStart(2, "0")}</span><span>${esc(row.detail || row.status || row.state || "queued")}</span></div>`;
-      }).join("");
-    } else if (isRenderTask && Array.isArray(state.songs) && state.songs.length) {
-      const current = Number(state.current);
-      songStates.innerHTML = state.songs.map((number) => {
-        const cls = Number(number) === current ? "active" : (Number(number) <= Number(state.done_count || 0) ? "done" : "");
-        return `<div class="loading-song-state ${cls}"><span>Song ${String(number).padStart(2, "0")}</span><span>${cls === "active" ? "working" : cls === "done" ? "done" : "queued"}</span></div>`;
       }).join("");
     } else {
       const facts = [
