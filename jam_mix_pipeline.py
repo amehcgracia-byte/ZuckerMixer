@@ -6679,16 +6679,44 @@ def master_temp_wav_streaming(premaster_path: Path, master_path: Path, sr: int) 
 
 
 def measure_encoded_lufs(path: Path) -> float:
-    """Measure the delivered MP3, including codec gain/rounding effects."""
+    """Measure encoded loudness without buffering the complete MP3 in Python."""
     ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
         return float("nan")
-    decoded = subprocess.check_output(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "wav", "-"],
+    # Let FFmpeg's ebur128 filter perform the integrated-loudness pass in
+    # streaming mode. The previous implementation decoded the whole MP3 into
+    # a Python bytes object and then into a NumPy array for every song.
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(path),
+            "-af",
+            "ebur128=peak=true",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
     )
-    audio, sample_rate = sf.read(io.BytesIO(decoded), dtype="float32", always_2d=True)
-    return float(pyln.Meter(sample_rate).integrated_loudness(audio))
-
+    if result.returncode != 0:
+        return float("nan")
+    matches = re.findall(r"\\bI:\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*LUFS", result.stderr or "")
+    if matches:
+        return float(matches[-1])
+    # Keep a compatibility fallback for FFmpeg builds that omit the summary
+    # line from stderr.
+    try:
+        decoded = subprocess.check_output(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "wav", "-"],
+        )
+        audio, sample_rate = sf.read(io.BytesIO(decoded), dtype="float32", always_2d=True)
+        return float(pyln.Meter(sample_rate).integrated_loudness(audio))
+    except Exception:
+        return float("nan")
 
 def measure_true_peak_db(path: Path) -> float:
     """Measure the delivered file with ffmpeg's independent true-peak meter."""
@@ -8144,7 +8172,7 @@ def render_segment(
         "vocal_bus_db": vocal_bus_trim_db,
         "stage_metrics": stage_meters_final,
         "premaster_headroom_db": PREMASTER_HEADROOM_DB,
-        "preserved_artifacts": preserved_artifacts,
+        "preserved_artifacts": preserved_artifacts,\n        "timings": {\n            "scan_seconds": round(float(scan_seconds), 3),\n            "mix_seconds": round(float(mix_seconds), 3),\n            "master_seconds": round(float(master_seconds), 3),\n            "encode_seconds": round(float(encode_seconds), 3),\n            "total_seconds": round(float(total_seconds), 3),\n        },
     }
 
 
