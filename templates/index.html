@@ -10,13 +10,26 @@
   <body>
     <div id="loadingOverlay" hidden aria-live="polite">
       <div class="loading-stage">
-        <img class="loading-stage-gif" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
-        <h2 id="loadingOverlayTitle">Working...</h2>
-        <p id="loadingOverlayDetail">Please wait...</p>
-        <p id="loadingOverlayFun" class="progress-fun"></p>
-        <div class="loading-stage-progress">
-          <div class="progress-track"><div id="loadingOverlayProgressFill"></div></div>
-          <span id="loadingOverlayPercent">0%</span>
+        <div class="loading-stage-visual">
+          <video class="loading-stage-media" autoplay loop muted playsinline preload="auto">
+            <source src="/static/zucker_loading_fragment.mp4" type="video/mp4">
+            <img class="loading-stage-media" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
+          </video>
+          <div class="loading-stage-info">
+            <h2 id="loadingOverlayTitle">Working...</h2>
+            <p id="loadingOverlayDetail">Please wait...</p>
+            <p id="loadingOverlayFun" class="progress-fun"></p>
+            <div class="loading-stage-progress">
+              <span class="loading-progress-label">Batch</span>
+              <div class="progress-track"><div id="loadingOverlayProgressFill"></div></div>
+              <span id="loadingOverlayPercent">0%</span>
+            </div>
+            <div id="loadingRenderProgress" class="loading-stage-progress loading-render-progress" hidden>
+              <span id="loadingRenderLabel" class="loading-progress-label">Current render</span>
+              <div class="progress-track"><div id="loadingRenderProgressFill"></div></div>
+              <span id="loadingRenderPercent">0%</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>

@@ -3062,12 +3062,15 @@ function renderLoadingOverlay() {
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
   if (!busy) return;
+
   const stage = String(state.current_stage || state.stage || "").toLowerCase();
+  const isRenderTask = ["render", "mix"].includes(String(state.kind || "").toLowerCase());
   const title = state.kind === "cut" ? (state.label || "Loading editor") :
     (state.status === "stopping" ? "Finishing the current task..." :
       stage === "redetecting" || stage === "detecting songs" ? "Finding songs..." : "Working...");
   const detail = state.detail || state.stage_detail || "Please wait...";
   const progress = Number(state.kind === "redetect" ? state.progress : (state.progress ?? state.song_progress ?? 0));
+  const renderProgress = Number(state.song_progress ?? 0);
   const messages = {
     scanning: ["Checking the room mics...", "Reading the session clock..."],
     "analyzing stems": ["Listening to the drummer...", "Counting the groove..."],
@@ -3081,16 +3084,29 @@ function renderLoadingOverlay() {
   const choices = messages[stage] || (state.kind === "cut" ? messages.loading : ["Keeping the session moving...", "The band is still tuning..."]);
   const fun = choices[Math.floor(Date.now() / 5000) % choices.length];
   const safeProgress = Math.max(0, Math.min(100, Number.isFinite(progress) ? progress : 0));
+  const safeRenderProgress = Math.max(0, Math.min(100, Number.isFinite(renderProgress) ? renderProgress : 0));
   const titleNode = $("#loadingOverlayTitle");
   const detailNode = $("#loadingOverlayDetail");
   const funNode = $("#loadingOverlayFun");
   const fillNode = $("#loadingOverlayProgressFill");
   const percentNode = $("#loadingOverlayPercent");
+  const renderRow = $("#loadingRenderProgress");
+  const renderLabel = $("#loadingRenderLabel");
+  const renderFill = $("#loadingRenderProgressFill");
+  const renderPercent = $("#loadingRenderPercent");
   if (titleNode) titleNode.textContent = title;
   if (detailNode) detailNode.textContent = detail;
   if (funNode) funNode.textContent = fun;
   if (fillNode) fillNode.style.width = String(safeProgress) + "%";
   if (percentNode) percentNode.textContent = String(Math.round(safeProgress)) + "%";
+  if (renderRow) renderRow.hidden = !isRenderTask;
+  if (renderLabel && isRenderTask) {
+    const current = state.current_item || (state.current ? `Song ${String(state.current).padStart(2, "0")}` : "Current render");
+    const total = state.total_count || (Array.isArray(state.songs) ? state.songs.length : "");
+    renderLabel.textContent = total ? `${current} · ${state.current || 0}/${total}` : current;
+  }
+  if (renderFill) renderFill.style.width = String(safeRenderProgress) + "%";
+  if (renderPercent) renderPercent.textContent = String(Math.round(safeRenderProgress)) + "%";
 }
 
 function setLoadingOverlayJob(job) {
