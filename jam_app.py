@@ -1505,6 +1505,46 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
                 flush=True,
             )
     if snapshot is not None:
+        # Migrate legacy one-slot snapshots into an explicit review-only
+        # candidate state. Older builds persisted the conservative fallback
+        # without recording that Whisper had failed to produce a usable slot
+        # topology, which made the UI present the whole jam as one valid song.
+        snapshot_stems = snapshot.get("stems", []) if isinstance(snapshot, dict) else []
+        snapshot_slots = snapshot.get("raw_songs", []) if isinstance(snapshot, dict) else []
+        snapshot_duration = max(
+            (
+                float(item.get("offset_seconds", 0.0))
+                + float(item.get("timeline_duration", item.get("duration", 0.0)))
+                for item in snapshot_stems
+                if isinstance(item, dict)
+            ),
+            default=0.0,
+        )
+        if (
+            len(snapshot_slots) == 1
+            and len(snapshot_stems) > 1
+            and snapshot_duration > pipeline.HARD_MAX_SONG_SECONDS
+        ):
+            migration_reason = (
+                f"Legacy snapshot contains one slot for {len(snapshot_stems)} parallel stems "
+                f"spanning {snapshot_duration:.1f}s; full-session segmentation is still pending."
+            )
+            snapshot["candidate_pending"] = True
+            snapshot["segmentation_status"] = "candidate_pending"
+            calibration = dict(snapshot.get("detection_calibration") or {})
+            calibration["candidate_pending"] = True
+            calibration["session_segmentation_usable"] = False
+            strategy = dict(calibration.get("strategy") or {})
+            strategy.update({
+                "id": "legacy_one_slot_candidate",
+                "candidate_only": True,
+                "session_segmentation_usable": False,
+                "needs_review": True,
+                "reason": migration_reason,
+            })
+            calibration["strategy"] = strategy
+            snapshot["detection_calibration"] = calibration
+            print("DETECTION SNAPSHOT MIGRATION: " + migration_reason, flush=True)
         snapshot["audio_scan"] = _ensure_snapshot_scan_report(snapshot)
         with state_lock:
             pipeline_state = snapshot
