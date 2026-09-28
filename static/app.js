@@ -3488,6 +3488,13 @@ if (typeof document !== "undefined") {
         clearCutLoading();
         await refreshState({ renderLarge: true });
         showToast(`${appState.songs.length} songs detected from a fresh pass.`);
+      } else if (job?.status === "pending_review") {
+        setLoadingOverlayJob(null);
+        clearCutLoading();
+        await refreshState({ renderLarge: true });
+        const found = Number(job.candidate_count || 0);
+        const preserved = Number(job.previous_count || appState?.songs?.length || 0);
+        showToast(`Re-detect incomplete: ${found} slot(s) found; current session (${preserved}) preserved.`);
       } else if (job?.status === "error" || job?.status === "cancelled") {
         setLoadingOverlayJob(null);
         clearCutLoading();
@@ -3534,6 +3541,9 @@ if (typeof document !== "undefined") {
       if (job?.status === "done") {
         await loadState();
         showToast(`${appState.audio_scan?.accepted?.length || 0} WAV/audio files loaded.`);
+      } else if (job?.status === "pending_review") {
+        await loadState();
+        showToast(`Folder detection incomplete: ${job.candidate_count || 0} slot(s) found; current session preserved.`);
       } else if (job?.status === "error" || job?.status === "cancelled") {
         await loadState();
         showToast(`Error loading folder: ${job.error || job.stage_detail || job.status}`);
