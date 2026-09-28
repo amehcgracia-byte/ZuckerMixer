@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: zuckermixer-build-${{ github.ref }}
+  cancel-in-progress: true
+
+
 jobs:
   build-dmg:
     name: Build ZuckerMixer DMG
@@ -41,5 +46,79 @@ jobs:
         with:
           name: ZuckerMixer-${{ steps.version.outputs.version }}
           path: dist/ZuckerMixer-${{ steps.version.outputs.version }}.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+  build-windows:
+    name: Build ZuckerMixer Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'VERSION is empty' }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "Building ZuckerMixer $version from $env:GITHUB_SHA"
+
+      - name: Install Windows build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pywebview Flask numpy scipy soundfile pyloudnorm pillow cffi
+          python -m pip install "numba==0.60.0" "llvmlite==0.43.0" matchering
+
+      - name: Build Windows executable
+        shell: pwsh
+        env:
+          ZUCKER_SOURCE_REVISION_OVERRIDE: ${{ github.sha }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          $metadata = @{
+            app_version = $version
+            build_timestamp = (Get-Date).ToUniversalTime().ToString('o')
+            source_revision = $env:ZUCKER_SOURCE_REVISION_OVERRIDE
+          } | ConvertTo-Json
+          $metadata | Set-Content -Path build/build_metadata.json -Encoding utf8
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name ZuckerMixer `
+            --add-data 'templates;templates' `
+            --add-data 'static;static' `
+            --add-data 'build/build_metadata.json;build' `
+            --add-data 'whisper_transcribe.py;.' `
+            --hidden-import flask `
+            --hidden-import werkzeug `
+            --hidden-import webview `
+            --hidden-import numpy `
+            --hidden-import scipy `
+            --hidden-import scipy.signal `
+            --hidden-import scipy.ndimage `
+            --hidden-import soundfile `
+            --hidden-import pyloudnorm `
+            --hidden-import cffi `
+            --hidden-import _cffi_backend `
+            mac_app.py
+          if (-not (Test-Path dist/ZuckerMixer.exe)) { throw 'ZuckerMixer.exe was not created' }
+          New-Item -ItemType Directory -Force -Path dist/package | Out-Null
+          Copy-Item dist/ZuckerMixer.exe dist/package/ZuckerMixer.exe -Force
+          "ZuckerMixer $version" | Set-Content dist/package/VERSION.txt -Encoding utf8
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/ZuckerMixer-$version-Windows.zip" -Force
+          if (-not (Test-Path "dist/ZuckerMixer-$version-Windows.zip")) { throw 'Windows ZIP was not created' }
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZuckerMixer-${{ steps.version.outputs.version }}-Windows
+          path: dist/ZuckerMixer-${{ steps.version.outputs.version }}-Windows.zip
           if-no-files-found: error
           retention-days: 30
