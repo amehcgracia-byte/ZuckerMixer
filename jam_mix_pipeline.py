@@ -8279,7 +8279,19 @@ def write_report(out_dir: Path, rows: list[dict[str, object]], segments: list[Se
         if final_cut:
             f.write("\nFinal render cut gate audit (exact source cut sample):\n")
             for item in final_cut:
-                active = ", ".join(str(x.get("stem")) for x in item.get("active_instruments", [])) or "none"
+                # Older detection records may contain a plain text audit entry.
+                # Keep the report useful without allowing a malformed entry to
+                # abort the worker after rendering has already completed.
+                if not isinstance(item, dict):
+                    f.write(f"  {item}\n")
+                    continue
+                active_instruments = item.get("active_instruments", [])
+                if not isinstance(active_instruments, (list, tuple)):
+                    active_instruments = [active_instruments]
+                active = ", ".join(
+                    str(x.get("stem")) if isinstance(x, dict) else str(x)
+                    for x in active_instruments
+                ) or "none"
                 f.write(f"  song {item.get('song')}: sample {item.get('cut_sample')} at {fmt_time(float(item.get('cut_seconds', 0)))}; safe={item.get('safe')}; active instruments={active}\n")
         titles = [str(row.get("title")) for row in rows if row.get("title")]
         if titles:
