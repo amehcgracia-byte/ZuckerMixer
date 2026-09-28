@@ -895,7 +895,7 @@ def default_source_config() -> dict[str, Any]:
         "suspicious_short_song_seconds": 5 * 60.0,
         "suspicious_long_song_seconds": 20 * 60.0,
         "whisper_model": os.environ.get("ZUCKER_WHISPER_MODEL", "tiny"),
-        "whisper_timeout_seconds": float(os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "90")),
+        "whisper_idle_timeout_seconds": float(os.environ.get("ZUCKER_WHISPER_IDLE_TIMEOUT_SECONDS", os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "300"))),
         "ear_confirmed_splits": [],
         "sanity_anchors": [],
     }

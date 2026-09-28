@@ -17,15 +17,28 @@ def main() -> int:
 
     from faster_whisper import WhisperModel
 
+    requests = json.loads(args.input_json.read_text(encoding="utf-8"))
+    total = len(requests)
+    print(json.dumps({"event": "model_loading", "total": total}), flush=True)
     model = WhisperModel(
         args.model,
         device="cpu",
         compute_type="int8",
         download_root=str(args.model_dir),
     )
-    requests = json.loads(args.input_json.read_text(encoding="utf-8"))
+    print(json.dumps({"event": "model_ready", "total": total}), flush=True)
+
     results = []
-    for request in requests:
+
+    def checkpoint() -> None:
+        temporary = args.output_json.with_name(args.output_json.name + ".partial")
+        temporary.write_text(
+            json.dumps(results, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(args.output_json)
+
+    for completed, request in enumerate(requests, 1):
         segments, info = model.transcribe(
             str(request["path"]),
             beam_size=3,
@@ -65,7 +78,20 @@ def main() -> int:
             "avg_logprob": float(sum(logprobs) / len(logprobs) if logprobs else -1.0),
             "segments": whisper_segments,
         })
-    args.output_json.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        checkpoint()
+        print(
+            json.dumps({
+                "event": "window_complete",
+                "completed": completed,
+                "total": total,
+                "id": request["id"],
+                "start": request["start"],
+                "end": request["end"],
+            }),
+            flush=True,
+        )
+
+    checkpoint()
     return 0
 
 

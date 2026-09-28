@@ -3070,7 +3070,7 @@ function renderLoadingOverlay() {
       stage.includes("redetect") || stage.includes("detecting") ? "Finding songs..." : "Working...");
   const detail = state.detail || state.stage_detail || "Please wait...";
   const progress = Number(state.kind === "redetect" ? state.progress : (state.progress ?? state.song_progress ?? 0));
-  const renderProgress = Number(state.song_progress ?? 0);
+  const renderProgress = Number(state.process_progress ?? state.song_progress ?? 0);
   const messages = {
     preparing: ["Opening the original session...", "Keeping every stem aligned..."],
     scanning: ["Checking the room mics...", "Reading the session clock..."],
@@ -3115,11 +3115,19 @@ function renderLoadingOverlay() {
   if (funNode) funNode.textContent = fun;
   if (fillNode) fillNode.style.width = String(safeProgress) + "%";
   if (percentNode) percentNode.textContent = String(Math.round(safeProgress)) + "%";
-  if (renderRow) renderRow.hidden = !isRenderTask;
-  if (renderLabel && isRenderTask) {
-    const current = state.current_item || (state.current ? `Song ${String(state.current).padStart(2, "0")}` : "Current render");
-    const total = state.total_count || (Array.isArray(state.songs) ? state.songs.length : "");
-    renderLabel.textContent = total ? `${current} · ${state.current || 0}/${total}` : current;
+  const showProcessRow = state.kind !== "cut";
+  if (renderRow) renderRow.hidden = !showProcessRow;
+  if (renderLabel && showProcessRow) {
+    if (state.kind === "redetect" || state.current_stage === "transcribing speech") {
+      const completed = Number(state.whisper_completed_windows || 0);
+      const total = Number(state.whisper_total_windows || state.candidate_windows || 0);
+      const stageLabel = state.current_stage === "transcribing speech" ? "Whisper" : (state.current_stage || "Process");
+      renderLabel.textContent = total ? `${stageLabel} · ${completed}/${total}` : stageLabel;
+    } else {
+      const current = state.current_item || (state.current ? `Song ${String(state.current).padStart(2, "0")}` : "Current process");
+      const total = state.total_count || (Array.isArray(state.songs) ? state.songs.length : "");
+      renderLabel.textContent = total ? `${current} · ${state.current || 0}/${total}` : current;
+    }
   }
   if (renderFill) renderFill.style.width = String(safeRenderProgress) + "%";
   if (renderPercent) renderPercent.textContent = String(Math.round(safeRenderProgress)) + "%";

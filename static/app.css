@@ -974,3 +974,24 @@ a {
     margin-right: -22px;
   }
 }
+
+
+/* The loading overlay owns the visible progress UI while the app is busy.
+   Keep the old inline indicator from becoming a duplicate ghost bar. */
+body.loading-mode #loadingStatus { display: none !important; }
+.loading-render-progress {
+  width: 82%;
+  margin-left: auto;
+  opacity: .92;
+}
+.loading-render-progress .loading-progress-label {
+  font-size: .68rem;
+  color: var(--orange2);
+}
+.loading-render-progress .progress-track {
+  height: 7px;
+  background: rgba(236, 163, 94, .22);
+}
+.loading-render-progress .progress-track > div {
+  background: var(--orange2);
+}

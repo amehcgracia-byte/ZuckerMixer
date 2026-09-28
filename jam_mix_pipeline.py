@@ -23,6 +23,8 @@ import tempfile
 import time
 import hashlib
 import io
+import queue
+import threading
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -192,7 +194,7 @@ DETECTION_CACHE_ALGORITHM_VERSION = "20260926-global-boundary-timeline-v5"
 SPEECH_DETECTION_ALGORITHM_VERSION = "20260827-whisper-v1"
 SPEECH_TRANSCRIPTION_CACHE_VERSION = "20260926-commentator-slots-v3"
 WHISPER_MODEL_SIZE = os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")
-WHISPER_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "90"))
+WHISPER_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_IDLE_TIMEOUT_SECONDS", os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "300")))
 WHISPER_ENV = Path(__file__).resolve().parent / ".whisperenv"
 LAST_SPEECH_TRANSCRIPTIONS: list[dict[str, object]] = []
 LAST_WHISPER_STATUS: dict[str, object] = {"status": "not_started"}
@@ -330,8 +332,11 @@ def configure_detection_profile(profile: dict[str, object] | None = None) -> dic
 
     model = str(raw.get("whisper_model") or os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")).strip()
     WHISPER_MODEL_SIZE = model or "tiny"
-    timeout = _profile_number(raw, ("whisper_timeout_seconds",), float(os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "90")))
-    WHISPER_TIMEOUT_SECONDS = max(1.0, float(timeout or 90.0))
+    timeout = _profile_number(raw, ("whisper_idle_timeout_seconds", "whisper_timeout_seconds"), float(os.environ.get("ZUCKER_WHISPER_IDLE_TIMEOUT_SECONDS", os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "300"))))
+    # This is an inactivity watchdog, not a total Whisper runtime cap. Old
+    # profiles that stored the former 90-second total timeout are migrated to
+    # a safe watchdog automatically.
+    WHISPER_TIMEOUT_SECONDS = max(180.0, float(timeout or 300.0))
     MC_EAR_CONFIRMED_SPLITS = _profile_markers(raw.get("ear_confirmed_splits", []), "ear")
     MC_SANITY_ANCHORS = _profile_markers(raw.get("sanity_anchors", []), "anchor")
     DETECTION_PROFILE_SIGNATURE = hashlib.sha256(
@@ -1410,63 +1415,162 @@ def transcribe_speech_candidates(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,
             )
+            progress_events: queue.Queue[tuple[str, str]] = queue.Queue()
+            stream_lines: dict[str, list[str]] = {"stdout": [], "stderr": []}
+
+            def drain_stream(name: str, stream: object) -> None:
+                try:
+                    for line in iter(stream.readline, ""):  # type: ignore[attr-defined]
+                        clean = str(line).rstrip()
+                        stream_lines[name].append(clean)
+                        progress_events.put((name, clean))
+                finally:
+                    try:
+                        stream.close()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+
+            stream_threads = [
+                threading.Thread(target=drain_stream, args=("stdout", process.stdout), daemon=True),
+                threading.Thread(target=drain_stream, args=("stderr", process.stderr), daemon=True),
+            ]
+            for thread in stream_threads:
+                thread.start()
+
             whisper_started = time.monotonic()
+            last_worker_activity = whisper_started
+            completed_windows = 0
+            total_windows = max(1, len(requests))
+            idle_timeout = max(180.0, float(effective_timeout or 300.0))
+            watchdog_reason = ""
             while process.poll() is None:
-                elapsed = time.monotonic() - whisper_started
+                while True:
+                    try:
+                        stream_name, line = progress_events.get_nowait()
+                    except queue.Empty:
+                        break
+                    if stream_name != "stdout" or not line.startswith("{"):
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    event_name = str(event.get("event") or "")
+                    if event_name in {"model_loading", "model_ready"}:
+                        last_worker_activity = time.monotonic()
+                        report_progress({
+                            "current_stage": "transcribing speech",
+                            "stage_detail": (
+                                "Whisper is loading the model"
+                                if event_name == "model_loading"
+                                else f"Whisper ready — processing {total_windows} windows"
+                            ),
+                            "progress": 70,
+                            "process_progress": 0,
+                            "song_progress": 0,
+                            "phase_index": 4,
+                            "phase_total": 7,
+                            "candidate_windows": total_windows,
+                            "whisper_completed_windows": completed_windows,
+                            "whisper_total_windows": total_windows,
+                            "heartbeat": time.time(),
+                        })
+                    elif event_name == "window_complete":
+                        completed_windows = max(
+                            completed_windows,
+                            min(total_windows, int(event.get("completed") or 0)),
+                        )
+                        last_worker_activity = time.monotonic()
+                        process_progress = int(round(completed_windows / total_windows * 100))
+                        report_progress({
+                            "current_stage": "transcribing speech",
+                            "stage_detail": f"Whisper transcribed window {completed_windows}/{total_windows}",
+                            "progress": 70 + int(round(18 * completed_windows / total_windows)),
+                            "process_progress": process_progress,
+                            "song_progress": process_progress,
+                            "phase_index": 4,
+                            "phase_total": 7,
+                            "candidate_windows": total_windows,
+                            "transcript_count": completed_windows,
+                            "whisper_completed_windows": completed_windows,
+                            "whisper_total_windows": total_windows,
+                            "heartbeat": time.time(),
+                        })
+                idle_seconds = time.monotonic() - last_worker_activity
+                if idle_seconds >= idle_timeout:
+                    watchdog_reason = (
+                        f"Whisper produced no worker event for {int(idle_seconds)}s "
+                        f"while processing window {completed_windows + 1}/{total_windows}"
+                    )
+                    process.kill()
+                    break
+                time.sleep(0.25)
+
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            for thread in stream_threads:
+                thread.join(timeout=2.0)
+            stdout = "\n".join(stream_lines["stdout"])
+            stderr = "\n".join(stream_lines["stderr"])
+
+            if watchdog_reason:
+                legacy_results = compatible_legacy_transcript()
+                if legacy_results is not None:
+                    results = legacy_results
+                    LAST_WHISPER_STATUS = {
+                        "status": "available_cached",
+                        "candidate_windows": total_windows,
+                        "completed_windows": completed_windows,
+                        "reason": f"{watchdog_reason}; reused compatible same-source transcript",
+                        "idle_timeout_seconds": idle_timeout,
+                    }
+                else:
+                    LAST_WHISPER_STATUS = {
+                        "status": "timed_out",
+                        "idle_timeout_seconds": idle_timeout,
+                        "candidate_windows": total_windows,
+                        "completed_windows": completed_windows,
+                        "reason": watchdog_reason,
+                        "stdout": stdout[-2000:],
+                        "stderr": stderr[-2000:],
+                    }
+                    raise RuntimeError(watchdog_reason)
+            elif process.returncode != 0:
+                LAST_WHISPER_STATUS = {
+                    "status": "error",
+                    "returncode": process.returncode,
+                    "candidate_windows": total_windows,
+                    "completed_windows": completed_windows,
+                    "stdout": stdout[-2000:],
+                    "stderr": stderr[-2000:],
+                }
+                raise RuntimeError(f"Whisper exited with code {process.returncode}")
+            else:
+                results = json.loads(output_json.read_text(encoding="utf-8"))
                 report_progress({
                     "current_stage": "transcribing speech",
-                    "stage_detail": f"Whisper is transcribing {len(requests)} windows — {int(elapsed)}s elapsed",
-                    "progress": 72,
-                    "song_progress": 72,
+                    "stage_detail": f"Whisper returned {len(results)} transcript windows",
+                    "progress": 88,
+                    "process_progress": 100,
+                    "song_progress": 100,
                     "phase_index": 4,
                     "phase_total": 7,
-                    "candidate_windows": len(requests),
-                    "elapsed_seconds": elapsed,
+                    "transcript_count": len(results),
+                    "whisper_completed_windows": len(results),
+                    "whisper_total_windows": total_windows,
                     "heartbeat": time.time(),
                 })
-                if elapsed >= effective_timeout:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                    legacy_results = compatible_legacy_transcript()
-                    if legacy_results is not None:
-                        results = legacy_results
-                        LAST_WHISPER_STATUS = {
-                            "status": "available_cached",
-                            "candidate_windows": len(requests),
-                            "reason": "current Whisper pass timed out; reused compatible same-source transcript",
-                            "timeout_seconds": effective_timeout,
-                        }
-                    else:
-                        LAST_WHISPER_STATUS = {
-                            "status": "timed_out",
-                            "timeout_seconds": effective_timeout,
-                            "candidate_windows": len(requests),
-                            "stdout": str(stdout or "")[-2000:],
-                            "stderr": str(stderr or "")[-2000:],
-                        }
-                        raise RuntimeError(f"Whisper timed out after {effective_timeout:.0f}s")
-                    break
-                time.sleep(2)
-            else:
-                stdout, stderr = process.communicate()
-                if process.returncode != 0:
-                    LAST_WHISPER_STATUS = {
-                        "status": "error",
-                        "returncode": process.returncode,
-                        "stdout": str(stdout or "")[-2000:],
-                        "stderr": str(stderr or "")[-2000:],
-                    }
-                    raise RuntimeError(f"Whisper exited with code {process.returncode}")
-                completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-            if results is None:
-                results = json.loads(output_json.read_text(encoding="utf-8"))
-                report_progress({"current_stage": "transcribing speech", "stage_detail": f"Whisper returned {len(results)} transcript windows", "progress": 88, "song_progress": 88, "phase_index": 4, "phase_total": 7, "transcript_count": len(results), "heartbeat": time.time()})
                 LAST_WHISPER_STATUS = {
                     "status": "available",
-                    "candidate_windows": len(requests),
-                    "stdout": str(completed.stdout or "")[-2000:],
-                    "stderr": str(completed.stderr or "")[-2000:],
+                    "candidate_windows": total_windows,
+                    "completed_windows": len(results),
+                    "stdout": stdout[-2000:],
+                    "stderr": stderr[-2000:],
                 }
         try:
             transcript_cache_path.parent.mkdir(parents=True, exist_ok=True)
