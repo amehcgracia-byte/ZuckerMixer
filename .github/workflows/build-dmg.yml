@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build-dmg:
     name: Build ZuckerMixer DMG
-    runs-on: macos-13
+    runs-on: macos-15-intel
 
     steps:
       - name: Checkout exact source
