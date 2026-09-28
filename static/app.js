@@ -3467,6 +3467,10 @@ if (typeof document !== "undefined") {
       showToast(data.error || "Could not start song detection.");
       return;
     }
+    const queuedJob = await response.json();
+    // Replace the temporary 2% editor indicator with the real worker state.
+    clearCutLoading();
+    setLoadingOverlayJob(queuedJob);
     showToast("Re-detecting the complete original session.");
     await pollJobs();
     // Do not wait for the general polling loop to repaint the song list. The
@@ -3476,11 +3480,17 @@ if (typeof document !== "undefined") {
       const jobs = await pollJobs();
       const job = [...jobs].reverse().find((item) => item.kind === "redetect");
       if (job?.status === "pending_confirmation") {
+        setLoadingOverlayJob(null);
+        clearCutLoading();
         await reviewRedetectCandidate(job);
       } else if (job?.status === "done") {
+        setLoadingOverlayJob(null);
+        clearCutLoading();
         await refreshState({ renderLarge: true });
         showToast(`${appState.songs.length} songs detected from a fresh pass.`);
       } else if (job?.status === "error" || job?.status === "cancelled") {
+        setLoadingOverlayJob(null);
+        clearCutLoading();
         showToast(`Re-detect ${job.status}.`);
       } else {
         setTimeout(() => waitForFreshDetection().catch((err) => console.warn("[redetect refresh failed]", err)), 1000);
