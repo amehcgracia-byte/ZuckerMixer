@@ -39,6 +39,8 @@ if [[ "$#" -ne 0 ]]; then
 fi
 
 echo "== ZuckerMixer macOS build =="
+echo "Application version: $APP_VERSION"
+echo "DMG output: $DMG_PATH"
 
 if [[ "$DMG_ONLY" -eq 1 ]]; then
   SKIP_APP_BUILD=1
