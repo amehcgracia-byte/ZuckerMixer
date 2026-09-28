@@ -3076,7 +3076,7 @@ async function resetSongToAutomatic(songId) {
 function renderLoadingOverlay() {
   const overlay = $("#loadingOverlay");
   if (!overlay) return;
-  // A cut-editor load is local and must not be obscured by a background\n  // Whisper/redetect job. Once the editor is ready, the background job can\n  // become visible again.\n  const state = loadingOverlayCut || loadingOverlayJob;
+  // Edit Cuts owns the foreground while its dialog is open. A background\n  // Whisper/render job must not cover or block waveform editing.\n  const cutEditorOpen = Boolean(document.querySelector("#cutSelectorDialog[open]"));\n  const state = cutEditorOpen ? loadingOverlayCut : (loadingOverlayCut || loadingOverlayJob);
   const busy = Boolean(state);
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
