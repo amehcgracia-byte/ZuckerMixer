@@ -767,6 +767,9 @@ button:active:not(:disabled), button.active { transform: translateY(0); backgrou
 #loadingOverlayPercent, #loadingRenderPercent { min-width: 3.5rem; color: var(--cream); font-variant-numeric: tabular-nums; text-align: right; }
 .loading-render-progress .progress-track { background: rgba(236, 163, 94, .18); }
 .loading-render-progress .progress-track > div { background: var(--orange2); }
+.loading-overlay-timing { display: flex; justify-content: space-between; gap: 12px; color: var(--cream); font-size: .82rem; font-variant-numeric: tabular-nums; }
+.loading-overlay-timing span { color: var(--muted); }
+
 .loading-activity { display: grid; gap: 8px; width: 100%; margin-top: 4px; }
 .loading-activity-head { display: flex; justify-content: space-between; gap: 12px; color: var(--cream); font-size: .75rem; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
 #loadingActivityAge { color: var(--muted); font-weight: 600; text-transform: none; letter-spacing: 0; }

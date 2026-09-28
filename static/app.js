@@ -3091,6 +3091,7 @@ function renderLoadingOverlay() {
   const safeRenderProgress = Math.max(0, Math.min(100, Number.isFinite(renderProgress) ? renderProgress : 0));
   const titleNode = $("#loadingOverlayTitle");
   const detailNode = $("#loadingOverlayDetail");
+  const timingNode = $("#loadingOverlayTiming");
   const funNode = $("#loadingOverlayFun");
   const fillNode = $("#loadingOverlayProgressFill");
   const percentNode = $("#loadingOverlayPercent");
@@ -3104,6 +3105,13 @@ function renderLoadingOverlay() {
   const songStates = $("#loadingSongStates");
   if (titleNode) titleNode.textContent = title;
   if (detailNode) detailNode.textContent = detail;
+  if (timingNode) {
+    const elapsed = Number(state.elapsed_seconds || 0);
+    const eta = Number(state.eta_seconds || 0);
+    const elapsedText = elapsed >= 60 ? `Elapsed: ${Math.floor(elapsed / 60)}m ${String(Math.floor(elapsed % 60)).padStart(2, "0")}s` : `Elapsed: ${Math.floor(elapsed)}s`;
+    const etaText = eta > 0 ? `ETA: ~${eta >= 60 ? `${Math.floor(eta / 60)}m ${Math.round(eta % 60)}s` : `${Math.round(eta)}s`}` : `Stage: ${state.phase_index != null ? Number(state.phase_index) + 1 : "—"}/${state.phase_total || 7}`;
+    timingNode.innerHTML = `<span>${esc(elapsedText)}</span><span>${esc(etaText)}</span>`;
+  }
   if (funNode) funNode.textContent = fun;
   if (fillNode) fillNode.style.width = String(safeProgress) + "%";
   if (percentNode) percentNode.textContent = String(Math.round(safeProgress)) + "%";
