@@ -1628,16 +1628,38 @@ def transcribe_speech_candidates(
         raise RuntimeError("Whisper is mandatory for detection but produced no transcriptions.")
     print(f"WHISPER STORE CONFIRMED: LAST_SPEECH_TRANSCRIPTIONS={len(LAST_SPEECH_TRANSCRIPTIONS)}", flush=True)
     announcement_windows = select_commentator_announcements(results)
-    LAST_WHISPER_STATUS["eligible_introductions"] = len(announcement_windows)
+    # Whisper can complete every requested window while still finding too few
+    # presenter introductions to build a trustworthy slot list.  Preserve the
+    # complete diagnostic state in that case; raising here used to make the
+    # caller discard the transcript results and silently create one metadata
+    # block for the whole session.
+    transcript_count = len(results)
+    LAST_WHISPER_STATUS = {
+        **LAST_WHISPER_STATUS,
+        "transcript_count": transcript_count,
+        "results_returned": transcript_count,
+        "candidate_windows": len(windows),
+        "completed_windows": transcript_count,
+        "eligible_introductions": len(announcement_windows),
+        "session_segmentation_usable": len(announcement_windows) >= 2,
+    }
     if len(announcement_windows) < 2:
         LAST_WHISPER_STATUS = {
-            "status": "unavailable",
-            "reason": f"fewer than two introductions ({len(announcement_windows)})",
+            **LAST_WHISPER_STATUS,
+            "status": "needs_review",
+            "reason": f"fewer than two introductions ({len(announcement_windows)}) after {transcript_count}/{len(windows)} Whisper windows completed",
         }
-        raise RuntimeError(
-            "Whisper is mandatory for detection but found fewer than two song introductions "
-            f"({len(announcement_windows)}); acoustic-only detection is disabled."
+        print(
+            "WHISPER COMPLETED BUT NEEDS REVIEW: "
+            f"{transcript_count}/{len(windows)} transcript windows, "
+            f"{len(announcement_windows)} eligible introductions; "
+            "no valid session segmentation was produced",
+            flush=True,
         )
+        # Return the transcripts for the diagnostic candidate.  The caller
+        # creates one explicitly review-only provisional block rather than
+        # treating this as a successful one-song detection.
+        return results, []
     segments: list[Segment] = []
     for index, item in enumerate(announcement_windows):
         # The introduction identifies the song and intentionally belongs in
@@ -3113,6 +3135,8 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         DETECTION_STRATEGY = {
             "id": "metadata_provisional",
             "label": "Single conservative metadata block; Analyze or Select Cuts required",
+            "candidate_only": True,
+            "session_segmentation_usable": False,
             "detected_count": len(segments),
             "needs_review": True,
             "whisper": LAST_WHISPER_STATUS,
@@ -3201,10 +3225,31 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     )
     print_mc_breaks(mc_breaks)
     if whisper_available and len(whisper_segments) < 2:
+        transcript_count = int(LAST_WHISPER_STATUS.get("transcript_count") or len(whisper_transcripts))
+        eligible_count = int(LAST_WHISPER_STATUS.get("eligible_introductions") or len(whisper_segments))
+        reason = (
+            f"only {eligible_count} commentator presentation(s) detected after "
+            f"{transcript_count}/{int(LAST_WHISPER_STATUS.get('candidate_windows') or transcript_count)} "
+            "Whisper windows; automatic session replacement is disabled"
+        )
         LAST_WHISPER_STATUS = {
             **LAST_WHISPER_STATUS,
             "status": "needs_review",
-            "reason": f"only {len(whisper_segments)} commentator presentation(s) detected; acoustic fallback disabled",
+            "reason": reason,
+            "transcript_count": transcript_count,
+            "eligible_introductions": eligible_count,
+            "session_segmentation_usable": False,
+        }
+        DETECTION_STRATEGY = {
+            "id": "whisper_completed_insufficient_presentations",
+            "label": "Whisper completed, but the slot candidate is incomplete",
+            "candidate_only": True,
+            "session_segmentation_usable": False,
+            "whisper_transcript_count": transcript_count,
+            "whisper_eligible_introductions": eligible_count,
+            "whisper": dict(LAST_WHISPER_STATUS),
+            "reason": reason,
+            "rhythm_equivalent_sources": rhythm_names,
         }
         whisper_available = False
     if whisper_available:
@@ -3228,11 +3273,30 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         # defensible slot boundary. Do not replace it with drum/acoustic or
         # fixed-clock windows; expose one conservative review block instead.
         segments = provisional_segments_from_metadata(stems)
+        provisional_reason = str(
+            LAST_WHISPER_STATUS.get("reason")
+            or "Commentator-led slot boundaries were not available"
+        )
+        if segments:
+            segments = [replace(
+                segments[0],
+                boundary_source="whisper-incomplete-provisional",
+                boundary_validation="needs_review",
+                boundary_validation_reason=(
+                    "Candidate only; not a valid single-song session: "
+                    + provisional_reason
+                ),
+            )]
         DETECTION_STRATEGY = {
+            **(DETECTION_STRATEGY if isinstance(DETECTION_STRATEGY, dict) else {}),
             "id": "commentator_missing_review",
-            "label": "Commentator-led slots unavailable; Select Cuts required",
+            "label": "Whisper candidate incomplete; Select Cuts required",
+            "candidate_only": True,
+            "session_segmentation_usable": False,
             "detected_count": len(segments),
-            "whisper": LAST_WHISPER_STATUS,
+            "whisper_transcript_count": int(LAST_WHISPER_STATUS.get("transcript_count") or len(whisper_transcripts)),
+            "whisper_eligible_introductions": int(LAST_WHISPER_STATUS.get("eligible_introductions") or len(whisper_segments)),
+            "whisper": dict(LAST_WHISPER_STATUS),
             "rhythm_equivalent_sources": rhythm_names,
             "needs_review": True,
         }
