@@ -3440,7 +3440,10 @@ def api_state() -> Response:
             except Exception as exc:
                 return jsonify(_loading_state(f"{type(exc).__name__}: {exc}")), 200
         if not detection_active:
-            api_redetect(False)
+            # A cache miss must perform the real song detection. The lightweight
+            # scan is useful for diagnostics, but it cannot produce usable slots
+            # without Whisper and otherwise leaves a misleading one-block session.
+            api_redetect(True)
         return jsonify(_loading_state()), 200
     return jsonify(public_state()), 200
 
