@@ -1,4 +1,5 @@
 let appState = null;
+let loadingOverlayJob = null;
 let checkedSongs = new Set();
 let lastLogId = -1;
 let songListSignature = "";
@@ -2998,6 +2999,56 @@ async function resetSongToAutomatic(songId) {
   showToast(`Song ${songId} reset to automatic mix.`);
 }
 
+function renderLoadingOverlay() {
+  const overlay = $("#loadingOverlay");
+  if (!overlay) return;
+  const job = loadingOverlayJob;
+  const busy = Boolean(job && ["queued", "running", "stopping"].includes(job.status));
+  overlay.hidden = !busy;
+  document.body.classList.toggle("loading-mode", busy);
+  if (!busy) return;
+  const stage = String(job.current_stage || "").toLowerCase();
+  const kind = String(job.kind || "").toLowerCase();
+  const title = kind === "render" || kind === "mix"
+    ? "Rendering the session..."
+    : stage.includes("transcrib") || stage.includes("whisper")
+      ? "Listening to the commentator..."
+      : stage.includes("detect") || stage.includes("prepar")
+        ? "Finding songs..."
+        : "Working...";
+  const detail = job.stage_detail || job.last_event || "Worker is active...";
+  const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+  const titleNode = $("#loadingOverlayTitle");
+  const detailNode = $("#loadingOverlayDetail");
+  const fillNode = $("#loadingOverlayProgressFill");
+  const percentNode = $("#loadingOverlayPercent");
+  const funNode = $("#loadingOverlayFun");
+  const healthNode = $("#loadingOverlayHealth");
+  if (titleNode) titleNode.textContent = title;
+  if (detailNode) detailNode.textContent = detail;
+  if (fillNode) fillNode.style.width = progress + "%";
+  if (percentNode) percentNode.textContent = Math.round(progress) + "%";
+  if (funNode) {
+    const messages = stage.includes("whisper") || stage.includes("transcrib")
+      ? ["Listening for the presenter...", "Separating the introductions from the music..."]
+      : ["Keeping every stem aligned...", "Reading the session clock..."];
+    funNode.textContent = messages[Math.floor(Date.now() / 5000) % messages.length];
+  }
+  if (healthNode) {
+    const last = Number(job.last_event_at || job.progress_updated_at || job.heartbeat || 0) * 1000;
+    const age = last ? Math.max(0, Math.floor((Date.now() - last) / 1000)) : 0;
+    healthNode.textContent = age >= 12
+      ? "No new worker event for " + age + "s. The source may be on an external disk."
+      : (job.last_event || detail);
+    healthNode.classList.toggle("stale", age >= 12);
+  }
+}
+
+function setLoadingOverlayJob(job) {
+  loadingOverlayJob = job || null;
+  renderLoadingOverlay();
+}
+
 function renderJobs(items) {
   const box = $("#jobs");
   box.innerHTML = "";
@@ -3007,6 +3058,7 @@ function renderJobs(items) {
   // was reporting real progress.
   const active = [...items].reverse().find((job) => ["running", "stopping"].includes(job.status))
     || [...items].reverse().find((job) => job.status === "queued");
+  setLoadingOverlayJob(active);
   const activeRender = active && ["render", "mix"].includes(active.kind) ? active : null;
   if (!renderInProgress && activeRender) {
     activeRenderJobId = activeRender.id;
@@ -3273,6 +3325,7 @@ if (typeof document !== "undefined") {
       return;
     }
     const queuedJob = await response.json();
+    setLoadingOverlayJob(queuedJob);
     showToast("Re-detecting the complete original session.");
     await pollJobs();
     // Do not wait for the general polling loop to repaint the song list. The
@@ -3282,7 +3335,15 @@ if (typeof document !== "undefined") {
       const jobs = await pollJobs();
       const job = jobs.find((item) => item.id === queuedJob.id) || [...jobs].reverse().find((item) => item.kind === "redetect");
       if (job?.status === "pending_confirmation") {
+        setLoadingOverlayJob(null);
         await reviewRedetectCandidate(job);
+      } else if (job?.status === "pending_review") {
+        setLoadingOverlayJob(null);
+        clearCutLoading();
+        await loadState();
+        const found = Number(job.candidate_count || 0);
+        const preserved = Number(job.previous_count || appState?.songs?.length || 0);
+        showToast("Whisper incomplete: " + found + " slot(s) found; current session (" + preserved + ") preserved.");
       } else if (job?.status === "done") {
         await refreshState({ renderLarge: true });
         showToast(`${appState.songs.length} songs detected from a fresh pass.`);
@@ -3331,6 +3392,9 @@ if (typeof document !== "undefined") {
       if (job?.status === "done") {
         await loadState();
         showToast(`${appState.audio_scan?.accepted?.length || 0} WAV/audio files loaded.`);
+      } else if (job?.status === "pending_review") {
+        await loadState();
+        showToast("Detection incomplete: " + (job.candidate_count || 0) + " candidate slot(s); existing session preserved.");
       } else if (job?.status === "error" || job?.status === "cancelled") {
         await loadState();
         showToast(`Error loading folder: ${job.error || job.stage_detail || job.status}`);
