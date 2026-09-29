@@ -3027,7 +3027,22 @@ function mixEverything() {
   mixSongs(songs, true, songs.length > 1, preflight);
 }
 
-async function runSecondWhisperPass() {
+async async function startOptionalWhisperAnalysis() {
+  const response = await fetch("/api/redetect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ allow_whisper: true }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.id) {
+    showToast(data.error || "Could not start optional Whisper analysis.");
+    return;
+  }
+  setLoadingOverlayJob(data);
+  showToast("Optional Whisper analysis started.");
+  await pollJobs();
+}
+function runSecondWhisperPass() {
   setCutLoading("Second Whisper pass", "Finding missing commentator presentations in suspicious intervals", 10);
   const response = await fetch("/api/redetect/second-pass", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
   const result = await response.json().catch(() => ({}));
@@ -3489,7 +3504,7 @@ if (typeof document !== "undefined") {
   $("#mixSelected").addEventListener("click", () => mixSongs([...checkedSongs], true, true).catch((error) => showToast(`Render failed: ${error.message || error}`)));
   $("#mixAll").addEventListener("click", () => mixEverything());
   $("#editAllCuts").addEventListener("click", () => editAllCuts().catch((error) => { setCutLoading("Error", error.message || String(error)); showToast(error.message || String(error)); }));
-  $("#secondWhisperPass").addEventListener("click", () => runSecondWhisperPass().catch((error) => { setCutLoading("Error", error.message || String(error), 100); showToast(error.message || String(error)); }));
+  $("#secondWhisperPass").addEventListener("click", () => startOptionalWhisperAnalysis().catch((error) => { setCutLoading("Error", error.message || String(error), 100); showToast(error.message || String(error)); }));
   $("#cancelJob").addEventListener("click", () => {
     if (!window.confirm("Are you sure you want to cancel?")) return;
     fetch("/api/cancel", { method: "POST" }).then(pollJobs);
@@ -3518,7 +3533,7 @@ if (typeof document !== "undefined") {
   $("#redetectSongs").addEventListener("click", async () => {
     if (!window.confirm("Re-detect the complete original session? Current slots remain until you confirm the comparison.")) return;
     setCutLoading("Re-detecting songs", "Preparing full original session", 2);
-    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: true }) });
+    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: false }) });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       showToast(data.error || "Could not start song detection.");
@@ -3586,7 +3601,7 @@ if (typeof document !== "undefined") {
     const detection = await fetch("/api/redetect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allow_whisper: true }),
+      body: JSON.stringify({ allow_whisper: false }),
     });
     if (!detection.ok) {
       showToast("Source folder changed, but automatic detection could not start.");
