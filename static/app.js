@@ -3027,7 +3027,7 @@ function mixEverything() {
   mixSongs(songs, true, songs.length > 1, preflight);
 }
 
-async async function startOptionalWhisperAnalysis() {
+async function startOptionalWhisperAnalysis() {
   const response = await fetch("/api/redetect", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
