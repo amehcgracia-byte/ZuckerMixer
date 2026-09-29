@@ -3535,7 +3535,7 @@ if (typeof document !== "undefined") {
     // fetch is the authoritative post-Re-detect count/boundary refresh.
     const waitForFreshDetection = async () => {
       const jobs = await pollJobs();
-      const job = [...jobs].reverse().find((item) => item.kind === "redetect");
+      const job = jobs.find((item) => item.id === queuedJob.id) || [...jobs].reverse().find((item) => item.kind === "redetect");
       if (job?.status === "pending_confirmation") {
         setLoadingOverlayJob(null);
         clearCutLoading();
@@ -3591,10 +3591,12 @@ if (typeof document !== "undefined") {
       showToast("Source folder changed, but automatic detection could not start.");
       return;
     }
+    const detectionJob = await detection.json();
+    setLoadingOverlayJob(detectionJob);
     await pollJobs();
     const waitForSourceDetection = async () => {
       const jobs = await pollJobs();
-      const job = [...jobs].reverse().find((item) => item.kind === "redetect");
+      const job = jobs.find((item) => item.id === detectionJob.id) || [...jobs].reverse().find((item) => item.kind === "redetect");
       if (job?.status === "done") {
         await loadState();
         showToast(`${appState.audio_scan?.accepted?.length || 0} WAV/audio files loaded.`);
