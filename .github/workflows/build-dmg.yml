@@ -40,6 +40,7 @@ jobs:
           ./build_app.sh
           DMG_PATH="dist/ZuckerMixer-${{ steps.version.outputs.version }}.dmg"
           test -f "$DMG_PATH"
+          "dist/ZuckerMixer.app/Contents/MacOS/ZuckerMixer" --self-check
           hdiutil imageinfo "$DMG_PATH" | grep -E 'image-variant|partition-partition' || true
           VERIFY_MOUNT="$(mktemp -d)"
           cleanup_verify_mount() {
