@@ -2,7 +2,7 @@ name: Build macOS DMG
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'consolidated-*']
   workflow_dispatch:
 
 permissions:
