@@ -146,7 +146,7 @@ EOF
 
   echo "Installing build requirements into .buildenv"
   "$BUILD_PY" -m pip install --upgrade pip setuptools wheel || die "Could not upgrade pip in .buildenv"
-  "$BUILD_PIP" install --upgrade pyinstaller pywebview Flask numpy scipy soundfile pyloudnorm pillow || die "Could not install build requirements"
+  "$BUILD_PIP" install --upgrade pyinstaller pywebview Flask numpy scipy soundfile pyloudnorm pillow faster-whisper || die "Could not install build requirements"
   # On Intel macOS, the newest numba currently resolves llvmlite to a source
   # distribution. Pin the last compatible CPython 3.12 binary pair so a clean
   # build does not require a separately installed LLVM toolchain.
