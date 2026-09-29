@@ -301,31 +301,15 @@ cp "$ICNS" "$DMG_ROOT/.VolumeIcon.icns" || die "Could not copy volume icon into 
 mkdir -p "$DMG_ROOT/.background"
 cp "$DMG_BG" "$DMG_ROOT/.background/background.png" || die "Could not copy DMG background"
 
-if command -v create-dmg >/dev/null 2>&1; then
-  rm -f "$DMG_ROOT/Applications"
-  create-dmg \
-    --volname "${APP_NAME} ${APP_VERSION}" \
-    --volicon "$ICNS" \
-    --background "$DMG_BG" \
-    --window-pos 200 120 \
-    --window-size 720 420 \
-    --icon-size 96 \
-    --icon "${APP_NAME}.app" 185 230 \
-    --app-drop-link 520 230 \
-    --hide-extension "${APP_NAME}.app" \
-    "$DMG_PATH" \
-    "$DMG_ROOT" || die "create-dmg failed"
-else
-  rm -f "$DMG_ROOT/Applications"
-  ln -s /Applications "$DMG_ROOT/Applications" || die "Could not create Applications symlink"
-  SetFile -a C "$DMG_ROOT" 2>/dev/null || true
-  hdiutil create \
-    -volname "${APP_NAME} ${APP_VERSION}" \
-    -srcfolder "$DMG_ROOT" \
-    -ov \
-    -format UDZO \
-    "$DMG_PATH" || die "hdiutil DMG creation failed"
-fi
+rm -f "$DMG_ROOT/Applications"
+ln -s /Applications "$DMG_ROOT/Applications" || die "Could not create Applications symlink"
+SetFile -a C "$DMG_ROOT" 2>/dev/null || true
+hdiutil create \
+  -volname "${APP_NAME} ${APP_VERSION}" \
+  -srcfolder "$DMG_ROOT" \
+  -ov \
+  -format UDZO \
+  "$DMG_PATH" || die "hdiutil DMG creation failed"
 
 [[ -f "$DMG_PATH" ]] || die "DMG was not created: $DMG_PATH"
 
