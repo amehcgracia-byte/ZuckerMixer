@@ -40,6 +40,11 @@ import jam_app
 import jam_mix_pipeline as pipeline
 
 
+if "--self-check" in sys.argv:
+    print("ZuckerMixer frozen import self-check: OK", flush=True)
+    raise SystemExit(0)
+
+
 class ZuckerMixerApi:
     def choose_source_folder(self, default_dir: str) -> dict[str, Any]:
         window = webview.windows[0] if webview.windows else None
