@@ -5,10 +5,18 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 APP_NAME="ZuckerMixer"
-APP_VERSION="2.1.8"
+VERSION_FILE="$ROOT/VERSION"
+if [[ -n "${ZUCKER_APP_VERSION:-}" ]]; then
+  APP_VERSION="$ZUCKER_APP_VERSION"
+elif [[ -f "$VERSION_FILE" ]]; then
+  APP_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+else
+  APP_VERSION="development"
+fi
+[[ -n "$APP_VERSION" ]] || APP_VERSION="development"
 APP_BUNDLE="$ROOT/dist/${APP_NAME}.app"
 DMG_ROOT="$ROOT/dist/dmg_root"
-DMG_PATH="$ROOT/dist/${APP_NAME}.dmg"
+DMG_PATH="$ROOT/dist/${APP_NAME}-${APP_VERSION}.dmg"
 LOGO_SRC="$ROOT/static/zucker_logo_orange.png"
 ICONSET="$ROOT/build/zucker.iconset"
 ICNS="$ROOT/zucker.icns"
@@ -31,6 +39,8 @@ if [[ "$#" -ne 0 ]]; then
 fi
 
 echo "== ZuckerMixer macOS build =="
+echo "Application version: $APP_VERSION"
+echo "DMG output: $DMG_PATH"
 
 if [[ "$DMG_ONLY" -eq 1 ]]; then
   SKIP_APP_BUILD=1
@@ -146,8 +156,10 @@ EOF
   "$BUILD_PYINSTALLER" --version >/dev/null || die "PyInstaller did not install correctly in .buildenv"
 
   BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  SOURCE_REVISION="nogit"
-  if git rev-parse --show-toplevel >/dev/null 2>&1; then
+  SOURCE_REVISION="${ZUCKER_SOURCE_REVISION_OVERRIDE:-nogit}"
+  if [[ -n "${ZUCKER_SOURCE_REVISION_OVERRIDE:-}" ]]; then
+    SOURCE_REVISION="$ZUCKER_SOURCE_REVISION_OVERRIDE"
+  elif git rev-parse --show-toplevel >/dev/null 2>&1; then
     SOURCE_REVISION="$(git rev-parse HEAD)"
     if ! git diff --quiet -- . ':!build' ':!dist'; then
       SOURCE_REVISION+="-dirty"
@@ -264,6 +276,16 @@ if [[ "$SKIP_APP_BUILD" -eq 0 ]]; then
     die "Build failed: $APP_BUNDLE was not created"
   fi
 
+  # Never publish a DMG whose filename says one version while the bundle
+  # advertises another one. This catches stale PyInstaller bundles and
+  # packaging regressions before the DMG is created.
+  INFO_PLIST="$APP_BUNDLE/Contents/Info.plist"
+  [[ -f "$INFO_PLIST" ]] || die "Built app has no Info.plist: $INFO_PLIST"
+  BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST" 2>/dev/null || true)"
+  [[ "$BUNDLE_VERSION" == "$APP_VERSION" ]] || die "Bundle version mismatch: expected $APP_VERSION, found $BUNDLE_VERSION"
+  BUILD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST" 2>/dev/null || true)"
+  [[ "$BUILD_VERSION" == "$APP_VERSION" ]] || die "Bundle build version mismatch: expected $APP_VERSION, found $BUILD_VERSION"
+  echo "Verified app bundle version: $BUNDLE_VERSION"
   echo "Built app bundle in project: $APP_BUNDLE"
 else
   [[ -d "$APP_BUNDLE" ]] || die "Existing app bundle disappeared: $APP_BUNDLE"
@@ -282,7 +304,7 @@ cp "$DMG_BG" "$DMG_ROOT/.background/background.png" || die "Could not copy DMG b
 if command -v create-dmg >/dev/null 2>&1; then
   rm -f "$DMG_ROOT/Applications"
   create-dmg \
-    --volname "$APP_NAME" \
+    --volname "${APP_NAME} ${APP_VERSION}" \
     --volicon "$ICNS" \
     --background "$DMG_BG" \
     --window-pos 200 120 \
@@ -298,7 +320,7 @@ else
   ln -s /Applications "$DMG_ROOT/Applications" || die "Could not create Applications symlink"
   SetFile -a C "$DMG_ROOT" 2>/dev/null || true
   hdiutil create \
-    -volname "$APP_NAME" \
+    -volname "${APP_NAME} ${APP_VERSION}" \
     -srcfolder "$DMG_ROOT" \
     -ov \
     -format UDZO \
