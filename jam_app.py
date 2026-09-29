@@ -3492,7 +3492,7 @@ def api_state() -> Response:
             # A cache miss must perform the real song detection. The lightweight
             # scan is useful for diagnostics, but it cannot produce usable slots
             # without Whisper and otherwise leaves a misleading one-block session.
-            api_redetect(True)
+            api_redetect(False)
         return jsonify(_loading_state()), 200
     return jsonify(public_state()), 200
 
@@ -3975,7 +3975,7 @@ def api_song_name(segment_id: int) -> Response:
 
 
 @app.post("/api/redetect")
-def api_redetect(allow_whisper: bool = True) -> Response:
+def api_redetect(allow_whisper: bool = False) -> Response:
     payload = request.get_json(force=True, silent=True) or {}
     if "allow_whisper" in payload:
         allow_whisper = bool(payload.get("allow_whisper"))
