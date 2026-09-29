@@ -3585,7 +3585,7 @@ if (typeof document !== "undefined") {
     const detection = await fetch("/api/redetect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allow_whisper: false }),
+      body: JSON.stringify({ allow_whisper: true }),
     });
     if (!detection.ok) {
       showToast("Source folder changed, but automatic detection could not start.");
