@@ -34,6 +34,37 @@ def record_worker_bootstrap() -> None:
 
 
 record_worker_bootstrap()
+
+
+def ensure_pipeline_module() -> None:
+    """Load jam_mix_pipeline from the frozen bundle when import discovery misses it."""
+    try:
+        import jam_mix_pipeline  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    module_path = bundle_root / "jam_mix_pipeline.py"
+    if not module_path.is_file():
+        raise ModuleNotFoundError(
+            f"jam_mix_pipeline.py is missing from frozen bundle: {module_path}"
+        )
+
+    import importlib.util
+
+    module_spec = importlib.util.spec_from_file_location(
+        "jam_mix_pipeline", str(module_path)
+    )
+    if module_spec is None or module_spec.loader is None:
+        raise ImportError(f"Cannot load frozen module: {module_path}")
+
+    module = importlib.util.module_from_spec(module_spec)
+    sys.modules["jam_mix_pipeline"] = module
+    module_spec.loader.exec_module(module)
+
+
+ensure_pipeline_module()
 import webview
 
 import jam_app
