@@ -108,6 +108,8 @@ jobs:
             --add-data 'static;static' `
             --add-data 'build/build_metadata.json;build' `
             --add-data 'whisper_transcribe.py;.' `
+            --add-data 'jam_app.py;.' `
+            --add-data 'jam_mix_pipeline.py;.' `
             --hidden-import flask `
             --hidden-import werkzeug `
             --hidden-import webview `
@@ -119,8 +121,12 @@ jobs:
             --hidden-import pyloudnorm `
             --hidden-import cffi `
             --hidden-import _cffi_backend `
+            --hidden-import jam_app `
+            --hidden-import jam_mix_pipeline `
             mac_app.py
           if (-not (Test-Path dist/ZuckerMixer.exe)) { throw 'ZuckerMixer.exe was not created' }
+          & "$PWD/dist/ZuckerMixer.exe" --self-check
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows self-check failed' }
           New-Item -ItemType Directory -Force -Path dist/package | Out-Null
           Copy-Item dist/ZuckerMixer.exe dist/package/ZuckerMixer.exe -Force
           "ZuckerMixer $version" | Set-Content dist/package/VERSION.txt -Encoding utf8
