@@ -933,3 +933,20 @@ a {
     margin-right: -22px;
   }
 }
+
+
+#loadingOverlay[hidden] { display: none !important; }
+#loadingOverlay { position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center; padding: 22px; background: radial-gradient(circle at center, #2a1b12 0%, #100c09 58%, #070605 100%); }
+.loading-stage { position: relative; width: min(980px, 96vw); max-height: 92vh; overflow: hidden; border: 1px solid rgba(255, 157, 66, .38); border-radius: 18px; background: #100c09; box-shadow: 0 24px 80px rgba(0,0,0,.55); }
+.loading-stage-media { display: block; width: 100%; max-height: 78vh; min-height: 280px; object-fit: contain; background: #100c09; image-rendering: auto; }
+.loading-stage-info { position: absolute; left: 5%; right: 5%; bottom: 5%; padding: 16px 18px; border: 1px solid rgba(255, 200, 150, .2); border-radius: 12px; background: rgba(18, 12, 9, .78); backdrop-filter: blur(4px); }
+.loading-stage-info h2 { margin: 0 0 5px; font-size: clamp(1.05rem, 2.2vw, 1.55rem); }
+.loading-stage-info p { margin: 5px 0; }
+.loading-stage-progress { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; margin-top: 10px; color: var(--cream); font-variant-numeric: tabular-nums; }
+.loading-stage-progress .progress-track { height: 8px; }
+#loadingOverlayPercent { min-width: 3.5rem; text-align: right; }
+.loading-overlay-health { min-height: 1.2em; color: var(--muted); font-size: .8rem; }
+.loading-overlay-health.stale { color: #ffd08f; }
+body.loading-mode > header, body.loading-mode > main { pointer-events: none; }
+body.loading-mode #loadingStatus { display: none !important; }
+@media (max-width: 680px) { #loadingOverlay { padding: 10px; } .loading-stage-info { left: 3%; right: 3%; bottom: 3%; padding: 12px; } .loading-stage-media { min-height: 220px; } }
