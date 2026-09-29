@@ -38,8 +38,19 @@ jobs:
         run: |
           chmod +x build_app.sh
           ./build_app.sh
-          test -f "dist/ZuckerMixer-${{ steps.version.outputs.version }}.dmg"
-          hdiutil imageinfo "dist/ZuckerMixer-${{ steps.version.outputs.version }}.dmg" | grep -E 'image-variant|partition-partition' || true
+          DMG_PATH="dist/ZuckerMixer-${{ steps.version.outputs.version }}.dmg"
+          test -f "$DMG_PATH"
+          hdiutil imageinfo "$DMG_PATH" | grep -E 'image-variant|partition-partition' || true
+          VERIFY_MOUNT="$(mktemp -d)"
+          cleanup_verify_mount() {
+            hdiutil detach "$VERIFY_MOUNT" >/dev/null 2>&1 || true
+            rmdir "$VERIFY_MOUNT" >/dev/null 2>&1 || true
+          }
+          trap cleanup_verify_mount EXIT
+          hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$VERIFY_MOUNT" >/dev/null
+          DMG_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$VERIFY_MOUNT/ZuckerMixer.app/Contents/Info.plist" 2>/dev/null || true)"
+          test "$DMG_VERSION" = "${{ steps.version.outputs.version }}"
+          echo "Verified DMG bundle version: $DMG_VERSION"
 
       - name: Upload versioned DMG
         uses: actions/upload-artifact@v4
