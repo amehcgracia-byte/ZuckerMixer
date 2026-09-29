@@ -23,7 +23,8 @@ import tempfile
 import time
 import hashlib
 import io
-import pickle
+import queue
+import threading
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -82,39 +83,15 @@ MC_CLUSTER_REWARD_SECONDS = 25.0
 MC_SHORT_ISOLATED_SECONDS = 12.0
 MC_MIN_FINAL_SONG_SECONDS = 4 * 60.0
 MC_SANITY_ANCHOR_TOLERANCE_SECONDS = 90.0
-MC_EAR_CONFIRMED_SPLITS = [
-    ("ear 04:44:09", 4 * 3600 + 44 * 60 + 9),
-    ("ear 04:57:04", 4 * 3600 + 57 * 60 + 4),
-    ("ear 05:31:04", 5 * 3600 + 31 * 60 + 4),
-    ("ear 05:45:17", 5 * 3600 + 45 * 60 + 17),
-    ("ear 06:16:59", 6 * 3600 + 16 * 60 + 59),
-    ("ear 06:43:36", 6 * 3600 + 43 * 60 + 36),
-    ("ear 06:57:12", 6 * 3600 + 57 * 60 + 12),
-    ("ear 07:10:49", 7 * 3600 + 10 * 60 + 49),
-]
-MC_SANITY_ANCHORS = [
-    ("05:07", 5 * 3600 + 7 * 60),
-    ("05:19", 5 * 3600 + 19 * 60),
-    ("06:28", 6 * 3600 + 28 * 60),
-    ("06:43", 6 * 3600 + 43 * 60),
-    ("07:10", 7 * 3600 + 10 * 60),
-    ("07:49", 7 * 3600 + 49 * 60),
-    ("08:01", 8 * 3600 + 1 * 60),
-    ("08:22", 8 * 3600 + 22 * 60),
-    ("08:47", 8 * 3600 + 47 * 60),
-    ("08:59", 8 * 3600 + 59 * 60),
-    ("09:38", 9 * 3600 + 38 * 60),
-    ("09:43", 9 * 3600 + 43 * 60),
-    ("09:56", 9 * 3600 + 56 * 60),
-] + MC_EAR_CONFIRMED_SPLITS
+MC_EAR_CONFIRMED_SPLITS = []
+MC_SANITY_ANCHORS = []
 SUSPICIOUS_SHORT_SONG_SECONDS = 5 * 60.0
 SUSPICIOUS_LONG_SONG_SECONDS = 20 * 60.0
-HARD_MIN_SONG_SECONDS = 8 * 60.0
-HARD_MAX_SONG_SECONDS = 13 * 60.0
-# This recording is presented in roughly 26 commentator-led slots.  The
-# count is a calibration target, never a reason to invent acoustic cuts.
-EXPECTED_SONG_COUNT = 26
-EXPECTED_SLOT_COUNT = 26
+# Permissive defaults. Each source can define its own review policy.
+HARD_MIN_SONG_SECONDS = 90.0
+HARD_MAX_SONG_SECONDS = 4 * 3600.0
+EXPECTED_SONG_COUNT = None
+EXPECTED_SLOT_COUNT = None
 RHYTHM_ANALYSIS_MAX_SECONDS = 300.0
 RHYTHM_ANALYSIS_SR = 11025
 RHYTHM_ONSET_TOLERANCE_BEATS = 0.16
@@ -158,6 +135,11 @@ AUTO_MIX_MAX_BOOST_DB = 0.0
 # capture would otherwise disappear. All other roles can only be attenuated
 # automatically. These limits are per song, never session-global.
 AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0}
+# Deliberate first-pass guitar trim: guitars were repeatedly masking vocals
+# in the user's real sessions. This is applied before per-song caps and is
+# included in the analysis signature so old plans cannot survive unnoticed.
+AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -3.0}
+AUTO_MIX_PROFILE_VERSION = 2
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -212,13 +194,17 @@ DETECTION_CACHE_ALGORITHM_VERSION = "20260926-global-boundary-timeline-v5"
 SPEECH_DETECTION_ALGORITHM_VERSION = "20260827-whisper-v1"
 SPEECH_TRANSCRIPTION_CACHE_VERSION = "20260926-commentator-slots-v3"
 WHISPER_MODEL_SIZE = os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")
-WHISPER_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "90"))
+WHISPER_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_IDLE_TIMEOUT_SECONDS", os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "300")))
+WHISPER_MODEL_START_TIMEOUT_SECONDS = float(os.environ.get("ZUCKER_WHISPER_MODEL_START_TIMEOUT_SECONDS", "60"))
 WHISPER_ENV = Path(__file__).resolve().parent / ".whisperenv"
 LAST_SPEECH_TRANSCRIPTIONS: list[dict[str, object]] = []
 LAST_WHISPER_STATUS: dict[str, object] = {"status": "not_started"}
 WHISPER_ALLOWED = True
 KNOWN_SONG_COUNT: int | None = None
 DETECTION_RESCAN_MODE = False
+DETECTION_PROFILE_VERSION = "20260927-source-scoped-profile-v1"
+DETECTION_PROFILE_SIGNATURE = "default"
+SESSION_DETECTION_PROFILE: dict[str, object] = {}
 
 
 def whisper_runtime_paths() -> tuple[Path, Path]:
@@ -252,6 +238,168 @@ def configure_detection_cache(source_dir: Path | None = None, cache_root: Path |
         DETECTION_CACHE_ROOT = Path(cache_root).expanduser().resolve()
     DETECTION_CACHE = detection_cache_path(source_dir)
     return DETECTION_CACHE
+
+
+def _profile_number(profile: dict[str, object], keys: tuple[str, ...], default: float | None) -> float | None:
+    for key in keys:
+        value = profile.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _profile_time(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if ":" not in text:
+            return float(text)
+        parts = [float(part) for part in text.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60.0 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _profile_markers(values: object, prefix: str) -> list[tuple[str, float]]:
+    if not isinstance(values, list):
+        return []
+    markers: list[tuple[str, float]] = []
+    for index, item in enumerate(values, 1):
+        label = f"{prefix} {index}"
+        raw_time = item
+        if isinstance(item, dict):
+            label = str(item.get("label") or label)
+            raw_time = item.get("seconds", item.get("time", item.get("timestamp")))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            label = str(item[0] or label)
+            raw_time = item[1]
+        seconds = _profile_time(raw_time)
+        if seconds is not None and seconds >= 0:
+            markers.append((label, seconds))
+    return markers
+
+
+def configure_detection_profile(profile: dict[str, object] | None = None) -> dict[str, object]:
+    """Apply one source's detection policy without leaking another source's calibration."""
+    global SESSION_DETECTION_PROFILE, DETECTION_PROFILE_SIGNATURE
+    global WHISPER_MODEL_SIZE, WHISPER_TIMEOUT_SECONDS, KNOWN_SONG_COUNT
+    global EXPECTED_SONG_COUNT, EXPECTED_SLOT_COUNT, MIN_SONG_SECONDS
+    global HARD_MIN_SONG_SECONDS, HARD_MAX_SONG_SECONDS
+    global MC_STRUCTURAL_MIN_SONG_SECONDS, MC_STRUCTURAL_MAX_SONG_SECONDS
+    global MC_STRUCTURAL_CLOSE_SONG_SECONDS, MC_MIN_FINAL_SONG_SECONDS
+    global SUSPICIOUS_SHORT_SONG_SECONDS, SUSPICIOUS_LONG_SONG_SECONDS
+    global MC_EAR_CONFIRMED_SPLITS, MC_SANITY_ANCHORS
+    raw = dict(profile or {})
+    SESSION_DETECTION_PROFILE = raw
+    expected_raw = raw.get("expected_song_count", raw.get("known_song_count"))
+    try:
+        expected = int(expected_raw) if expected_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        expected = None
+    if expected is not None and expected < 1:
+        expected = None
+    KNOWN_SONG_COUNT = expected
+    EXPECTED_SONG_COUNT = expected
+    EXPECTED_SLOT_COUNT = expected
+
+    minimum = _profile_number(raw, ("min_song_seconds", "hard_min_song_seconds"), 90.0)
+    maximum = _profile_number(raw, ("max_song_seconds", "hard_max_song_seconds"), 4 * 3600.0)
+    structural_min = _profile_number(raw, ("structural_min_song_seconds",), minimum)
+    structural_max = _profile_number(raw, ("structural_max_song_seconds",), maximum)
+    close_min = _profile_number(raw, ("structural_close_song_seconds",), minimum)
+    final_min = _profile_number(raw, ("min_final_song_seconds",), minimum)
+    suspicious_short = _profile_number(raw, ("suspicious_short_song_seconds",), 5 * 60.0)
+    suspicious_long = _profile_number(raw, ("suspicious_long_song_seconds",), 20 * 60.0)
+    MIN_SONG_SECONDS = max(1.0, float(minimum or 90.0))
+    HARD_MIN_SONG_SECONDS = max(1.0, float(minimum or 90.0))
+    HARD_MAX_SONG_SECONDS = max(HARD_MIN_SONG_SECONDS, float(maximum or 4 * 3600.0))
+    MC_STRUCTURAL_MIN_SONG_SECONDS = max(1.0, float(structural_min or HARD_MIN_SONG_SECONDS))
+    MC_STRUCTURAL_MAX_SONG_SECONDS = max(MC_STRUCTURAL_MIN_SONG_SECONDS, float(structural_max or HARD_MAX_SONG_SECONDS))
+    MC_STRUCTURAL_CLOSE_SONG_SECONDS = max(1.0, float(close_min or MC_STRUCTURAL_MIN_SONG_SECONDS))
+    MC_MIN_FINAL_SONG_SECONDS = max(1.0, float(final_min or MC_STRUCTURAL_MIN_SONG_SECONDS))
+    SUSPICIOUS_SHORT_SONG_SECONDS = max(0.0, float(suspicious_short or 0.0))
+    SUSPICIOUS_LONG_SONG_SECONDS = max(SUSPICIOUS_SHORT_SONG_SECONDS, float(suspicious_long or HARD_MAX_SONG_SECONDS))
+
+    model = str(raw.get("whisper_model") or os.environ.get("ZUCKER_WHISPER_MODEL", "tiny")).strip()
+    WHISPER_MODEL_SIZE = model or "tiny"
+    timeout = _profile_number(raw, ("whisper_idle_timeout_seconds", "whisper_timeout_seconds"), float(os.environ.get("ZUCKER_WHISPER_IDLE_TIMEOUT_SECONDS", os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "300"))))
+    # This is an inactivity watchdog, not a total Whisper runtime cap. Old
+    # profiles that stored the former 90-second total timeout are migrated to
+    # a safe watchdog automatically.
+    WHISPER_TIMEOUT_SECONDS = max(180.0, float(timeout or 300.0))
+    MC_EAR_CONFIRMED_SPLITS = _profile_markers(raw.get("ear_confirmed_splits", []), "ear")
+    MC_SANITY_ANCHORS = _profile_markers(raw.get("sanity_anchors", []), "anchor")
+    DETECTION_PROFILE_SIGNATURE = hashlib.sha256(
+        json.dumps(raw, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return dict(raw)
+
+
+def _analysis_cache_encode(value: object, arrays: dict[str, np.ndarray]) -> object:
+    if isinstance(value, np.ndarray):
+        key = f"array_{len(arrays):04d}"
+        arrays[key] = np.asarray(value)
+        return {"__ndarray__": key}
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _analysis_cache_encode(item, arrays) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_analysis_cache_encode(item, arrays) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _analysis_cache_restore(value: object, arrays: dict[str, np.ndarray]) -> object:
+    if isinstance(value, dict) and set(value) == {"__ndarray__"}:
+        return np.asarray(arrays[str(value["__ndarray__"])])
+    if isinstance(value, dict):
+        return {str(key): _analysis_cache_restore(item, arrays) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_analysis_cache_restore(item, arrays) for item in value]
+    return value
+
+
+def save_analysis_cache(path: Path, payload: dict[str, object]) -> None:
+    """Persist Auto-Mix analysis without executable pickle payloads."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {}
+    metadata = _analysis_cache_encode(payload, arrays)
+    tmp_path = path.with_name(f".{path.name}.tmp.npz")
+    with tmp_path.open("wb") as handle:
+        np.savez_compressed(handle, __meta__=np.array(json.dumps(metadata, sort_keys=True, default=str), dtype=str), **arrays)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(path)
+
+
+def load_analysis_cache(path: Path) -> dict[str, object]:
+    """Load a non-executable Auto-Mix analysis cache."""
+    path = Path(path)
+    if path.suffix.lower() == ".pkl":
+        raise RuntimeError("Legacy pickle analysis cache rejected; run Analyze again to create a safe cache.")
+    with np.load(path, allow_pickle=False) as data:
+        metadata = json.loads(str(data["__meta__"]))
+        arrays = {name: np.asarray(data[name]) for name in data.files if name != "__meta__"}
+    restored = _analysis_cache_restore(metadata, arrays)
+    if not isinstance(restored, dict):
+        raise RuntimeError("Analysis cache metadata is not an object.")
+    return restored
 
 
 def report_progress(payload: dict[str, object]) -> None:
@@ -696,7 +844,7 @@ def inspect_stems(source_dir: Path) -> list[Stem]:
     total_bytes = sum(max(0, path.stat().st_size) for path in paths)
     bytes_done = 0
     scan_started = time.perf_counter()
-    report_progress({"current_stage": "scanning folder", "stage_detail": f"Scanning source folder — 0 of {len(paths)} files", "progress": 1, "song_progress": 1, "elapsed_seconds": 0.0, "eta_seconds": None, "bytes_read": 0, "bytes_total": total_bytes, "heartbeat": time.time()})
+    report_progress({"current_stage": "scanning folder", "stage_detail": f"Scanning source folder — 0 of {len(paths)} files", "progress": 8, "song_progress": 8, "phase_index": 1, "phase_total": 7, "stem_count": len(paths), "elapsed_seconds": 0.0, "eta_seconds": None, "bytes_read": 0, "bytes_total": total_bytes, "heartbeat": time.time()})
     for file_index, path in enumerate(paths, 1):
         try:
             info = sf.info(str(path))
@@ -1101,7 +1249,19 @@ def speech_candidate_windows(
     timelines: dict[str, np.ndarray],
     session_end: float,
     boundary_probes: list[float] | None = None,
+    focus_regions: list[tuple[float, float]] | None = None,
 ) -> list[tuple[float, float]]:
+    if focus_regions:
+        windows: list[tuple[float, float]] = []
+        for region_start, region_end in focus_regions:
+            cursor = max(0.0, float(region_start))
+            end = min(float(session_end), float(region_end))
+            while cursor < end:
+                piece_end = min(end, cursor + 90.0)
+                if piece_end - cursor >= 2.0:
+                    windows.append((cursor, piece_end))
+                cursor = piece_end
+        return sorted(set(windows))
     voices = [stem for stem in stems if stem.role in {"vocal", "room"}]
     instruments = [stem for stem in stems if stem not in voices]
     if not voices or not instruments:
@@ -1147,11 +1307,14 @@ def transcribe_speech_candidates(
     timelines: dict[str, np.ndarray],
     session_end: float,
     boundary_probes: list[float] | None = None,
+    focus_regions: list[tuple[float, float]] | None = None,
+    timeout_seconds: float | None = None,
 ) -> tuple[list[dict[str, object]], list[Segment]]:
     global LAST_SPEECH_TRANSCRIPTIONS, LAST_WHISPER_STATUS
-    windows = speech_candidate_windows(stems, timelines, session_end, boundary_probes)
+    windows = speech_candidate_windows(stems, timelines, session_end, boundary_probes, focus_regions)
     LAST_SPEECH_TRANSCRIPTIONS = []
-    LAST_WHISPER_STATUS = {"status": "starting", "candidate_windows": len(windows)}
+    effective_timeout = float(timeout_seconds if timeout_seconds is not None else WHISPER_TIMEOUT_SECONDS)
+    LAST_WHISPER_STATUS = {"status": "starting", "candidate_windows": len(windows), "timeout_seconds": effective_timeout}
     whisper_python, worker = whisper_runtime_paths()
     if not whisper_python.exists() or not worker.exists():
         LAST_WHISPER_STATUS = {
@@ -1176,6 +1339,31 @@ def transcribe_speech_candidates(
     ).hexdigest()[:16]
     transcript_cache_path = transcript_cache_root / f"jam_whisper_transcripts_{transcript_digest}.json"
     results: list[dict[str, object]] | None = None
+
+    def compatible_legacy_transcript() -> list[dict[str, object]] | None:
+        """Reuse a same-source transcript when a long Whisper pass times out.
+
+        The current source signature may differ only by the cache algorithm
+        prefix. The stem/file/frame/offset suffix and exact candidate windows
+        must still match, so this cannot mix sessions or selected-slot audio.
+        """
+        current_tail = cache_signature(stems).split("|", 1)[-1]
+        for legacy_path in sorted(transcript_cache_root.glob("jam_whisper_transcripts_*.json")):
+            if legacy_path == transcript_cache_path:
+                continue
+            try:
+                legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+                legacy_tail = str(legacy.get("signature") or "").split("|", 1)[-1]
+                if (
+                    legacy_tail == current_tail
+                    and legacy.get("windows") == [[float(start), float(end)] for start, end in windows]
+                    and isinstance(legacy.get("results"), list)
+                ):
+                    print(f"Reusing compatible same-source Whisper transcript after timeout: {legacy_path}", flush=True)
+                    return list(legacy["results"])
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+        return None
     try:
         # Re-detect is an explicit user command to redo the detection work.
         # The per-stem envelope cache remains reusable, but Whisper must see a
@@ -1221,40 +1409,186 @@ def transcribe_speech_candidates(
             input_json, output_json = temp_dir / "requests.json", temp_dir / "results.json"
             input_json.write_text(json.dumps(requests), encoding="utf-8")
             model_dir = Path.home() / "Library" / "Application Support" / "ZuckerMixer" / "whisper"
-            report_progress({"current_stage": "transcribing speech", "stage_detail": f"Whisper: {len(requests)} candidate windows", "progress": 84, "song_progress": 84, "heartbeat": time.time()})
+            report_progress({"current_stage": "transcribing speech", "stage_detail": f"Preparing Whisper for {len(requests)} commentator windows", "progress": 70, "song_progress": 70, "phase_index": 4, "phase_total": 7, "candidate_windows": len(requests), "heartbeat": time.time()})
             command = [str(whisper_python), str(worker), "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            progress_events: queue.Queue[tuple[str, str]] = queue.Queue()
+            stream_lines: dict[str, list[str]] = {"stdout": [], "stderr": []}
+
+            def drain_stream(name: str, stream: object) -> None:
+                try:
+                    for line in iter(stream.readline, ""):  # type: ignore[attr-defined]
+                        clean = str(line).rstrip()
+                        stream_lines[name].append(clean)
+                        progress_events.put((name, clean))
+                finally:
+                    try:
+                        stream.close()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+
+            stream_threads = [
+                threading.Thread(target=drain_stream, args=("stdout", process.stdout), daemon=True),
+                threading.Thread(target=drain_stream, args=("stderr", process.stderr), daemon=True),
+            ]
+            for thread in stream_threads:
+                thread.start()
+
+            whisper_started = time.monotonic()
+            last_worker_activity = whisper_started
+            completed_windows = 0
+            total_windows = max(1, len(requests))
+            idle_timeout = max(180.0, float(effective_timeout or 300.0))
+            model_start_timeout = max(30.0, WHISPER_MODEL_START_TIMEOUT_SECONDS)
+            model_ready = False
+            watchdog_reason = ""
+            while process.poll() is None:
+                while True:
+                    try:
+                        stream_name, line = progress_events.get_nowait()
+                    except queue.Empty:
+                        break
+                    if stream_name != "stdout" or not line.startswith("{"):
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    event_name = str(event.get("event") or "")
+                    if event_name in {"worker_started", "runtime_ready", "model_loading", "model_ready"}:
+                        last_worker_activity = time.monotonic()
+                        model_ready = model_ready or event_name == "model_ready"
+                        stage_detail = {
+                            "worker_started": "Whisper worker started",
+                            "runtime_ready": "Whisper runtime loaded; loading model",
+                            "model_loading": "Whisper is loading the model",
+                            "model_ready": f"Whisper ready — processing {total_windows} windows",
+                        }.get(event_name, "Whisper starting")
+                        report_progress({
+                            "current_stage": "transcribing speech",
+                            "stage_detail": stage_detail,
+                            "progress": 70,
+                            "process_progress": 0,
+                            "song_progress": 0,
+                            "phase_index": 4,
+                            "phase_total": 7,
+                            "candidate_windows": total_windows,
+                            "whisper_completed_windows": completed_windows,
+                            "whisper_total_windows": total_windows,
+                            "whisper_model_ready": model_ready,
+                            "heartbeat": time.time(),
+                        })
+                    elif event_name == "window_complete":
+                        completed_windows = max(
+                            completed_windows,
+                            min(total_windows, int(event.get("completed") or 0)),
+                        )
+                        last_worker_activity = time.monotonic()
+                        process_progress = int(round(completed_windows / total_windows * 100))
+                        report_progress({
+                            "current_stage": "transcribing speech",
+                            "stage_detail": f"Whisper transcribed window {completed_windows}/{total_windows}",
+                            "progress": 70 + int(round(18 * completed_windows / total_windows)),
+                            "process_progress": process_progress,
+                            "song_progress": process_progress,
+                            "phase_index": 4,
+                            "phase_total": 7,
+                            "candidate_windows": total_windows,
+                            "transcript_count": completed_windows,
+                            "whisper_completed_windows": completed_windows,
+                            "whisper_total_windows": total_windows,
+                            "heartbeat": time.time(),
+                        })
+                elapsed_total = time.monotonic() - whisper_started
+                if not model_ready and elapsed_total >= model_start_timeout:
+                    watchdog_reason = (
+                        f"Whisper model did not become ready after {int(elapsed_total)}s; "
+                        f"automatic fallback before window {completed_windows + 1}/{total_windows}"
+                    )
+                    process.kill()
+                    break
+                idle_seconds = time.monotonic() - last_worker_activity
+                if idle_seconds >= idle_timeout:
+                    watchdog_reason = (
+                        f"Whisper produced no worker event for {int(idle_seconds)}s "
+                        f"while processing window {completed_windows + 1}/{total_windows}"
+                    )
+                    process.kill()
+                    break
+                time.sleep(0.25)
+
             try:
-                completed = subprocess.run(
-                    command,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=WHISPER_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired as exc:
-                LAST_WHISPER_STATUS = {
-                    "status": "timed_out",
-                    "timeout_seconds": WHISPER_TIMEOUT_SECONDS,
-                    "candidate_windows": len(requests),
-                    "stdout": str(exc.stdout or "")[-2000:],
-                    "stderr": str(exc.stderr or "")[-2000:],
-                }
-                raise RuntimeError(f"Whisper timed out after {WHISPER_TIMEOUT_SECONDS:.0f}s") from exc
-            except subprocess.CalledProcessError as exc:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            for thread in stream_threads:
+                thread.join(timeout=2.0)
+            stdout = "\n".join(stream_lines["stdout"])
+            stderr = "\n".join(stream_lines["stderr"])
+
+            if watchdog_reason:
+                legacy_results = compatible_legacy_transcript()
+                if legacy_results is not None:
+                    results = legacy_results
+                    LAST_WHISPER_STATUS = {
+                        "status": "available_cached",
+                        "candidate_windows": total_windows,
+                        "completed_windows": completed_windows,
+                        "reason": f"{watchdog_reason}; reused compatible same-source transcript",
+                        "idle_timeout_seconds": idle_timeout,
+                    }
+                else:
+                    LAST_WHISPER_STATUS = {
+                        "status": "timed_out",
+                        "idle_timeout_seconds": idle_timeout,
+                        "model_start_timeout_seconds": model_start_timeout,
+                        "model_ready": model_ready,
+                        "candidate_windows": total_windows,
+                        "completed_windows": completed_windows,
+                        "reason": watchdog_reason,
+                        "stdout": stdout[-2000:],
+                        "stderr": stderr[-2000:],
+                    }
+                    raise RuntimeError(watchdog_reason)
+            elif process.returncode != 0:
                 LAST_WHISPER_STATUS = {
                     "status": "error",
-                    "returncode": exc.returncode,
-                    "stdout": str(exc.stdout or "")[-2000:],
-                    "stderr": str(exc.stderr or "")[-2000:],
+                    "returncode": process.returncode,
+                    "candidate_windows": total_windows,
+                    "completed_windows": completed_windows,
+                    "stdout": stdout[-2000:],
+                    "stderr": stderr[-2000:],
                 }
-                raise RuntimeError(f"Whisper exited with code {exc.returncode}") from exc
-            results = json.loads(output_json.read_text(encoding="utf-8"))
-            LAST_WHISPER_STATUS = {
-                "status": "available",
-                "candidate_windows": len(requests),
-                "stdout": str(completed.stdout or "")[-2000:],
-                "stderr": str(completed.stderr or "")[-2000:],
-            }
+                raise RuntimeError(f"Whisper exited with code {process.returncode}")
+            else:
+                results = json.loads(output_json.read_text(encoding="utf-8"))
+                report_progress({
+                    "current_stage": "transcribing speech",
+                    "stage_detail": f"Whisper returned {len(results)} transcript windows",
+                    "progress": 88,
+                    "process_progress": 100,
+                    "song_progress": 100,
+                    "phase_index": 4,
+                    "phase_total": 7,
+                    "transcript_count": len(results),
+                    "whisper_completed_windows": len(results),
+                    "whisper_total_windows": total_windows,
+                    "heartbeat": time.time(),
+                })
+                LAST_WHISPER_STATUS = {
+                    "status": "available",
+                    "candidate_windows": total_windows,
+                    "completed_windows": len(results),
+                    "stdout": stdout[-2000:],
+                    "stderr": stderr[-2000:],
+                }
         try:
             transcript_cache_path.parent.mkdir(parents=True, exist_ok=True)
             transcript_cache_path.write_text(json.dumps({
@@ -1288,21 +1622,44 @@ def transcribe_speech_candidates(
         # introduction-less song and trip the structural invariant.
         result["speech_intro_text"] = " ".join(intro_texts).strip() or (text if result["announcement"] else "")
     LAST_SPEECH_TRANSCRIPTIONS = results
+    report_progress({"current_stage": "merging song boundaries", "stage_detail": f"Classifying {len(results)} transcript windows and extracting introductions", "progress": 91, "song_progress": 91, "phase_index": 5, "phase_total": 7, "transcript_count": len(results), "heartbeat": time.time()})
     if not LAST_SPEECH_TRANSCRIPTIONS:
         LAST_WHISPER_STATUS = {"status": "unavailable", "reason": "no transcriptions returned"}
         raise RuntimeError("Whisper is mandatory for detection but produced no transcriptions.")
     print(f"WHISPER STORE CONFIRMED: LAST_SPEECH_TRANSCRIPTIONS={len(LAST_SPEECH_TRANSCRIPTIONS)}", flush=True)
     announcement_windows = select_commentator_announcements(results)
-    LAST_WHISPER_STATUS["eligible_introductions"] = len(announcement_windows)
+    # Whisper can complete every requested window while still finding too few
+    # presenter introductions to build a trustworthy slot list.  Preserve the
+    # complete diagnostic state in that case; raising here used to make the
+    # caller discard the transcript results and silently create one metadata
+    # block for the whole session.
+    transcript_count = len(results)
+    LAST_WHISPER_STATUS = {
+        **LAST_WHISPER_STATUS,
+        "transcript_count": transcript_count,
+        "results_returned": transcript_count,
+        "candidate_windows": len(windows),
+        "completed_windows": transcript_count,
+        "eligible_introductions": len(announcement_windows),
+        "session_segmentation_usable": len(announcement_windows) >= 2,
+    }
     if len(announcement_windows) < 2:
         LAST_WHISPER_STATUS = {
-            "status": "unavailable",
-            "reason": f"fewer than two introductions ({len(announcement_windows)})",
+            **LAST_WHISPER_STATUS,
+            "status": "needs_review",
+            "reason": f"fewer than two introductions ({len(announcement_windows)}) after {transcript_count}/{len(windows)} Whisper windows completed",
         }
-        raise RuntimeError(
-            "Whisper is mandatory for detection but found fewer than two song introductions "
-            f"({len(announcement_windows)}); acoustic-only detection is disabled."
+        print(
+            "WHISPER COMPLETED BUT NEEDS REVIEW: "
+            f"{transcript_count}/{len(windows)} transcript windows, "
+            f"{len(announcement_windows)} eligible introductions; "
+            "no valid session segmentation was produced",
+            flush=True,
         )
+        # Return the transcripts for the diagnostic candidate.  The caller
+        # creates one explicitly review-only provisional block rather than
+        # treating this as a successful one-song detection.
+        return results, []
     segments: list[Segment] = []
     for index, item in enumerate(announcement_windows):
         # The introduction identifies the song and intentionally belongs in
@@ -2233,11 +2590,11 @@ def enforce_hard_song_duration_bounds(
         "final_count": len(result),
         "decisions": decisions,
         "violations_seconds": violations,
-        "count_matches_expected": len(result) == EXPECTED_SONG_COUNT,
+        "count_matches_expected": EXPECTED_SONG_COUNT is None or len(result) == EXPECTED_SONG_COUNT,
     }
     for decision in decisions:
         print("HARD DURATION VALIDATION: " + str(decision), flush=True)
-    print(f"HARD DURATION VALIDATION: final_count={len(result)} expected={EXPECTED_SONG_COUNT} violations={violations}", flush=True)
+    print(f"HARD DURATION VALIDATION: final_count={len(result)} expected={EXPECTED_SONG_COUNT or 'not configured'} violations={violations}", flush=True)
     return result
 
 
@@ -2778,6 +3135,8 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         DETECTION_STRATEGY = {
             "id": "metadata_provisional",
             "label": "Single conservative metadata block; Analyze or Select Cuts required",
+            "candidate_only": True,
+            "session_segmentation_usable": False,
             "detected_count": len(segments),
             "needs_review": True,
             "whisper": LAST_WHISPER_STATUS,
@@ -2786,9 +3145,10 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         return segments, np.array([], dtype=np.float32)
 
     print("\nSONG DETECTION")
-    report_progress({"current_stage": "analyzing stems", "stage_detail": f"analyzing {len(stems)} stems before detecting song boundaries", "progress": 82, "song_progress": 82, "heartbeat": time.time()})
+    report_progress({"current_stage": "reading cached envelopes", "stage_detail": f"Reading cached activity envelopes for {len(stems)} parallel stems", "progress": 24, "song_progress": 24, "phase_index": 2, "phase_total": 7, "stem_count": len(stems), "heartbeat": time.time()})
     print("Loading cached per-stem RMS envelopes for MC-break detection...", flush=True)
     timelines = load_cached_timelines_or_die(stems, "Detection")
+    report_progress({"current_stage": "analyzing stems", "stage_detail": f"Comparing activity across {len(stems)} stems", "progress": 38, "song_progress": 38, "phase_index": 3, "phase_total": 7, "stem_count": len(stems), "heartbeat": time.time()})
     durations = sorted(s.offset_seconds + s.timeline_duration for s in stems)
     metadata_session_end = max(durations)
     session_end = active_session_end_from_timelines(stems, timelines, metadata_session_end)
@@ -2817,6 +3177,7 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     if not instrument_stems:
         raise RuntimeError("No instrument stems found for MC-break detection.")
 
+    report_progress({"current_stage": "analyzing stems", "stage_detail": "Finding commentator transition candidates", "progress": 54, "song_progress": 54, "phase_index": 3, "phase_total": 7, "heartbeat": time.time()})
     mc_data, calibrated_segments = auto_calibrate_detection(voice_stems, instrument_stems, timelines, session_end)
     probe_segments = calibrated_segments
     if not probe_segments:
@@ -2864,10 +3225,31 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     )
     print_mc_breaks(mc_breaks)
     if whisper_available and len(whisper_segments) < 2:
+        transcript_count = int(LAST_WHISPER_STATUS.get("transcript_count") or len(whisper_transcripts))
+        eligible_count = int(LAST_WHISPER_STATUS.get("eligible_introductions") or len(whisper_segments))
+        reason = (
+            f"only {eligible_count} commentator presentation(s) detected after "
+            f"{transcript_count}/{int(LAST_WHISPER_STATUS.get('candidate_windows') or transcript_count)} "
+            "Whisper windows; automatic session replacement is disabled"
+        )
         LAST_WHISPER_STATUS = {
             **LAST_WHISPER_STATUS,
             "status": "needs_review",
-            "reason": f"only {len(whisper_segments)} commentator presentation(s) detected; acoustic fallback disabled",
+            "reason": reason,
+            "transcript_count": transcript_count,
+            "eligible_introductions": eligible_count,
+            "session_segmentation_usable": False,
+        }
+        DETECTION_STRATEGY = {
+            "id": "whisper_completed_insufficient_presentations",
+            "label": "Whisper completed, but the slot candidate is incomplete",
+            "candidate_only": True,
+            "session_segmentation_usable": False,
+            "whisper_transcript_count": transcript_count,
+            "whisper_eligible_introductions": eligible_count,
+            "whisper": dict(LAST_WHISPER_STATUS),
+            "reason": reason,
+            "rhythm_equivalent_sources": rhythm_names,
         }
         whisper_available = False
     if whisper_available:
@@ -2891,11 +3273,30 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         # defensible slot boundary. Do not replace it with drum/acoustic or
         # fixed-clock windows; expose one conservative review block instead.
         segments = provisional_segments_from_metadata(stems)
+        provisional_reason = str(
+            LAST_WHISPER_STATUS.get("reason")
+            or "Commentator-led slot boundaries were not available"
+        )
+        if segments:
+            segments = [replace(
+                segments[0],
+                boundary_source="whisper-incomplete-provisional",
+                boundary_validation="needs_review",
+                boundary_validation_reason=(
+                    "Candidate only; not a valid single-song session: "
+                    + provisional_reason
+                ),
+            )]
         DETECTION_STRATEGY = {
+            **(DETECTION_STRATEGY if isinstance(DETECTION_STRATEGY, dict) else {}),
             "id": "commentator_missing_review",
-            "label": "Commentator-led slots unavailable; Select Cuts required",
+            "label": "Whisper candidate incomplete; Select Cuts required",
+            "candidate_only": True,
+            "session_segmentation_usable": False,
             "detected_count": len(segments),
-            "whisper": LAST_WHISPER_STATUS,
+            "whisper_transcript_count": int(LAST_WHISPER_STATUS.get("transcript_count") or len(whisper_transcripts)),
+            "whisper_eligible_introductions": int(LAST_WHISPER_STATUS.get("eligible_introductions") or len(whisper_segments)),
+            "whisper": dict(LAST_WHISPER_STATUS),
             "rhythm_equivalent_sources": rhythm_names,
             "needs_review": True,
         }
@@ -3111,8 +3512,8 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     DETECTION_STRATEGY["detected_count"] = len(segments)
     print_detected_segments(segments)
     long_count = sum(((seg.nominal_end if seg.nominal_end is not None else seg.end) - seg.start) > 15 * 60 for seg in segments)
-    if len(segments) != EXPECTED_SONG_COUNT or any(not HARD_MIN_SONG_SECONDS <= seg.duration <= HARD_MAX_SONG_SECONDS for seg in segments):
-        print(f"CALIBRATION WARNING: found {len(segments)} songs; hard contract is {EXPECTED_SONG_COUNT} songs, {HARD_MIN_SONG_SECONDS/60:.0f}-{HARD_MAX_SONG_SECONDS/60:.0f} minutes each.", flush=True)
+    if (EXPECTED_SONG_COUNT is not None and len(segments) != EXPECTED_SONG_COUNT) or any(not HARD_MIN_SONG_SECONDS <= seg.duration <= HARD_MAX_SONG_SECONDS for seg in segments):
+        print(f"CALIBRATION WARNING: found {len(segments)} songs; configured target is {EXPECTED_SONG_COUNT or 'not configured'}, duration policy is {HARD_MIN_SONG_SECONDS/60:.0f}-{HARD_MAX_SONG_SECONDS/60:.0f} minutes.", flush=True)
     else:
         print(f"CALIBRATION: found {len(segments)} songs; expected around 20 or more, looks reasonable.", flush=True)
     return segments, mc_mask.astype(np.float32)
@@ -3393,7 +3794,7 @@ def auto_calibrate_detection(
         score = 100.0 - 100.0 * count_error - undercount_penalty - 25.0 * min(median_error, 2.0) - 20.0 * long_fraction
         if best is None or score > best[0]:
             best = (score, (voice, minimum, gap), data, segments)
-        report_progress({"current_stage": "calibrating detection", "stage_detail": f"Testing boundary sensitivity {config_index} of {len(configs)}", "progress": 82 + int(config_index / len(configs) * 10), "song_progress": 82 + int(config_index / len(configs) * 10), "heartbeat": time.time()})
+        report_progress({"current_stage": "calibrating detection", "stage_detail": f"Testing boundary sensitivity {config_index} of {len(configs)}", "progress": 82 + int(config_index / len(configs) * 10), "process_progress": int(config_index / len(configs) * 100), "song_progress": int(config_index / len(configs) * 100), "calibration_current": config_index, "calibration_total": len(configs), "heartbeat": time.time()})
     assert best is not None
     score, selected, data, segments = best
     MC_VOICE_ACTIVE_WITHIN_DB, MC_BREAK_MIN_SECONDS, MC_SCAN_MERGE_GAP_SECONDS = selected
@@ -3572,7 +3973,7 @@ def auto_calibrate_drum_fallback(
         })
         if best is None or score > best[0]:
             best = (score, threshold, gap, segments)
-        report_progress({"current_stage": "calibrating drum fallback", "stage_detail": f"Testing drum silence threshold/gap {index} of {total}", "progress": 92 + int(index / total * 6), "song_progress": 92 + int(index / total * 6), "heartbeat": time.time()})
+        report_progress({"current_stage": "calibrating drum fallback", "stage_detail": f"Testing drum silence threshold/gap {index} of {total}", "progress": 92 + int(index / total * 6), "process_progress": int(index / total * 100), "song_progress": int(index / total * 100), "calibration_current": index, "calibration_total": total, "heartbeat": time.time()})
     if best is None:
         return []
     score, threshold, gap, segments = best
@@ -5356,7 +5757,7 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
     elif role == "vocal":
         bands = [("low", "highpass", 115, 0.707, 0.0), ("mid", "peaking", 3000, 0.9, 2.0), ("air", "highshelf", 11000, 0.707, 1.0)]
     elif role == "guitar":
-        bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 250, 1.0, -2.0), ("fixed", "peaking", 2800, 1.0, 1.0), ("air", "highshelf", 10000, 0.707, 0.0)]
+        bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 250, 1.0, -2.0), ("fixed", "peaking", 2800, 1.0, 0.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role in {"keys", "keys_l", "keys_r"}:
         bands = [("low", "highpass", 80, 0.707, 0.0), ("mid", "peaking", 320, 1.0, -2.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role in {"sax", "horn"}:
@@ -5454,7 +5855,7 @@ def base_level_db(role: str) -> float:
         "keys_l": -7.0,
         "keys_r": -7.0,
         "keys": -8.0,
-        "guitar": -7.5,
+        "guitar": -10.5,
         "synth": -11.0,
         "sax": -8.0,
         "horn": -8.0,
@@ -5476,7 +5877,7 @@ def automatic_makeup_gain_db(
     """
     requested = TARGET_TRACK_RMS_DBFS - float(raw_rms_db)
     cap = MAX_DRUM_MAKEUP_GAIN_DB if role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
-    gain = min(requested, cap) + base_level_db(role)
+    gain = min(requested, cap) + base_level_db(role) + AUTO_MIX_ROLE_TRIMS_DB.get(role, 0.0)
     if role_norm_db is not None and raw_rms_db > -90.0:
         # Move unusually loud/quiet performances toward the session's own
         # role norm without erasing genuine dynamics.
@@ -5537,7 +5938,7 @@ def per_song_auto_mix_gain_db(
     """Calculate a bounded balance correction for one stem in one song."""
     reference = float(accompaniment_reference_db) if accompaniment_reference_db is not None else TARGET_TRACK_RMS_DBFS
     target = reference + (2.0 if role == "vocal" else 0.5 if role == "bass" else 0.0)
-    requested = target - float(stem_active_level_db)
+    requested = target - float(stem_active_level_db) + AUTO_MIX_ROLE_TRIMS_DB.get(role, 0.0)
     upper = float(AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(role, AUTO_MIX_MAX_BOOST_DB))
     return float(np.clip(requested, AUTO_MIX_MAX_ATTENUATION_DB, upper))
 
@@ -6856,7 +7257,7 @@ def render_segment(
         cache_path = Path(str(cache_path_value))
         try:
             with cache_path.open("rb") as cache_file:
-                analysis_cache = pickle.load(cache_file)
+                analysis_cache = load_analysis_cache(cache_path)
         except Exception as exc:
             raise RuntimeError(f"Render analysis snapshot is unavailable: {exc}") from exc
         if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
