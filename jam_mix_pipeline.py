@@ -210,6 +210,12 @@ SESSION_DETECTION_PROFILE: dict[str, object] = {}
 
 
 def whisper_runtime_paths() -> tuple[Path, Path]:
+    """Resolve Whisper from the frozen app first, then from a source checkout."""
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    if getattr(sys, "frozen", False):
+        # The frozen executable dispatches --whisper-worker itself. The script
+        # path is still returned so the detector can verify the bundled data.
+        return Path(sys.executable), bundle_root / "whisper_transcribe.py"
     roots = [Path(__file__).resolve().parent, Path.cwd(), Path.home() / "ZuckerMixer"]
     for root in roots:
         python = root / ".whisperenv" / "bin" / "python"
@@ -1412,7 +1418,10 @@ def transcribe_speech_candidates(
             input_json.write_text(json.dumps(requests), encoding="utf-8")
             model_dir = Path.home() / "Library" / "Application Support" / "ZuckerMixer" / "whisper"
             report_progress({"current_stage": "transcribing speech", "stage_detail": f"Preparing Whisper for {len(requests)} commentator windows", "progress": 70, "song_progress": 70, "phase_index": 4, "phase_total": 7, "candidate_windows": len(requests), "heartbeat": time.time()})
-            command = [str(whisper_python), str(worker), "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
+            if getattr(sys, "frozen", False):
+                command = [str(whisper_python), "--whisper-worker", "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
+            else:
+                command = [str(whisper_python), str(worker), "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
