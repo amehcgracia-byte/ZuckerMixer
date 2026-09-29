@@ -28,6 +28,8 @@ a = Analysis(
         "pyloudnorm",
         "cffi",
         "_cffi_backend",
+        "jam_app",
+        "jam_mix_pipeline",
     ],
     hookspath=[],
     hooksconfig={},
