@@ -10,17 +10,31 @@
   <body>
     <div id="loadingOverlay" hidden aria-live="polite">
       <div class="loading-stage">
-        <img class="loading-stage-media" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
+        <video class="loading-stage-media" autoplay loop muted playsinline preload="auto">
+          <source src="/static/zucker_loading_fragment.mp4" type="video/mp4">
+          <img class="loading-stage-media" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
+        </video>
         <div class="loading-stage-info">
           <h2 id="loadingOverlayTitle">Working...</h2>
           <p id="loadingOverlayDetail">Please wait...</p>
+          <p id="loadingOverlayTiming" class="loading-overlay-timing"></p>
           <p id="loadingOverlayFun" class="progress-fun"></p>
           <div class="loading-stage-progress">
             <span>Session</span>
             <div class="progress-track"><div id="loadingOverlayProgressFill"></div></div>
             <span id="loadingOverlayPercent">0%</span>
           </div>
-          <p id="loadingOverlayHealth" class="loading-overlay-health"></p>
+          <div id="loadingRenderProgress" class="loading-stage-progress loading-render-progress">
+            <span id="loadingRenderLabel">Current process</span>
+            <div class="progress-track"><div id="loadingRenderProgressFill"></div></div>
+            <span id="loadingRenderPercent">0%</span>
+          </div>
+          <div class="loading-activity">
+            <div class="loading-activity-head"><span>Live activity</span><span id="loadingActivityAge"></span></div>
+            <div id="loadingPhaseList" class="loading-phase-list"></div>
+            <div id="loadingSongStates" class="loading-song-states"></div>
+            <p id="loadingOverlayHealth" class="loading-overlay-health"></p>
+          </div>
         </div>
       </div>
     </div>
