@@ -3018,16 +3018,32 @@ function renderLoadingOverlay() {
         : "Working...";
   const detail = job.stage_detail || job.last_event || "Worker is active...";
   const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+  const processProgress = Math.max(0, Math.min(100, Number(job.process_progress ?? job.song_progress ?? 0)));
+  const elapsed = Number(job.elapsed_seconds || 0);
+  const eta = Number(job.eta_seconds || 0);
   const titleNode = $("#loadingOverlayTitle");
   const detailNode = $("#loadingOverlayDetail");
+  const timingNode = $("#loadingOverlayTiming");
   const fillNode = $("#loadingOverlayProgressFill");
   const percentNode = $("#loadingOverlayPercent");
+  const renderFill = $("#loadingRenderProgressFill");
+  const renderPercent = $("#loadingRenderPercent");
+  const renderLabel = $("#loadingRenderLabel");
   const funNode = $("#loadingOverlayFun");
+  const phaseNode = $("#loadingPhaseList");
+  const songsNode = $("#loadingSongStates");
+  const ageNode = $("#loadingActivityAge");
   const healthNode = $("#loadingOverlayHealth");
   if (titleNode) titleNode.textContent = title;
   if (detailNode) detailNode.textContent = detail;
+  if (timingNode) timingNode.textContent = "Elapsed: " + Math.floor(elapsed / 60) + "m " + String(Math.floor(elapsed % 60)).padStart(2, "0") + "s" + (eta > 0 ? " · ETA: ~" + Math.round(eta) + "s" : "");
   if (fillNode) fillNode.style.width = progress + "%";
   if (percentNode) percentNode.textContent = Math.round(progress) + "%";
+  if (renderFill) renderFill.style.width = processProgress + "%";
+  if (renderPercent) renderPercent.textContent = Math.round(processProgress) + "%";
+  if (renderLabel) renderLabel.textContent = kind === "redetect" ? "Whisper / current stage" : "Current process";
+  if (phaseNode) phaseNode.textContent = "Stage " + (Number(job.phase_index || 0) + 1) + "/" + (job.phase_total || 7) + " · " + (job.current_stage || "waiting");
+  if (songsNode) songsNode.textContent = "Items: " + (job.done_count || 0) + "/" + (job.total_count || 1) + (job.current_item ? " · " + job.current_item : "");
   if (funNode) {
     const messages = stage.includes("whisper") || stage.includes("transcrib")
       ? ["Listening for the presenter...", "Separating the introductions from the music..."]
@@ -3037,13 +3053,11 @@ function renderLoadingOverlay() {
   if (healthNode) {
     const last = Number(job.last_event_at || job.progress_updated_at || job.heartbeat || 0) * 1000;
     const age = last ? Math.max(0, Math.floor((Date.now() - last) / 1000)) : 0;
-    healthNode.textContent = age >= 12
-      ? "No new worker event for " + age + "s. The source may be on an external disk."
-      : (job.last_event || detail);
+    if (ageNode) ageNode.textContent = age ? age + "s ago" : "";
+    healthNode.textContent = age >= 12 ? "No new worker event for " + age + "s. The source may be on an external disk." : (job.last_event || detail);
     healthNode.classList.toggle("stale", age >= 12);
   }
 }
-
 function setLoadingOverlayJob(job) {
   loadingOverlayJob = job || null;
   renderLoadingOverlay();
