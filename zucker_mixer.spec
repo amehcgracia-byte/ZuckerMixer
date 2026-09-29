@@ -15,6 +15,8 @@ a = Analysis(
         ("static", "static"),
         ("build/build_metadata.json", "build"),
         ("whisper_transcribe.py", "."),
+        ("jam_app.py", "."),
+        ("jam_mix_pipeline.py", "."),
     ],
     hiddenimports=[
         "flask",
@@ -28,6 +30,8 @@ a = Analysis(
         "pyloudnorm",
         "cffi",
         "_cffi_backend",
+        "jam_app",
+        "jam_mix_pipeline",
     ],
     hookspath=[],
     hooksconfig={},
