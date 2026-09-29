@@ -3042,7 +3042,7 @@ async function startOptionalWhisperAnalysis() {
   showToast("Optional Whisper analysis started.");
   await pollJobs();
 }
-function runSecondWhisperPass() {
+async function runSecondWhisperPass() {
   setCutLoading("Second Whisper pass", "Finding missing commentator presentations in suspicious intervals", 10);
   const response = await fetch("/api/redetect/second-pass", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
   const result = await response.json().catch(() => ({}));
