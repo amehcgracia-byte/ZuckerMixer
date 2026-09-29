@@ -276,6 +276,16 @@ if [[ "$SKIP_APP_BUILD" -eq 0 ]]; then
     die "Build failed: $APP_BUNDLE was not created"
   fi
 
+  # Never publish a DMG whose filename says one version while the bundle
+  # advertises another one. This catches stale PyInstaller bundles and
+  # packaging regressions before the DMG is created.
+  INFO_PLIST="$APP_BUNDLE/Contents/Info.plist"
+  [[ -f "$INFO_PLIST" ]] || die "Built app has no Info.plist: $INFO_PLIST"
+  BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST" 2>/dev/null || true)"
+  [[ "$BUNDLE_VERSION" == "$APP_VERSION" ]] || die "Bundle version mismatch: expected $APP_VERSION, found $BUNDLE_VERSION"
+  BUILD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST" 2>/dev/null || true)"
+  [[ "$BUILD_VERSION" == "$APP_VERSION" ]] || die "Bundle build version mismatch: expected $APP_VERSION, found $BUILD_VERSION"
+  echo "Verified app bundle version: $BUNDLE_VERSION"
   echo "Built app bundle in project: $APP_BUNDLE"
 else
   [[ -d "$APP_BUNDLE" ]] || die "Existing app bundle disappeared: $APP_BUNDLE"
