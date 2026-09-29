@@ -8,7 +8,6 @@ import json
 import math
 import mimetypes
 import os
-import pickle
 import queue
 import re
 import resource
@@ -48,10 +47,15 @@ WAVEFORM_CACHE_PATH = ACTIVE_SOURCE_STATE_ROOT / "waveform_cache.json"
 MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
 SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
 DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
+EDITOR_HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "editor_history.json"
 REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
 REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
+SECOND_PASS_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "whisper_second_pass_candidate.json"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerPreviewCache"
 PREVIEW_DIR = PREVIEW_CACHE_ROOT / "default"
+SOURCE_CONFIG_PATH = ACTIVE_SOURCE_STATE_ROOT / "session_config.json"
+SKIPPED_SEGMENTS_PATH = ACTIVE_SOURCE_STATE_ROOT / "skipped_segments.json"
+CUT_AUDIO_CACHE_ROOT = Path(tempfile.gettempdir()) / "ZuckerMixerCutAudioCache"
 JOB_STATUS_DIR = STATE_ROOT / "job_status"
 JOB_STATUS_DIR.mkdir(parents=True, exist_ok=True)
 LIFECYCLE_LOG_PATH = STATE_ROOT / "redetect_worker_lifecycle.jsonl"
@@ -301,6 +305,20 @@ def load_build_metadata() -> dict[str, str]:
 BUILD_METADATA = load_build_metadata()
 
 
+def runtime_build_metadata() -> dict[str, str]:
+    """Identify the exact frozen resources serving the current WebView."""
+    payload = dict(BUILD_METADATA)
+    for name, key in (("app.js", "app_js_sha256"), ("app.css", "app_css_sha256")):
+        path = RESOURCE_ROOT / "static" / name
+        try:
+            payload[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            payload[key] = "unavailable"
+    payload["runtime_pid"] = str(os.getpid())
+    payload["runtime_bundle"] = str(RESOURCE_ROOT)
+    return payload
+
+
 def json_default(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -344,7 +362,7 @@ def active_stems_for_segment(stems: list[pipeline.Stem], segment: pipeline.Segme
     return [stem.path.name for stem in stems]
 
 
-MIX_PLAN_VERSION = 3
+MIX_PLAN_VERSION = 4
 
 
 def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
@@ -355,6 +373,7 @@ def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_override
         "end_sec": round(float(segment.end), 6),
         "overrides": song_overrides,
         "dsp_revision": BUILD_METADATA.get("source_revision", "development"),
+        "auto_mix_profile": getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
@@ -739,12 +758,11 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "stems": stem_params,
     }
     plan_signature = mix_plan_signature(segment_id, segment, song_overrides)
-    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"mix_analysis_{segment_id}_{plan_signature}.pkl"
-    with cache_path.open("wb") as cache_file:
-        pickle.dump(analysis_cache, cache_file, protocol=pickle.HIGHEST_PROTOCOL)
+    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"mix_analysis_{segment_id}_{plan_signature}.npz"
+    pipeline.save_analysis_cache(cache_path, analysis_cache)
     plan["analysis_cache_path"] = str(cache_path)
     plan["analysis_cache_signature"] = plan_signature
-    plan["analysis_cache_version"] = 1
+    plan["analysis_cache_version"] = 2
     plan["effective_dsp_plan_hash"] = plan_signature
     save_mix_plan(segment_id, segment, song_overrides, plan)
     return plan
@@ -816,6 +834,10 @@ def load_settings() -> dict[str, Any]:
     if not isinstance(settings, dict):
         settings = default_settings()
     settings.setdefault("skipped_segments", [])
+    # Skip state is source-scoped. The legacy field remains in the settings
+    # file for backward compatibility, but it must never hide slots from a
+    # different jam.
+    settings["skipped_segments"] = sorted(load_skipped_segments())
     settings.setdefault("last_render_dir", "")
     settings.setdefault("source_folder", str(pipeline.SOURCE_DIR))
     settings.setdefault("audio_scan_mode", "auto")
@@ -824,8 +846,83 @@ def load_settings() -> dict[str, Any]:
     return settings
 
 
+
+def load_skipped_segments() -> set[int]:
+    payload = load_json(SKIPPED_SEGMENTS_PATH, None)
+    if payload is None:
+        # One-time migration only when the legacy setting belongs to this
+        # exact source. Never carry skipped IDs across sessions.
+        legacy = load_json(SETTINGS_PATH, {})
+        legacy_source = str(legacy.get("source_folder") or "").strip() if isinstance(legacy, dict) else ""
+        current_source = Path(pipeline.SOURCE_DIR).expanduser().resolve()
+        if legacy_source and Path(legacy_source).expanduser().resolve() == current_source:
+            payload = {"segments": legacy.get("skipped_segments", [])}
+        else:
+            payload = {"segments": []}
+    values = payload.get("segments", []) if isinstance(payload, dict) else payload
+    result: set[int] = set()
+    for value in values if isinstance(values, list) else []:
+        try:
+            result.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def save_skipped_segments(values: Any) -> None:
+    result: set[int] = set()
+    for value in values if isinstance(values, list) else []:
+        try:
+            result.add(int(value))
+        except (TypeError, ValueError):
+            raise ValueError("skipped_segments must contain whole numbers")
+    save_json_atomic(SKIPPED_SEGMENTS_PATH, {"version": 1, "segments": sorted(result)})
+
 def save_settings(settings: dict[str, Any]) -> None:
     save_json(SETTINGS_PATH, settings)
+
+
+def default_source_config() -> dict[str, Any]:
+    return {
+        "config_version": 1,
+        "expected_song_count": None,
+        "min_song_seconds": 90.0,
+        "max_song_seconds": 4 * 3600.0,
+        "structural_min_song_seconds": 90.0,
+        "structural_max_song_seconds": 4 * 3600.0,
+        "structural_close_song_seconds": 90.0,
+        "min_final_song_seconds": 90.0,
+        "suspicious_short_song_seconds": 5 * 60.0,
+        "suspicious_long_song_seconds": 20 * 60.0,
+        "whisper_model": os.environ.get("ZUCKER_WHISPER_MODEL", "tiny"),
+        "whisper_idle_timeout_seconds": float(os.environ.get("ZUCKER_WHISPER_IDLE_TIMEOUT_SECONDS", os.environ.get("ZUCKER_WHISPER_TIMEOUT_SECONDS", "300"))),
+        "ear_confirmed_splits": [],
+        "sanity_anchors": [],
+    }
+
+
+def load_source_config() -> dict[str, Any]:
+    config = load_json(SOURCE_CONFIG_PATH, {})
+    if not isinstance(config, dict):
+        config = {}
+    merged = default_source_config()
+    merged.update(config)
+    # Preserve a legacy target only for the source that owned the old setting.
+    if not SOURCE_CONFIG_PATH.exists():
+        legacy = load_settings()
+        legacy_source = str(legacy.get("source_folder") or "").strip()
+        if legacy_source and Path(legacy_source).expanduser().resolve() == Path(pipeline.SOURCE_DIR).expanduser().resolve():
+            raw_count = legacy.get("known_song_count")
+            if raw_count not in (None, ""):
+                try:
+                    merged["expected_song_count"] = int(raw_count)
+                except (TypeError, ValueError):
+                    pass
+    return merged
+
+
+def save_source_config(config: dict[str, Any]) -> None:
+    save_json(SOURCE_CONFIG_PATH, {**default_source_config(), **dict(config), "config_version": 1})
 
 
 def load_manual_splits() -> list[float]:
@@ -845,7 +942,7 @@ def save_manual_splits(values: list[float]) -> None:
 
 
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, PREVIEW_DIR
+    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, EDITOR_HISTORY_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, SECOND_PASS_CANDIDATE_PATH, PREVIEW_DIR, SOURCE_CONFIG_PATH, SKIPPED_SEGMENTS_PATH
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.AUDIO_SCAN_REPORT = {
@@ -868,9 +965,14 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
     SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
     DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
+    EDITOR_HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "editor_history.json"
     REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
     REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
+    SECOND_PASS_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "whisper_second_pass_candidate.json"
     PREVIEW_DIR = PREVIEW_CACHE_ROOT / source_key
+    SOURCE_CONFIG_PATH = ACTIVE_SOURCE_STATE_ROOT / "session_config.json"
+    SKIPPED_SEGMENTS_PATH = ACTIVE_SOURCE_STATE_ROOT / "skipped_segments.json"
+    pipeline.configure_detection_profile(load_source_config())
     return source
 
 
@@ -985,19 +1087,25 @@ def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int
                     except (OSError, ValueError):
                         continue
     files.sort()
-    return (str(source), tuple(mtimes), tuple(files))
+    return (f"{source}|profile={pipeline.DETECTION_PROFILE_SIGNATURE}", tuple(mtimes), tuple(files))
 
 
-def apply_saved_segment_selections(segments: list[pipeline.Segment]) -> list[pipeline.Segment]:
+def apply_saved_segment_selections(segments: list[pipeline.Segment], raw_songs: list[dict[str, Any]] | None = None) -> list[pipeline.Segment]:
     """Apply explicit timeline selections without reusing invalid windows."""
     payload = load_json(SEGMENT_SELECTIONS_PATH, {})
     saved = payload.get("segments", {}) if isinstance(payload, dict) else {}
     if not isinstance(saved, dict):
         return segments
     result = list(segments)
+    raw_by_slot_id = {
+        str(row.get("slot_id")): index
+        for index, row in enumerate(raw_songs or [])
+        if row.get("slot_id")
+    }
     for raw_id, selection in saved.items():
         try:
-            index = int(raw_id) - 1
+            slot_id = selection.get("slot_id") if isinstance(selection, dict) else None
+            index = raw_by_slot_id.get(str(slot_id), int(raw_id) - 1)
             start = float(selection["start_sec"])
             end = float(selection["end_sec"])
         except (KeyError, TypeError, ValueError):
@@ -1077,6 +1185,43 @@ def slot_waveform(start_sec: float, end_sec: float, points: int = 1400) -> dict[
     values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
     result = {"window_start_sec": start_sec, "window_end_sec": end_sec, "duration_sec": duration, "peaks": values, "cached": False}
     cache.setdefault("slots", {})[key] = result
+    save_json_atomic(WAVEFORM_CACHE_PATH, cache)
+    return result
+
+
+def full_session_waveform(points: int = 1800) -> dict[str, Any]:
+    """Return a cached low-resolution envelope for the complete session."""
+    identity = _waveform_identity()
+    cache = load_json(WAVEFORM_CACHE_PATH, {})
+    if not isinstance(cache, dict) or cache.get("identity") != identity:
+        cache = {"identity": identity, "version": 2, "slots": {}}
+    existing = cache.get("global")
+    if isinstance(existing, dict) and len(existing.get("peaks", [])):
+        return {**existing, "cached": True}
+    state = ensure_pipeline_state()
+    end_sec = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in state["stems"]), default=0.0)
+    envelope = np.zeros(points, dtype=np.float32)
+    # The global editor's visual envelope is presentation-only. Use the
+    # shortest available original stem as a representative timeline so
+    # opening the editor never scans tens of gigabytes from every channel.
+    # Detection and rendering still use every stem.
+    visual_stems = sorted(state["stems"], key=lambda item: float(item.timeline_duration))[:1]
+    for stem in visual_stems:
+        try:
+            with sf.SoundFile(str(stem.path)) as audio_file:
+                total = max(1, int(audio_file.frames))
+                for index in range(points):
+                    frame = min(total - 1, int(index / max(1, points - 1) * total))
+                    audio_file.seek(frame)
+                    block = audio_file.read(min(512, total - frame), dtype="float32", always_2d=True)
+                    if len(block):
+                        envelope[index] = max(envelope[index], float(np.max(np.abs(block))))
+        except (OSError, RuntimeError, ValueError):
+            continue
+    peak = float(np.max(envelope)) if len(envelope) else 0.0
+    values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
+    result = {"window_start_sec": 0.0, "window_end_sec": end_sec, "duration_sec": end_sec, "peaks": values, "cached": False}
+    cache["global"] = result
     save_json_atomic(WAVEFORM_CACHE_PATH, cache)
     return result
 
@@ -1335,17 +1480,9 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     global pipeline_state, pipeline_state_signature
     settings = load_settings()
     pipeline.AUDIO_SCAN_MODE = str(settings.get("audio_scan_mode") or "auto")
-    raw_known_count = settings.get("known_song_count")
-    try:
-        pipeline.KNOWN_SONG_COUNT = int(raw_known_count) if raw_known_count not in (None, "") else None
-    except (TypeError, ValueError):
-        pipeline.KNOWN_SONG_COUNT = None
-    # The source-specific setting is the contract for this session. Keep the
-    # pipeline's hard-validation/reporting target in sync with it so a valid
-    # 24-song session is not reported as stale/incorrect against the generic
-    # 27-song default.
-    pipeline.EXPECTED_SONG_COUNT = pipeline.KNOWN_SONG_COUNT or 27
     configure_source_folder(settings.get("source_folder") or pipeline.SOURCE_DIR)
+    source_config = load_source_config()
+    pipeline.configure_detection_profile(source_config)
     signature = detection_state_signature()
     with state_lock:
         if pipeline_state is not None and pipeline_state_signature == signature:
@@ -1368,6 +1505,46 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
                 flush=True,
             )
     if snapshot is not None:
+        # Migrate legacy one-slot snapshots into an explicit review-only
+        # candidate state. Older builds persisted the conservative fallback
+        # without recording that Whisper had failed to produce a usable slot
+        # topology, which made the UI present the whole jam as one valid song.
+        snapshot_stems = snapshot.get("stems", []) if isinstance(snapshot, dict) else []
+        snapshot_slots = snapshot.get("raw_songs", []) if isinstance(snapshot, dict) else []
+        snapshot_duration = max(
+            (
+                float(item.get("offset_seconds", 0.0))
+                + float(item.get("timeline_duration", item.get("duration", 0.0)))
+                for item in snapshot_stems
+                if isinstance(item, dict)
+            ),
+            default=0.0,
+        )
+        if (
+            len(snapshot_slots) == 1
+            and len(snapshot_stems) > 1
+            and snapshot_duration > pipeline.HARD_MAX_SONG_SECONDS
+        ):
+            migration_reason = (
+                f"Legacy snapshot contains one slot for {len(snapshot_stems)} parallel stems "
+                f"spanning {snapshot_duration:.1f}s; full-session segmentation is still pending."
+            )
+            snapshot["candidate_pending"] = True
+            snapshot["segmentation_status"] = "candidate_pending"
+            calibration = dict(snapshot.get("detection_calibration") or {})
+            calibration["candidate_pending"] = True
+            calibration["session_segmentation_usable"] = False
+            strategy = dict(calibration.get("strategy") or {})
+            strategy.update({
+                "id": "legacy_one_slot_candidate",
+                "candidate_only": True,
+                "session_segmentation_usable": False,
+                "needs_review": True,
+                "reason": migration_reason,
+            })
+            calibration["strategy"] = strategy
+            snapshot["detection_calibration"] = calibration
+            print("DETECTION SNAPSHOT MIGRATION: " + migration_reason, flush=True)
         snapshot["audio_scan"] = _ensure_snapshot_scan_report(snapshot)
         with state_lock:
             pipeline_state = snapshot
@@ -1380,8 +1557,34 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     with contextlib.redirect_stdout(capture):
         stems = pipeline.inspect_stems(pipeline.SOURCE_DIR)
         segments, _ = pipeline.detect_segments(stems)
-        segments = apply_manual_splits(segments, load_manual_splits())
-        segments = apply_saved_segment_selections(segments)
+        source_duration = max((stem.offset_seconds + stem.timeline_duration for stem in stems), default=0.0)
+        if len(segments) == 1 and len(stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS:
+            # A one-window fallback after Whisper failure is not a complete
+            # session. Keep it diagnostic/review-only; never present it as a
+            # valid source segmentation or use it as a redetect input.
+            segments = [replace(
+                segments[0],
+                boundary_source="incomplete-source-segmentation",
+                boundary_validation="needs_review",
+                boundary_validation_reason=(
+                    f"Incomplete source segmentation: {len(stems)} original stems span "
+                    f"{source_duration:.1f}s but detection returned one slot"
+                ),
+            )]
+            pipeline.DETECTION_STRATEGY = {
+                **(pipeline.DETECTION_STRATEGY if isinstance(pipeline.DETECTION_STRATEGY, dict) else {}),
+                "id": "incomplete_source_segmentation",
+                "candidate_only": True,
+                "session_segmentation_usable": False,
+                "needs_review": True,
+                "reason": segments[0].boundary_validation_reason,
+            }
+        # A redetect candidate is an automatic view of the original session.
+        # Manual cuts remain a separate override layer and are reapplied only
+        # after the user confirms the candidate replacement.
+        if not pipeline.DETECTION_RESCAN_MODE:
+            segments = apply_manual_splits(segments, load_manual_splits())
+            segments = apply_saved_segment_selections(segments)
         # Public numbering is the stable session order. When the detector has
         # identified leading recorded material as SONG 0, expose that number
         # and continue 1, 2, 3... through the app and exported filenames.
@@ -1393,6 +1596,13 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     session_id = session_id_for_signature(signature)
     raw_songs = []
     strategy = getattr(pipeline, "DETECTION_STRATEGY", {})
+    candidate_pending = bool(
+        isinstance(strategy, dict)
+        and (
+            strategy.get("candidate_only")
+            or strategy.get("session_segmentation_usable") is False
+        )
+    )
     boundary_audit = strategy.get("boundary_audit", []) if isinstance(strategy, dict) else []
     for index, segment in enumerate(segments, 1):
         nominal_end = segment.nominal_end if segment.nominal_end is not None else segment.end
@@ -1408,6 +1618,9 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
                 "manual_end": None,
                 "revision": 0,
                 "detection_version": getattr(pipeline, "SPEECH_TRANSCRIPTION_CACHE_VERSION", "unknown"),
+                "proposal_status": "needs_review" if segment.boundary_validation == "needs_review" else ("manual" if segment.boundary_source == "manual-selection" else "auto"),
+                "cut_reason": segment.speech_reason or segment.boundary_source,
+                "whisper_confidence": float(segment.speech_confidence or 0.0),
                 "start": segment.start,
                 "end": segment.end,
                 "duration": duration,
@@ -1449,7 +1662,7 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
         )
         for song in raw_songs
     )
-    if detected_count != expected_count:
+    if expected_count is not None and detected_count != expected_count:
         calibration_warning = f"Found {detected_count} commentator-led slots — target is approximately {expected_count}; review the slot list before export."
         calibration_level = "warning"
     elif invalid_duration_count:
@@ -1479,9 +1692,13 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
             "stem_info": stems_payload,
             "active_stems_by_song": {},
             "audio_scan": pipeline.audio_scan_report(),
+            "segmentation_status": "candidate_pending" if candidate_pending else "ready",
+            "candidate_pending": candidate_pending,
             "detection_calibration": {
                 "count": detected_count,
                 "expected_minimum": pipeline.EXPECTED_SLOT_COUNT,
+                "candidate_pending": candidate_pending,
+                "session_segmentation_usable": not candidate_pending,
                 "expected_target": expected_count,
                 "unit": "commentator-led slot",
                 "ready_count": detected_count - needs_review_count,
@@ -1511,9 +1728,22 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
     global pipeline_state, pipeline_state_signature
     is_redetect = job_id != "detect"
     had_previous_snapshot = DETECTION_STATE_PATH.exists()
+    previous_count = 0
     if is_redetect and had_previous_snapshot:
+        previous_snapshot = load_json(DETECTION_STATE_PATH, {})
+        if isinstance(previous_snapshot, dict):
+            previous_count = len(previous_snapshot.get("raw_songs", []) or [])
         shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_BACKUP_PATH)
     append_log(job_id, "Searching again from a clean deterministic detection pass; suspicious regions will be rescanned.")
+    app_progress({
+        "current_stage": "preparing session",
+        "stage_detail": "Preparing full original session — loading source signature and source configuration",
+        "progress": 3,
+        "song_progress": 3,
+        "phase_index": 0,
+        "phase_total": 7,
+        "heartbeat": time.time(),
+    })
     pipeline.DETECTION_RESCAN_MODE = True
     with state_lock:
         pipeline_state = None
@@ -1524,11 +1754,35 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
         candidate_count = len(state.get("raw_songs", []))
         if is_redetect:
             if candidate_count < 2:
+                incomplete_reason = (
+                    f"Fresh detection produced only {candidate_count} slot(s); "
+                    f"the current session with {previous_count} slot(s) was preserved."
+                )
+                # Keep the one-slot result as a diagnostic candidate, but never
+                # let it replace the usable session or turn a recoverable
+                # Whisper miss into a worker crash.
+                if DETECTION_STATE_PATH.exists():
+                    shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
                 if REDETECTION_BACKUP_PATH.exists():
                     shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
-                raise RuntimeError(
-                    f"Re-detect produced only {candidate_count} slot(s); previous session preserved and not replaced."
-                )
+                append_log(job_id, "INCOMPLETE REDetect: " + incomplete_reason)
+                app_progress({
+                    "status": "pending_review",
+                    "current_stage": "pending_review",
+                    "stage_detail": incomplete_reason,
+                    "warning": incomplete_reason,
+                    "candidate_count": candidate_count,
+                    "previous_count": previous_count,
+                    "heartbeat": time.time(),
+                    "progress": 100,
+                    "song_progress": 100,
+                })
+                incomplete_state = dict(state)
+                incomplete_state["_redetect_outcome"] = "incomplete"
+                incomplete_state["_redetect_candidate_count"] = candidate_count
+                incomplete_state["_redetect_previous_count"] = previous_count
+                incomplete_state["_redetect_warning"] = incomplete_reason
+                return incomplete_state
             shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
             if REDETECTION_BACKUP_PATH.exists():
                 shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
@@ -1561,7 +1815,7 @@ def visible_songs(
 ) -> list[dict[str, Any]]:
     disk = disk or disk_versions()
     names = names or load_song_names()
-    skipped = {int(x) for x in settings.get("skipped_segments", [])}
+    skipped = load_skipped_segments()
     songs = []
     visible_index = 1
     for raw in state["raw_songs"]:
@@ -1587,7 +1841,7 @@ def visible_songs(
         item["needs_review"] = bool(boundary_review)
         item["render_valid"] = (
             not user_skipped
-            and MIN_RENDER_DURATION_SECONDS <= duration <= MAX_RENDER_DURATION_SECONDS
+            and pipeline.HARD_MIN_SONG_SECONDS <= duration <= pipeline.HARD_MAX_SONG_SECONDS
             and not boundary_review
         )
         item["render_validation"] = (
@@ -1647,6 +1901,7 @@ def _loading_state(error: str = "") -> dict[str, Any]:
         "stems": stem_info,
         "overrides": load_json(OVERRIDES_PATH, {"songs": {}}),
         "settings": settings,
+        "source_config": load_source_config(),
         "jobs": current_jobs(),
         "output_dir": str(out_dir()),
         "average_render_seconds": 180.0,
@@ -1657,7 +1912,7 @@ def _loading_state(error: str = "") -> dict[str, Any]:
         "segmentation_status": "not_available",
         "last_error": error,
         "whisper": pipeline.LAST_WHISPER_STATUS,
-        "build": BUILD_METADATA,
+        "build": runtime_build_metadata(),
     }
 
 
@@ -1693,6 +1948,32 @@ def public_state() -> dict[str, Any]:
         "slot_ids": [item.get("slot_id") for item in raw_slots],
         "visible_slot_count": len(songs),
         "integrity_warning": "Persisted state contains only one slot; full-session re-detection is required before replacement." if len(raw_slots) == 1 else "",
+    }
+    source_stems = state.get("stems", [])
+    source_duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in source_stems), default=0.0)
+    expected_slot_count = pipeline.EXPECTED_SLOT_COUNT
+    incomplete_source = len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS
+    count_mismatch = expected_slot_count is not None and len(raw_slots) != expected_slot_count
+    candidate_pending = bool(
+        state.get("candidate_pending")
+        or state.get("detection_calibration", {}).get("candidate_pending")
+    )
+    source_integrity = {
+        "status": (
+            "Candidate pending review"
+            if candidate_pending
+            else ("Incomplete source segmentation" if incomplete_source else ("Needs review: candidate count differs from configured target" if count_mismatch else "ok"))
+        ),
+        "original_wav_required": True,
+        "stem_count": len(source_stems),
+        "duration_sec": source_duration,
+        "saved_slot_count": len(raw_slots),
+        "expected_slot_count": expected_slot_count,
+        "warning": (
+            "Whisper completed, but the slot list is only a review candidate; it is not a valid single-song session. Original WAVs and Edit Cuts are required."
+            if candidate_pending
+            else ("Source state incomplete; Original WAVs required; no destructive changes made." if incomplete_source else (f"Current slots: {len(raw_slots)}; configured target: {expected_slot_count}. Review Whisper proposals before export." if count_mismatch else ""))
+        ),
     }
     transitions = [
         {
@@ -1730,23 +2011,26 @@ def public_state() -> dict[str, Any]:
         "stems": state["stem_info"],
         "overrides": overrides,
         "settings": settings,
+        "source_config": load_source_config(),
         "jobs": current_jobs(),
         "output_dir": str(out_dir()),
         "average_render_seconds": sum(render_seconds) / len(render_seconds) if render_seconds else 180.0,
         "ffmpeg": ffmpeg_status(),
         "source_folder": str(pipeline.SOURCE_DIR),
         "audio_scan": state.get("audio_scan") or pipeline.audio_scan_report(),
-        "segmentation_status": "ready",
+        "segmentation_status": "candidate_pending" if candidate_pending else "ready",
+        "candidate_pending": candidate_pending,
         "last_error": last_load_error,
         "whisper": whisper_status,
         "detection_calibration": state.get("detection_calibration", {}),
         "slot_audit": slot_audit,
+        "source_integrity": source_integrity,
         "matchering": {
             "available": pipeline.matchering_api is not None,
             "import_error": pipeline.MATCHERING_IMPORT_ERROR,
             "reference": settings.get("matchering_reference", ""),
         },
-        "build": BUILD_METADATA,
+        "build": runtime_build_metadata(),
     }
 
 
@@ -2639,24 +2923,41 @@ def _run_child_job(job_path: Path) -> int:
         app_progress(
             {
                 "status": "running",
-                "current_stage": "detecting songs",
-                "stage_detail": "reading cached envelopes",
+                "current_stage": "preparing session",
+                "stage_detail": "Preparing full original session — checking source signature",
                 "started": time.time(),
                 "heartbeat": time.time(),
-                "progress": 5,
-                "song_progress": 10,
+                "progress": 2,
+                "song_progress": 2,
+                "phase_index": 0,
+                "phase_total": 7,
             }
         )
-        rebuild_detection_state(job_id)
-        app_progress({
-            "status": "pending_confirmation",
-            "current_stage": "validating cuts",
-            "stage_detail": "New full-session detection ready for comparison; current session unchanged",
-            "heartbeat": time.time(),
-            "progress": 100,
-            "song_progress": 100,
-            "done_count": 1,
-        })
+        redetect_result = rebuild_detection_state(job_id)
+        if redetect_result.get("_redetect_outcome") == "incomplete":
+            warning = str(redetect_result.get("_redetect_warning") or "Fresh detection was incomplete; current session preserved.")
+            app_progress({
+                "status": "pending_review",
+                "current_stage": "pending_review",
+                "stage_detail": warning,
+                "warning": warning,
+                "candidate_count": redetect_result.get("_redetect_candidate_count", 0),
+                "previous_count": redetect_result.get("_redetect_previous_count", 0),
+                "heartbeat": time.time(),
+                "progress": 100,
+                "song_progress": 100,
+                "done_count": 1,
+            })
+        else:
+            app_progress({
+                "status": "pending_confirmation",
+                "current_stage": "validating cuts",
+                "stage_detail": "New full-session detection ready for comparison; current session unchanged",
+                "heartbeat": time.time(),
+                "progress": 100,
+                "song_progress": 100,
+                "done_count": 1,
+            })
         return 0
 
     state = load_render_state()
@@ -3087,7 +3388,11 @@ def worker() -> None:
 
 @app.get("/")
 def index() -> str:
-    return render_template("index.html")
+    build = runtime_build_metadata()
+    return render_template(
+        "index.html",
+        static_version=f"{build.get('app_version', 'dev')}-{build.get('source_revision', 'unbuilt')}-{build.get('app_js_sha256', '')[:16]}",
+    )
 
 
 @app.get("/favicon.ico")
@@ -3135,7 +3440,10 @@ def api_state() -> Response:
             except Exception as exc:
                 return jsonify(_loading_state(f"{type(exc).__name__}: {exc}")), 200
         if not detection_active:
-            api_redetect(False)
+            # A cache miss must run the real full-session detection.
+            # A lightweight one-block fallback is diagnostic only and must not
+            # become the visible session for a new source.
+            api_redetect(True)
         return jsonify(_loading_state()), 200
     return jsonify(public_state()), 200
 
@@ -3148,6 +3456,7 @@ def api_cuts(song_id: int) -> Response:
         return jsonify({"error": "song not found"}), 404
     selected = state["segments"][song_id - 1]
     waveform = slot_waveform(float(selected.start), float(selected.end))
+    global_waveform = full_session_waveform()
     markers = []
     for index, segment in enumerate(state["segments"], 1):
         markers.append({
@@ -3165,6 +3474,7 @@ def api_cuts(song_id: int) -> Response:
     return jsonify({
         "song_id": song_id,
         "waveform": waveform,
+        "global_waveform": global_waveform,
         "selection": {"start_sec": float(selected.start), "end_sec": float(selected.end)},
         "markers": markers,
         "bounds": {"min_sec": pipeline.HARD_MIN_SONG_SECONDS, "max_sec": pipeline.HARD_MAX_SONG_SECONDS},
@@ -3176,6 +3486,53 @@ def api_cuts(song_id: int) -> Response:
             "revision": state.get("raw_songs", [{}])[song_id - 1].get("revision", 0),
         },
     })
+
+
+@app.get("/api/cuts/audio/<int:song_id>")
+def api_cut_audio(song_id: int) -> Response:
+    """Provide a temporary downmix of only the selected source slot for playback."""
+    state = ensure_pipeline_state()
+    if song_id < 1 or song_id > len(state["segments"]):
+        return Response(status=404)
+    segment = state["segments"][song_id - 1]
+    start, end = float(segment.start), float(segment.end)
+    signature = hashlib.sha256(f"{Path(pipeline.SOURCE_DIR).resolve()}:{start:.3f}:{end:.3f}".encode()).hexdigest()[:24]
+    CUT_AUDIO_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = CUT_AUDIO_CACHE_ROOT / f"{signature}.wav"
+    if not path.exists():
+        stems = state.get("stems", [])
+        if not stems:
+            return jsonify({"error": "No source stems available for playback."}), 404
+        sample_rate = int(round(float(stems[0].samplerate)))
+        frame_count = max(1, int(round((end - start) * sample_rate)))
+        mix = np.zeros(frame_count, dtype=np.float32)
+        used = 0
+        for stem in stems:
+            try:
+                with sf.SoundFile(str(stem.path)) as audio_file:
+                    sr = float(audio_file.samplerate)
+                    local_start = max(0, int(round((start - float(stem.offset_seconds)) * sr)))
+                    audio_file.seek(local_start)
+                    remaining = frame_count
+                    cursor = 0
+                    while remaining > 0:
+                        block = audio_file.read(min(262144, remaining), dtype="float32", always_2d=True)
+                        if len(block) == 0:
+                            break
+                        mix[cursor:cursor + len(block)] += np.mean(block, axis=1).astype(np.float32)
+                        cursor += len(block)
+                        remaining -= len(block)
+                used += 1
+            except (OSError, RuntimeError, ValueError):
+                continue
+        if used == 0:
+            return jsonify({"error": "Source stems could not be read for playback."}), 404
+        mix /= max(1, used)
+        peak = float(np.max(np.abs(mix))) if len(mix) else 0.0
+        if peak > 0.95:
+            mix *= 0.95 / peak
+        sf.write(path, mix, sample_rate, subtype="PCM_16")
+    return ranged_file_response(path, mimetype="audio/wav")
 
 
 @app.post("/api/segment-selection/<int:song_id>")
@@ -3243,6 +3600,102 @@ def api_segment_selection(song_id: int) -> Response:
             save_detection_snapshot(state, pipeline_state_signature)
     append_log("ui", f"Saved manual cut for song {song_id}: {start:.3f}-{end:.3f}s")
     return jsonify({"ok": True, "song_id": song_id, "start_sec": start, "end_sec": end, "duration_sec": duration, "source": "manual"})
+
+
+def _editor_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    return {"segments": [asdict(segment) for segment in state.get("segments", [])], "raw_songs": state.get("raw_songs", [])}
+
+
+def _restore_editor_snapshot(state: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    segments = [pipeline.Segment(**item) for item in snapshot.get("segments", [])]
+    state["segments"] = segments
+    state["raw_songs"] = snapshot.get("raw_songs", [])
+
+
+@app.post("/api/editor-cut-operation")
+def api_editor_cut_operation() -> Response:
+    """Apply one explicit global-editor operation without running detection."""
+    payload = request.get_json(force=True, silent=True) or {}
+    operation = str(payload.get("operation") or "").strip().lower()
+    state = ensure_pipeline_state()
+    history = load_json(EDITOR_HISTORY_PATH, {"undo": [], "redo": []})
+    if not isinstance(history, dict):
+        history = {"undo": [], "redo": []}
+    history.setdefault("undo", []); history.setdefault("redo", [])
+    current = _editor_snapshot(state)
+    row_hints: list[dict[str, Any] | None] | None = None
+    if operation in {"undo", "redo"}:
+        source = history["undo"] if operation == "undo" else history["redo"]
+        target = history["redo"] if operation == "undo" else history["undo"]
+        if not source:
+            return jsonify({"error": f"Nothing to {operation}."}), 409
+        target.append(current)
+        _restore_editor_snapshot(state, source.pop())
+    else:
+        try:
+            at = float(payload.get("at_sec", payload.get("old_sec")))
+        except (TypeError, ValueError):
+            return jsonify({"error": "at_sec is required for this editor operation."}), 400
+        index = next((i for i, segment in enumerate(state["segments"]) if segment.start < at < segment.end), None)
+        if operation == "add":
+            if index is None:
+                return jsonify({"error": "Playhead is not inside a slot."}), 400
+            segment = state["segments"][index]
+            left = replace(segment, end=at, core_end=at, nominal_end=at, boundary_source="manual-add-cut", boundary_validation="manual-selection", boundary_validation_reason="user added cut")
+            right = replace(segment, start=at, core_start=at, boundary_source="manual-add-cut", boundary_validation="manual-selection", boundary_validation_reason="user added cut")
+            state["segments"][index:index + 1] = [left, right]
+            row_hints = list(state.get("raw_songs", []))
+            row_hints[index:index + 1] = [state.get("raw_songs", [])[index] if index < len(state.get("raw_songs", [])) else None, None]
+        elif operation == "move":
+            try:
+                old_boundary = float(payload.get("old_sec"))
+                new_boundary = float(payload.get("new_sec"))
+            except (TypeError, ValueError):
+                return jsonify({"error": "old_sec and new_sec are required to move a cut."}), 400
+            pair = next((i for i in range(len(state["segments"]) - 1) if abs(state["segments"][i].end - old_boundary) <= 1.0), None)
+            if pair is None:
+                return jsonify({"error": "No slot boundary near the selected marker."}), 400
+            left, right = state["segments"][pair], state["segments"][pair + 1]
+            if not left.start + pipeline.HARD_MIN_SONG_SECONDS <= new_boundary <= right.end - pipeline.HARD_MIN_SONG_SECONDS:
+                return jsonify({"error": "The moved cut would create a slot outside the 8–13 minute safety range."}), 400
+            state["segments"][pair:pair + 2] = [
+                replace(left, end=new_boundary, core_end=new_boundary, nominal_end=new_boundary, boundary_source="manual-move-cut", boundary_validation="manual-selection", boundary_validation_reason="user moved shared cut"),
+                replace(right, start=new_boundary, core_start=new_boundary, boundary_source="manual-move-cut", boundary_validation="manual-selection", boundary_validation_reason="user moved shared cut"),
+            ]
+            row_hints = list(state.get("raw_songs", []))
+        elif operation in {"delete", "merge"}:
+            boundary = at
+            pair = next((i for i in range(len(state["segments"]) - 1) if abs(state["segments"][i].end - boundary) <= 1.0), None)
+            if pair is None:
+                return jsonify({"error": "No slot boundary near the playhead."}), 400
+            left, right = state["segments"][pair], state["segments"][pair + 1]
+            state["segments"][pair:pair + 2] = [replace(left, end=right.end, core_end=right.end, nominal_end=right.end, boundary_source="manual-merge", boundary_validation="manual-selection", boundary_validation_reason="user merged adjacent slots")]
+        else:
+            return jsonify({"error": f"Unknown editor operation: {operation}"}), 400
+        history["undo"].append(current)
+        history["undo"] = history["undo"][-20:]
+        history["redo"] = []
+
+    # Rebuild only the editor rows. Match unchanged rows by their original
+    # interval, never by ordinal, so inserting a cut cannot rename every
+    # following slot.
+    old_rows = state.get("raw_songs", [])
+    session_id = next((row.get("session_id") for row in old_rows if row.get("session_id")), session_id_for_signature(detection_state_signature()))
+    rows = []
+    for ordinal, segment in enumerate(state["segments"], 1):
+        old = row_hints[ordinal - 1] if row_hints is not None and ordinal - 1 < len(row_hints) else next((candidate for candidate in old_rows if abs(float(candidate.get("source_start", candidate.get("start", -999999))) - segment.start) <= 0.01 and abs(float(candidate.get("source_end", candidate.get("end", -999999))) - segment.end) <= 0.01), None)
+        row = dict(old or {})
+        row.update({"id": ordinal, "session_id": row.get("session_id") or session_id, "slot_id": row.get("slot_id") or f"{session_id}:manual-slot-{ordinal:03d}", "start": segment.start, "end": segment.end, "source_start": row.get("source_start", segment.start), "source_end": row.get("source_end", segment.end), "duration": segment.duration, "duration_text": fmt_time(segment.duration), "render_end": segment.end, "segment": asdict(segment), "proposal_status": "manual", "revision": int(row.get("revision", 0) or 0) + 1})
+        rows.append(row)
+    state["raw_songs"] = rows
+    with state_lock:
+        global pipeline_state, pipeline_state_signature
+        pipeline_state = state
+        pipeline_state_signature = detection_state_signature()
+        save_detection_snapshot(state, pipeline_state_signature)
+    save_json_atomic(EDITOR_HISTORY_PATH, history)
+    append_log("ui", f"Global editor operation {operation} applied at {payload.get('at_sec')}")
+    return jsonify({"ok": True, "operation": operation, "slot_count": len(state["segments"]), "segments": [{"start": s.start, "end": s.end} for s in state["segments"]]})
 
 
 @app.post("/api/overrides")
@@ -3356,7 +3809,11 @@ def api_settings() -> Response:
     payload = request.get_json(force=True, silent=True) or {}
     settings = load_settings()
     if "skipped_segments" in payload:
-        settings["skipped_segments"] = sorted({int(x) for x in payload.get("skipped_segments", [])})
+        try:
+            save_skipped_segments(payload.get("skipped_segments", []))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        settings["skipped_segments"] = sorted(load_skipped_segments())
     if "last_render_dir" in payload:
         path = Path(str(payload.get("last_render_dir") or "")).expanduser()
         if str(path):
@@ -3372,6 +3829,8 @@ def api_settings() -> Response:
         with state_lock:
             pipeline_state = None
             pipeline_state_signature = None
+    source_config = load_source_config()
+    source_config_changed = False
     if "audio_scan_mode" in payload:
         mode = str(payload.get("audio_scan_mode") or "auto")
         if mode not in {"auto", "aligned_only", "all"}:
@@ -3382,18 +3841,45 @@ def api_settings() -> Response:
         with state_lock:
             pipeline_state = None
             pipeline_state_signature = None
-    if "known_song_count" in payload:
-        raw_count = payload.get("known_song_count")
+    if "known_song_count" in payload or "expected_song_count" in payload:
+        raw_count = payload.get("expected_song_count", payload.get("known_song_count"))
         if raw_count in (None, ""):
-            settings["known_song_count"] = None
+            source_config["expected_song_count"] = None
         else:
             try:
                 count = int(raw_count)
             except (TypeError, ValueError):
-                return jsonify({"error": "known song count must be a whole number"}), 400
-            if not 1 <= count <= 200:
-                return jsonify({"error": "known song count must be between 1 and 200"}), 400
-            settings["known_song_count"] = count
+                return jsonify({"error": "expected song count must be a whole number"}), 400
+            if count < 1:
+                return jsonify({"error": "expected song count must be positive"}), 400
+            source_config["expected_song_count"] = count
+        source_config_changed = True
+    for key in ("min_song_seconds", "max_song_seconds", "structural_min_song_seconds", "structural_max_song_seconds", "structural_close_song_seconds", "min_final_song_seconds", "suspicious_short_song_seconds", "suspicious_long_song_seconds", "whisper_timeout_seconds"):
+        if key not in payload:
+            continue
+        try:
+            value = float(payload[key])
+        except (TypeError, ValueError):
+            return jsonify({"error": f"{key} must be numeric"}), 400
+        if value <= 0:
+            return jsonify({"error": f"{key} must be positive"}), 400
+        source_config[key] = value
+        source_config_changed = True
+    if "whisper_model" in payload:
+        model = str(payload.get("whisper_model") or "").strip()
+        if not model:
+            return jsonify({"error": "whisper_model cannot be empty"}), 400
+        source_config["whisper_model"] = model
+        source_config_changed = True
+    for key in ("ear_confirmed_splits", "sanity_anchors"):
+        if key in payload:
+            if not isinstance(payload[key], list):
+                return jsonify({"error": f"{key} must be a list"}), 400
+            source_config[key] = payload[key]
+            source_config_changed = True
+    if source_config_changed:
+        save_source_config(source_config)
+        pipeline.configure_detection_profile(source_config)
         with state_lock:
             pipeline_state = None
             pipeline_state_signature = None
@@ -3403,7 +3889,7 @@ def api_settings() -> Response:
             return jsonify({"error": "Matchering reference file not found"}), 400
         settings["matchering_reference"] = str(Path(reference).expanduser().resolve()) if reference else ""
     save_settings(settings)
-    return jsonify({"ok": True, "settings": settings})
+    return jsonify({"ok": True, "settings": settings, "source_config": load_source_config()})
 
 
 @app.post("/api/reset-automatic/<int:song_id>")
@@ -3479,6 +3965,16 @@ def api_redetect(allow_whisper: bool = True) -> Response:
     return jsonify(job)
 
 
+def configured_slot_target() -> int | None:
+    raw = getattr(pipeline, "EXPECTED_SLOT_COUNT", None)
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 @app.get("/api/redetect/candidate")
 def api_redetect_candidate() -> Response:
     candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
@@ -3493,6 +3989,9 @@ def api_redetect_candidate() -> Response:
         "new_count": new_count,
         "old_slots": current.get("raw_songs", []) if isinstance(current, dict) else [],
         "new_slots": candidate.get("raw_songs", []),
+        "source_stem_count": len(candidate.get("stems", [])),
+        "source_duration_sec": max((float(item.get("frames", 0)) / float(item.get("samplerate", 1)) + float(item.get("offset_seconds", 0.0)) for item in candidate.get("stems", []) if isinstance(item, dict)), default=0.0),
+        "warning": "Candidate slot count differs from the configured session target; review required before replacement." if configured_slot_target() is not None and new_count != configured_slot_target() else "",
     })
 
 
@@ -3534,6 +4033,66 @@ def api_redetect_discard() -> Response:
         pass
     append_log("ui", "Discarded pending full-session detection; current session preserved.")
     return jsonify({"ok": True})
+
+
+@app.post("/api/redetect/second-pass")
+def api_redetect_second_pass() -> Response:
+    """Run Whisper only in long uncovered source intervals and save proposals."""
+    state = ensure_pipeline_state()
+    stems = state.get("stems", [])
+    if not stems:
+        return jsonify({"error": "Original WAV stems are not loaded."}), 409
+    existing = sorted((float(segment.start), float(segment.end)) for segment in state.get("segments", []))
+    source_end = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in stems), default=0.0)
+    regions: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in existing:
+        if start - cursor >= 180.0:
+            regions.append((max(0.0, cursor - 30.0), min(source_end, start + 30.0)))
+        cursor = max(cursor, end)
+    if source_end - cursor >= 180.0:
+        regions.append((max(0.0, cursor - 30.0), source_end))
+    expected_target = configured_slot_target()
+    if not regions:
+        missing_count = max(0, expected_target - len(existing)) if expected_target is not None else None
+        return jsonify({"ok": True, "status": "no_suspicious_intervals", "new_proposals": [], "missing_count": missing_count})
+    try:
+        app_progress({"current_stage": "second Whisper pass", "stage_detail": f"Scanning {len(regions)} uncovered interval(s)", "progress": 10, "song_progress": 10, "heartbeat": time.time()})
+        timelines = pipeline.load_cached_timelines_or_die(stems, "Whisper second pass")
+        _transcripts, focused_segments = pipeline.transcribe_speech_candidates(
+            stems, timelines, source_end, focus_regions=regions, timeout_seconds=240.0,
+        )
+    except Exception as exc:
+        candidate = {"status": "incomplete", "reason": f"{type(exc).__name__}: {exc}", "regions": regions, "new_proposals": []}
+        save_json_atomic(SECOND_PASS_CANDIDATE_PATH, candidate)
+        app_progress({"status": "error", "current_stage": "second Whisper pass", "stage_detail": candidate["reason"], "progress": 100, "song_progress": 100, "heartbeat": time.time()})
+        return jsonify({"ok": False, **candidate}), 200
+    new_proposals = []
+    proposal_session_id = next((str(row.get("session_id")) for row in state.get("raw_songs", []) if row.get("session_id")), session_id_for_signature(detection_state_signature()))
+    for segment in focused_segments:
+        if any(abs(float(segment.start) - start) < 25.0 for start, _end in existing):
+            continue
+        new_proposals.append({
+            "slot_id": f"{proposal_session_id}:whisper-second-pass-{len(new_proposals) + 1:03d}",
+            "start": float(segment.start),
+            "end": float(segment.end),
+            "duration": float(segment.duration),
+            "text": segment.speech_text,
+            "confidence": float(segment.speech_confidence or 0.0),
+            "reason": segment.speech_reason or "additional commentator presentation in uncovered interval",
+            "status": "needs_review",
+        })
+    missing_count = max(0, expected_target - len(existing) - len(new_proposals)) if expected_target is not None else None
+    candidate = {"status": "pending_confirmation", "regions": regions, "new_proposals": new_proposals, "missing_count": missing_count}
+    save_json_atomic(SECOND_PASS_CANDIDATE_PATH, candidate)
+    app_progress({"status": "pending_confirmation", "current_stage": "second Whisper pass", "stage_detail": f"Found {len(new_proposals)} new proposal(s); manual review required", "progress": 100, "song_progress": 100, "heartbeat": time.time()})
+    return jsonify({"ok": True, **candidate})
+
+
+@app.get("/api/redetect/second-pass")
+def api_redetect_second_pass_status() -> Response:
+    candidate = load_json(SECOND_PASS_CANDIDATE_PATH, None)
+    return jsonify(candidate if isinstance(candidate, dict) else {"available": False})
 
 
 
