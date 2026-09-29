@@ -2815,6 +2815,55 @@ def run_child_job(job_path: Path) -> int:
     try:
         return _run_child_job(job_path)
     except BaseException as exc:
+        # Compatibility guard for bundles built from the pre-2.1.34 detector.
+        # That code raised after producing a diagnostic one-slot candidate;
+        # this is an incomplete detection, not a worker crash.
+        legacy_incomplete = (
+            payload.get("kind") == "redetect"
+            and isinstance(exc, RuntimeError)
+            and "re-detect produced only" in str(exc).lower()
+            and "slot" in str(exc).lower()
+        )
+        if legacy_incomplete:
+            status_path = Path(str(payload.get("status_path") or job_status_path(str(payload.get("id", "child")))))
+            now = time.time()
+            match = re.search(r"onlys+(d+)s+slot", str(exc), re.IGNORECASE)
+            candidate_count = int(match.group(1)) if match else 0
+            snapshot = load_json(DETECTION_STATE_PATH, {})
+            previous_count = len(snapshot.get("raw_songs", []) or []) if isinstance(snapshot, dict) else 0
+            warning = (
+                f"Fresh detection produced only {candidate_count} slot(s); "
+                f"the current session with {previous_count} slot(s) was preserved."
+            )
+            recovery = {
+                **payload,
+                "status": "pending_review",
+                "error": None,
+                "warning": warning,
+                "candidate_count": candidate_count,
+                "previous_count": previous_count,
+                "current_stage": "pending_review",
+                "stage_detail": warning,
+                "progress": 100,
+                "song_progress": 100,
+                "done_count": 1,
+                "total_count": 1,
+                "exit_code": 0,
+                "finished_at": now,
+                "heartbeat": now,
+                "updated_at": now,
+                "termination": "recovered incomplete detection",
+            }
+            save_json_atomic(status_path, recovery)
+            print("APP_PROGRESS " + json.dumps(recovery, sort_keys=True), flush=True)
+            lifecycle_log(
+                "legacy_incomplete_redetect_recovered",
+                job_id,
+                candidate_count=candidate_count,
+                previous_count=previous_count,
+                original_error=str(exc),
+            )
+            return 0
         status_path = Path(str(payload.get("status_path") or job_status_path(str(payload.get("id", "child")))))
         signal_code = exc.code if isinstance(exc, SystemExit) else None
         cancelled = isinstance(signal_code, int) and signal_code in {130, 143, 145, 146}
@@ -3949,6 +3998,8 @@ def api_redetect(allow_whisper: bool = True) -> Response:
         "total_count": 1,
         "lifecycle_log_path": str(LIFECYCLE_LOG_PATH),
         "allow_whisper": bool(allow_whisper),
+        "source_folder": str(Path(pipeline.SOURCE_DIR).expanduser().resolve()),
+        "build": runtime_build_metadata(),
     }
     with state_lock:
         jobs.append(job)
