@@ -950,3 +950,9 @@ a {
 body.loading-mode > header, body.loading-mode > main { pointer-events: none; }
 body.loading-mode #loadingStatus { display: none !important; }
 @media (max-width: 680px) { #loadingOverlay { padding: 10px; } .loading-stage-info { left: 3%; right: 3%; bottom: 3%; padding: 12px; } .loading-stage-media { min-height: 220px; } }
+
+.loading-overlay-timing { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums; }
+.loading-render-progress { margin-top: 7px; }
+.loading-activity { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.12); color: var(--muted); font-size: .78rem; }
+.loading-activity-head { display: flex; justify-content: space-between; color: var(--cream); }
+.loading-phase-list, .loading-song-states { margin-top: 4px; overflow-wrap: anywhere; }
