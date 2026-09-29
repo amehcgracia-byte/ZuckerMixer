@@ -65,6 +65,20 @@ def ensure_pipeline_module() -> None:
 
 
 ensure_pipeline_module()
+
+if "--whisper-worker" in sys.argv:
+    # The frozen app carries whisper_transcribe.py as a data resource. Running
+    # it through the same executable keeps the DMG self-contained and avoids
+    # depending on a user's unrelated .whisperenv checkout.
+    import runpy
+
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    worker_path = bundle_root / "whisper_transcribe.py"
+    if not worker_path.is_file():
+        raise FileNotFoundError(f"Bundled Whisper worker is missing: {worker_path}")
+    runpy.run_path(str(worker_path), run_name="__main__")
+    raise SystemExit(0)
+
 import webview
 
 import jam_app
@@ -72,7 +86,12 @@ import jam_mix_pipeline as pipeline
 
 
 if "--self-check" in sys.argv:
+    try:
+        import faster_whisper  # noqa: F401
+    except Exception as exc:
+        raise SystemExit(f"ZuckerMixer Whisper self-check failed: {type(exc).__name__}: {exc}")
     print("ZuckerMixer frozen import self-check: OK", flush=True)
+    print("ZuckerMixer bundled Whisper import self-check: OK", flush=True)
     raise SystemExit(0)
 
 
