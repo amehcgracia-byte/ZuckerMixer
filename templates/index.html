@@ -8,6 +8,22 @@
     <link rel="stylesheet" href="/static/app.css?v={{ static_version }}">
   </head>
   <body>
+    <div id="loadingOverlay" hidden aria-live="polite">
+      <div class="loading-stage">
+        <img class="loading-stage-media" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
+        <div class="loading-stage-info">
+          <h2 id="loadingOverlayTitle">Working...</h2>
+          <p id="loadingOverlayDetail">Please wait...</p>
+          <p id="loadingOverlayFun" class="progress-fun"></p>
+          <div class="loading-stage-progress">
+            <span>Session</span>
+            <div class="progress-track"><div id="loadingOverlayProgressFill"></div></div>
+            <span id="loadingOverlayPercent">0%</span>
+          </div>
+          <p id="loadingOverlayHealth" class="loading-overlay-health"></p>
+        </div>
+      </div>
+    </div>
     <header class="topbar">
       <div class="brand">
         <img src="/static/zucker_logo_orange.png" alt="ZuckerSession">
