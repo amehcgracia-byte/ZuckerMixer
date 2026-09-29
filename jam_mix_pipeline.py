@@ -8172,7 +8172,14 @@ def render_segment(
         "vocal_bus_db": vocal_bus_trim_db,
         "stage_metrics": stage_meters_final,
         "premaster_headroom_db": PREMASTER_HEADROOM_DB,
-        "preserved_artifacts": preserved_artifacts,\n        "timings": {\n            "scan_seconds": round(float(scan_seconds), 3),\n            "mix_seconds": round(float(mix_seconds), 3),\n            "master_seconds": round(float(master_seconds), 3),\n            "encode_seconds": round(float(encode_seconds), 3),\n            "total_seconds": round(float(total_seconds), 3),\n        },
+        "preserved_artifacts": preserved_artifacts,
+        "timings": {
+            "scan_seconds": round(float(scan_seconds), 3),
+            "mix_seconds": round(float(mix_seconds), 3),
+            "master_seconds": round(float(master_seconds), 3),
+            "encode_seconds": round(float(encode_seconds), 3),
+            "total_seconds": round(float(total_seconds), 3),
+        },
     }
 
 
