@@ -3555,7 +3555,8 @@ if (typeof document !== "undefined") {
       } else if (job?.status === "error" || job?.status === "cancelled") {
         setLoadingOverlayJob(null);
         clearCutLoading();
-        showToast(`Re-detect ${job.status}.`);
+        const detail = job.error || job.warning || job.stage_detail || job.last_event || "see job details";
+        showToast(`Re-detect ${job.status}: ${detail}`);
       } else {
         setTimeout(() => waitForFreshDetection().catch((err) => console.warn("[redetect refresh failed]", err)), 1000);
       }
