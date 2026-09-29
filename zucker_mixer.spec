@@ -15,6 +15,8 @@ a = Analysis(
         ("static", "static"),
         ("build/build_metadata.json", "build"),
         ("whisper_transcribe.py", "."),
+        ("jam_app.py", "."),
+        ("jam_mix_pipeline.py", "."),
     ],
     hiddenimports=[
         "flask",
