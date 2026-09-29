@@ -34,10 +34,46 @@ def record_worker_bootstrap() -> None:
 
 
 record_worker_bootstrap()
+
+
+def ensure_pipeline_module() -> None:
+    """Load jam_mix_pipeline from the frozen bundle when import discovery misses it."""
+    try:
+        import jam_mix_pipeline  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    module_path = bundle_root / "jam_mix_pipeline.py"
+    if not module_path.is_file():
+        raise ModuleNotFoundError(
+            f"jam_mix_pipeline.py is missing from frozen bundle: {module_path}"
+        )
+
+    import importlib.util
+
+    module_spec = importlib.util.spec_from_file_location(
+        "jam_mix_pipeline", str(module_path)
+    )
+    if module_spec is None or module_spec.loader is None:
+        raise ImportError(f"Cannot load frozen module: {module_path}")
+
+    module = importlib.util.module_from_spec(module_spec)
+    sys.modules["jam_mix_pipeline"] = module
+    module_spec.loader.exec_module(module)
+
+
+ensure_pipeline_module()
 import webview
 
 import jam_app
 import jam_mix_pipeline as pipeline
+
+
+if "--self-check" in sys.argv:
+    print("ZuckerMixer frozen import self-check: OK", flush=True)
+    raise SystemExit(0)
 
 
 class ZuckerMixerApi:
@@ -125,13 +161,23 @@ def main() -> None:
                 "ZuckerMixer needs ffmpeg to create MP3 files.\n\nInstall it in Terminal with:\n\nbrew install ffmpeg",
             )
 
-    def on_closing() -> None:
+    def on_closing() -> bool:
+        if jam_app.has_active_jobs():
+            proceed = window.create_confirmation_dialog(
+                "Trabajos en curso",
+                "Hay una mezcla o análisis ejecutándose. Si cierras ahora se cancelará; "
+                "los resultados ya guardados se conservarán. ¿Cerrar?",
+            )
+            if not proceed:
+                return False
         threading.Thread(target=jam_app.stop_server, daemon=True).start()
+        return True
 
     window.events.loaded += on_loaded
     window.events.closing += on_closing
     webview.start(debug=False)
-    jam_app.wait_for_jobs_to_stop()
+    # Closing the WebView must never wait forever for Whisper/ffmpeg.
+    jam_app.wait_for_jobs_to_stop(timeout_seconds=5.0)
 
 
 if __name__ == "__main__":
