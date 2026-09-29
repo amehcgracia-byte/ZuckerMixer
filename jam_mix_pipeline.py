@@ -3147,22 +3147,80 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     LAST_DETECTION_CALIBRATION = {}
 
     if not WHISPER_ALLOWED:
-        segments = provisional_segments_from_metadata(stems)
+        # Whisper is optional. Use the acoustic MC/drum boundary detector for
+        # the normal pass so sessions without a commentator still get slots.
         LAST_WHISPER_STATUS = {
             "status": "skipped",
-            "reason": "optional analysis disabled for initial source registration",
+            "reason": "optional analysis disabled; acoustic detection used",
         }
+        report_progress({
+            "current_stage": "reading cached envelopes",
+            "stage_detail": f"Reading cached activity envelopes for {len(stems)} parallel stems",
+            "progress": 24,
+            "song_progress": 24,
+            "phase_index": 2,
+            "phase_total": 7,
+            "stem_count": len(stems),
+            "heartbeat": time.time(),
+        })
+        timelines = load_cached_timelines_or_die(stems, "Acoustic detection")
+        durations = [float(stem.offset_seconds + stem.timeline_duration) for stem in stems]
+        metadata_session_end = max(durations)
+        session_end = active_session_end_from_timelines(stems, timelines, metadata_session_end)
+        voice_stems = [stem for stem in stems if stem.role in {"vocal", "room"}]
+        instrument_stems = [stem for stem in stems if stem.role not in {"vocal", "room"}]
+        if not voice_stems or not instrument_stems:
+            segments = provisional_segments_from_metadata(stems)
+            DETECTION_STRATEGY = {
+                "id": "metadata_provisional",
+                "label": "No usable acoustic groups; Select Cuts required",
+                "candidate_only": True,
+                "session_segmentation_usable": False,
+                "detected_count": len(segments),
+                "needs_review": True,
+                "whisper": LAST_WHISPER_STATUS,
+            }
+            return segments, np.array([], dtype=np.float32)
+        mc_data, segments = auto_calibrate_detection(
+            voice_stems, instrument_stems, timelines, session_end
+        )
+        if not segments:
+            segments = auto_calibrate_drum_fallback(
+                stems, timelines, session_end, voice_stems, instrument_stems, mc_data
+            )
+        if not segments:
+            segments = provisional_segments_from_metadata(stems)
+        else:
+            segments = [
+                replace(
+                    segment,
+                    boundary_source="acoustic-break",
+                    speech_reason="Whisper skipped; boundary inferred from acoustic activity",
+                )
+                for segment in segments
+            ]
+        LAST_DETECTION_CALIBRATION["mode"] = "acoustic_without_whisper"
         DETECTION_STRATEGY = {
-            "id": "metadata_provisional",
-            "label": "Single conservative metadata block; Analyze or Select Cuts required",
-            "candidate_only": True,
-            "session_segmentation_usable": False,
+            "id": "acoustic_without_whisper",
+            "label": "Acoustic MC/drum boundaries; Whisper optional",
             "detected_count": len(segments),
+            "candidate_only": len(segments) < 2,
+            "session_segmentation_usable": len(segments) > 1,
             "needs_review": True,
             "whisper": LAST_WHISPER_STATUS,
         }
-        print(f"PROVISIONAL DETECTION: registered {len(segments)} metadata windows", flush=True)
-        return segments, np.array([], dtype=np.float32)
+        report_progress({
+            "current_stage": "validating cuts",
+            "stage_detail": f"Acoustic detection found {len(segments)} slot(s); Whisper was skipped",
+            "progress": 90,
+            "song_progress": 90,
+            "phase_index": 6,
+            "phase_total": 7,
+            "candidate_count": len(segments),
+            "heartbeat": time.time(),
+        })
+        print(f"ACOUSTIC DETECTION WITHOUT WHISPER: found {len(segments)} slot(s)", flush=True)
+        return segments, np.asarray(mc_data.get("mc_mask", np.array([], dtype=np.float32)), dtype=np.float32)
 
     print("\nSONG DETECTION")
     report_progress({"current_stage": "reading cached envelopes", "stage_detail": f"Reading cached activity envelopes for {len(stems)} parallel stems", "progress": 24, "song_progress": 24, "phase_index": 2, "phase_total": 7, "stem_count": len(stems), "heartbeat": time.time()})
