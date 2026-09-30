@@ -143,7 +143,7 @@ AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0, "flute": 2.0, "horn"
 # in the user's real sessions. This is applied before per-song caps and is
 # included in the analysis signature so old plans cannot survive unnoticed.
 AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -4.5}
-AUTO_MIX_PROFILE_VERSION = 6
+AUTO_MIX_PROFILE_VERSION = 7
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -5846,7 +5846,15 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
     if role == "kick":
         bands = [("low", "highpass", 30, 0.707, 0.0), ("fixed", "peaking", 60, 0.9, 2.5), ("mid", "peaking", 350, 1.0, -2.5), ("fixed", "peaking", 3500, 0.9, 2.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role == "bass":
-        bands = [("low", "highpass", 35, 0.707, 0.0), ("mid", "peaking", 300, 1.0, -2.5), ("fixed", "peaking", 100, 0.8, 1.0), ("air", "highshelf", 10000, 0.707, 0.0)]
+        # Keep the fundamental with the kick, clear mud, and add a controlled
+        # upper-bass presence so the line remains audible on small speakers.
+        bands = [
+            ("low", "highpass", 32, 0.707, 0.0),
+            ("fixed", "peaking", 72, 0.9, 1.5),
+            ("mid", "peaking", 250, 1.0, -2.5),
+            ("fixed", "peaking", 850, 1.1, 1.5),
+            ("air", "highshelf", 10000, 0.707, 0.0),
+        ]
     elif role == "vocal":
         bands = [("low", "highpass", 115, 0.707, 0.0), ("mid", "peaking", 3000, 0.9, 2.0), ("air", "highshelf", 11000, 0.707, 1.0)]
     elif role == "guitar":
@@ -5931,7 +5939,7 @@ def process_track_streaming(
         return x.astype(np.float32)
 
     if role == "bass":
-        x = compressor_streaming(x, sr, ratio=3.0, threshold_db=-22.0, release_ms=140, state=state, key=f"{key}:bass")
+        x = compressor_streaming(x, sr, ratio=3.0, threshold_db=-24.0, release_ms=180, state=state, key=f"{key}:bass")
     elif role in {"kick", "snare", "hh", "overhead", "drums"}:
         x = compressor_streaming(x, sr, ratio=4.0, threshold_db=-20.0, release_ms=100, state=state, key=f"{key}:drums")
     elif role in {"keys", "keys_l", "keys_r", "guitar", "synth"}:
@@ -5948,7 +5956,7 @@ def base_level_db(role: str) -> float:
         "kick": 0.0,
         "snare": -7.0,
         "drums": -8.0,
-        "bass": -3.5,
+        "bass": -2.0,
         "keys_l": -7.0,
         "keys_r": -7.0,
         "keys": -8.0,
@@ -6169,6 +6177,7 @@ def per_song_role_balance_corrections(
     role_groups = {
         "guitar": [name for name, role in effective_roles.items() if role == "guitar"],
         "keys": [name for name, role in effective_roles.items() if role in {"keys", "keys_l", "keys_r", "synth"}],
+        "bass": [name for name, role in effective_roles.items() if role == "bass"],
     }
     role_levels = {
         role: group_active_level_db(names, active_levels_db)
@@ -6218,7 +6227,8 @@ def per_song_role_balance_corrections(
     harmonic_hierarchy_corrections: dict[str, float] = {}
     if drum_anchor_level is not None:
         harmonic_target = float(drum_anchor_level) - HARMONIC_BELOW_DRUM_REFERENCE_DB
-        for role, names in role_groups.items():
+        for role in ("guitar", "keys"):
+            names = role_groups[role]
             level = role_levels.get(role)
             if level is None or not names:
                 continue
@@ -6230,6 +6240,32 @@ def per_song_role_balance_corrections(
                 harmonic_hierarchy_corrections[name] = trim
                 role_corrections[name] = min(float(role_corrections.get(name, 0.0)), trim)
                 role_reasons[name] = f"{role} held below drum reference"
+
+    # Bass is referenced to the kick, not to the vocal/harmonic group. This
+    # restores presence on quiet bass captures while keeping the kick transient
+    # above the bass fundamental.
+    bass_kick_correction = 0.0
+    bass_names = role_groups["bass"]
+    bass_level = role_levels.get("bass")
+    kick_level = group_active_level_db(
+        [name for name, role in effective_roles.items() if role == "kick"],
+        active_levels_db,
+    )
+    if bass_names and bass_level is not None and kick_level is not None:
+        bass_target = float(kick_level) - 3.0
+        bass_gap = bass_target - float(bass_level)
+        if bass_gap > 0.5:
+            bass_kick_correction = float(np.clip(bass_gap - 0.5, 0.0, 3.0))
+        elif bass_gap < -1.0:
+            bass_kick_correction = -float(np.clip(abs(bass_gap) - 1.0, 0.0, 3.0))
+        if abs(bass_kick_correction) > 0.01:
+            for name in bass_names:
+                role_corrections[name] = float(np.clip(
+                    role_corrections.get(name, 0.0) + bass_kick_correction,
+                    -6.0,
+                    AUTO_MIX_ROLE_BOOST_LIMITS_DB.get("bass", 3.0),
+                ))
+                role_reasons[name] = "bass aligned to kick active level"
 
     mic_voice_wind_corrections: dict[str, float] = {}
     wind_names = [name for name, role in effective_roles.items() if role in {"horn", "sax", "flute"}]
@@ -6280,6 +6316,10 @@ def per_song_role_balance_corrections(
             (role_reasons[name] for name in role_groups["guitar"] if role_reasons.get(name)),
             "no reliable vocal overlap evidence",
         ),
+        "bass_original_level_db": role_levels.get("bass"),
+        "bass_kick_correction_db": bass_kick_correction,
+        "bass_kick_target_method": "kick active level minus 3 dB, bounded to +3/-3 dB",
+
         "mic_voice_wind_corrections_db": mic_voice_wind_corrections,
         "harmonic_hierarchy_corrections_db": harmonic_hierarchy_corrections,
         "drum_reference_level_db": drum_anchor_level,
@@ -6504,9 +6544,10 @@ def override_bool(value: object, default: bool = False) -> bool:
 
 def reverb_send_level_db(role: str) -> float | None:
     return {
-        "vocal": -10.0,
-        "sax": -14.0,
-        "horn": -14.0,
+        "vocal": -9.0,
+        "sax": -13.0,
+        "horn": -13.0,
+        "flute": -12.0,
         "guitar": -15.0,
         "keys": -16.0,
         "keys_l": -16.0,
@@ -6523,9 +6564,9 @@ def reverb_send_level_db(role: str) -> float | None:
 
 def delay_send_level_db(role: str, lead_bonus: float) -> float | None:
     if role == "vocal":
-        return -16.0
+        return -14.0
     if role in {"sax", "horn", "flute", "guitar"}:
-        return -18.0 if lead_bonus > 0.0 else -24.0
+        return -18.0 if lead_bonus > 0.0 else -22.0
     if role in {"keys", "keys_l", "keys_r", "synth"} and lead_bonus > 0.0:
         return -22.0
     return None
@@ -7652,7 +7693,20 @@ def render_segment(
         and float(info.get("rms_dbfs", -120.0) or -120.0) <= EMPTY_STEM_RMS_DBFS
         and float(info.get("level_spread_db", 0.0) or 0.0) <= EMPTY_STEM_SPREAD_DB
     ]
-    noise_names = sorted(set(noise_names + quiet_empty_names))
+    # A beatbox/drum stem can contain a real part in one slot and only its
+    # microphone noise in the next. A low, flat envelope is an empty source,
+    # not a reason to apply makeup gain and raise hiss.
+    stem_roles = {stem.path.name: stem.role for stem in stems}
+    flat_empty_names = []
+    for name, spread in dynamic_spread_db.items():
+        try:
+            rms_value = float(rms_values_db.get(name, -120.0))
+            spread_value = float(spread or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if rms_value <= -50.0 and spread_value <= 6.0:
+            flat_empty_names.append(name)
+    noise_names = sorted(set(noise_names + quiet_empty_names + flat_empty_names))
     if noise_names:
         print(f"NOISE DETECTION song={index}: empty/noisy inputs muted: {', '.join(noise_names)}", flush=True)
     watchdog_names = [name for name, info in noise_diagnostics.items() if info.get("flagged")]
@@ -8248,7 +8302,9 @@ def render_segment(
                         kick_env = signal.lfilter([0.04], [1.0, -0.96], kick_control.astype(np.float32))
                         if np.max(kick_env) > 1e-8:
                             norm = kick_env / np.max(kick_env)
-                            duck = np.power(10.0, (-2.0 * norm) / 20.0).astype(np.float32)
+                            # Keep the kick/bass relationship audible without
+                        # erasing the bass note on every kick transient.
+                        duck = np.power(10.0, (-1.5 * norm) / 20.0).astype(np.float32)
                         else:
                             duck = np.ones(nframes, dtype=np.float32)
                         for bass_stereo in bass_items:
