@@ -3107,6 +3107,171 @@ async function resetSongToAutomatic(songId) {
 }
 
 
+
+  const LOADING_MESSAGE_CATALOG = {
+    preparing: [
+      "Opening the original session...", "Keeping every stem aligned...", "Waking the session clock...",
+      "Checking that the band arrived together...", "Unpacking the long take without losing the plot...",
+      "Finding the beginning before finding the songs...", "The tape is long; the coffee is longer...",
+      "Making sure nobody starts on the wrong bar...", "Reading the room before touching the faders...",
+      "Preparing the session map...", "Counting microphones, cables and suspicious silences...",
+      "The original recording is taking a deep breath...", "Setting the compass for a very long jam...",
+      "No song left behind...", "Loading the session with theatrical patience...",
+      "Getting the whole band on the same timeline..."
+    ],
+    scanning: [
+      "Checking the room mics...", "Reading the session clock...", "Looking for audio hiding in the folder...",
+      "Inspecting every stem, even the shy ones...", "Making sure the WAVs are really WAVs...",
+      "Counting channels before they count themselves...", "Checking which microphones actually contain music...",
+      "Scanning the long take from end to end...", "Listening for the first real downbeat...",
+      "Separating signal from cable philosophy...", "Looking for silence that means something...",
+      "Making friends with the external drive...", "Checking offsets so the band stays together...",
+      "The stems are lining up like a very patient choir...",
+      "Searching for the places where the presenter appears...",
+      "No folder left unexamined..."
+    ],
+    "analyzing stems": [
+      "Listening to the drummer...", "Comparing the parallel stems...", "Measuring who is actually playing...",
+      "Finding the musical signal inside the room tone...", "Checking the kick against the bass...",
+      "Looking for the snare's opinion...", "Comparing the two microphones fairly...",
+      "Finding which guitar is trying to run the meeting...", "Checking whether the piano brought too much furniture...",
+      "Listening for brass, flute and other plot twists...", "Measuring the quiet parts without calling them empty...",
+      "Separating musical dynamics from microphone noise...", "Finding the useful peaks...",
+      "Building a level map for the whole band...", "Checking the harmonic crowding...",
+      "The stems are introducing themselves one by one..."
+    ],
+    "reading cached envelopes": [
+      "Reusing the audio map...", "Reading cached activity envelopes...", "Opening yesterday's map without trusting ghosts...",
+      "Checking the saved timeline...", "Finding the quietest safe boundaries...",
+      "Reconstructing the session from its acoustic footprints...", "The cache remembers more than the presenter...",
+      "Reading the envelope trail...", "Comparing the new source signature...",
+      "Making sure this cache belongs to this folder...", "Looking for old cuts that still make sense...",
+      "Turning yesterday's measurements into today's decisions...",
+      "The waveform has left breadcrumbs...", "Checking the cache before doing the long work again...",
+      "Recovering the session's musical geography...", "No stale snapshot gets to run the show..."
+    ],
+    "transcribing speech": [
+      "Listening to the commentator...", "Waiting for the transcript...", "Finding the introductions between the songs...",
+      "Separating presenter from trumpet...", "Reading the stage announcements...", "Looking for names, titles and useful clues...",
+      "Whisper is listening carefully...", "Checking whether this voice starts the next slot...",
+      "Turning speech into song boundaries...", "The microphone is telling us what comes next...",
+      "Finding the human hand in the long recording...", "Checking the presenter against the instruments...",
+      "Not every word is a cut, but every cut needs a reason...",
+      "Listening for the announcement that unlocks the next song...",
+      "Speech first, panic never...", "The presenter is acting as the session's chapter titles..."
+    ],
+    "detecting songs": [
+      "Finding where the MC talks...", "Looking for the next song...", "Following the presenter-led slots...",
+      "Marking beginnings without cutting through music...", "Counting musical chapters...",
+      "Finding the gap that is actually a beginning...", "Checking whether this is one song or two...",
+      "Building the song list from the whole session...", "Protecting the middle of every performance...",
+      "Looking for a clean hand-off...", "The set is becoming a tracklist...",
+      "Finding the next real entrance...", "Separating silence, introduction and music...",
+      "Checking the expected song count without forcing it...",
+      "One boundary at a time...", "The jam is finally giving up its structure..."
+    ],
+    "merging song boundaries": [
+      "Merging boundaries without losing songs...", "Joining evidence from voice and instruments...",
+      "Resolving two timestamps that both think they are right...", "Keeping the safest cut...",
+      "Comparing adjacent candidates...", "Making the timeline agree with itself...",
+      "Checking that no song is swallowed by a merge...", "The boundaries are negotiating...",
+      "Protecting introductions at the front of each slot...", "Removing duplicate cuts, not real songs...",
+      "Looking for the cleanest shared boundary across all stems...",
+      "The timeline is folding itself neatly...", "No musical phrase gets chopped for administrative reasons...",
+      "Merging clues, preserving performances...", "Almost a tracklist...", "Making the final decision at the quiet point..."
+    ],
+    "validating cuts": [
+      "Checking the proposed boundaries...", "Preparing the cuts for review...", "Making sure no instrument is mid-phrase...",
+      "Checking every stem at the edge...", "Confirming the presenter belongs to the next song...",
+      "Testing the boundary against the full session...", "Looking for active instruments at the cut...",
+      "Keeping unsafe cuts visible instead of hiding them...", "Checking duration and musical continuity...",
+      "The cut gate is asking difficult questions...", "No silent drummer gets blamed...",
+      "Verifying that every slot shares the same timeline...", "Checking the first seconds of every song...",
+      "A good cut sounds inevitable...", "Reviewing the edges before rendering...", "The scissors are staying polite..."
+    ],
+    mixing: [
+      "Balancing the band...", "Giving every stem its place...", "Letting the kick lead without swallowing the bass...",
+      "Finding space for the two microphones...", "Taming the guitar before it calls the police...",
+      "Keeping the piano below the vocal spotlight...", "Matching the flute to the trumpet...",
+      "Putting the overheads in the room...", "Checking that quiet tracks are musical, not noisy...",
+      "Building the mix from the rhythm section upward...", "Making room for the voice...",
+      "Keeping the bass present without making mud...", "Finding the song's natural center...",
+      "The faders are having a serious conversation...", "Balancing tone, level and space...",
+      "This is the part where the band becomes a record..."
+    ],
+    mastering: [
+      "Polishing the final bounce...", "Keeping the kick as the peak without clipping...",
+      "Checking loudness and headroom...", "Making the master travel well...",
+      "Preserving the dynamics while controlling the edges...", "Checking the true peak ceiling...",
+      "Keeping the room around the instruments...", "Making sure the master breathes...",
+      "Comparing loudness without flattening the song...", "Finishing the mix with a light touch...",
+      "Checking the low end one last time...", "Making the vocal survive small speakers...",
+      "The final polish is almost dry...", "Mastering, not repainting the whole house...",
+      "Checking that the reverb did not move into the foreground...", "One last pass over the stereo image..."
+    ],
+    encoding: [
+      "Packing the mix for listening...", "Putting the finishing label on it...", "Writing the MP3 without losing the master...",
+      "Checking that the export decodes cleanly...", "Turning the finished song into a portable record...",
+      "Keeping the metadata tidy...", "Making the file easy to find later...",
+      "Checking the final duration...", "Writing the audio at full quality...",
+      "The song is leaving the studio...", "Verifying the last bytes...",
+      "Making a copy that the player will actually understand...",
+      "Almost ready for the headphones...", "Exporting the finished chapter...",
+      "The mix is getting its passport...", "Final file, final check..."
+    ],
+    loading: [
+      "Warming up the tape machine...", "Finding the exact waveform...", "Opening the selected slot...",
+      "Drawing the session at a useful scale...", "Preparing the playhead...",
+      "Making the waveform large enough to see...", "Loading the audio without moving the cut...",
+      "Finding the exact point under the cursor...", "The waveform is stretching its legs...",
+      "Checking the selected song...", "Preparing playback and navigation...",
+      "Keeping the editor responsive...", "One slot, all stems, one timeline...",
+      "Loading the part you actually asked to hear...", "The waveform is nearly on stage...",
+      "Getting ready for a precise cut..."
+    ],
+    cancelling: [
+      "Stopping the worker safely...", "Closing the session without leaving ghosts...",
+      "Asking every process to come back from the coffee break...", "Releasing the audio files...",
+      "Putting the faders down gently...", "Stopping the render queue...",
+      "Closing the loading screen after the worker confirms...", "Cleaning up temporary files...",
+      "Cancelling without touching your saved cuts...", "The band is packing up...",
+      "Waiting for the last process to leave the stage...", "Returning to the start screen...",
+      "No render will be left running backstage...", "Finishing the cancellation safely...",
+      "The session is stopping, not crashing...", "Almost back to the main screen..."
+    ],
+    fallback: [
+      "Keeping the session moving...", "The band is still tuning...", "Checking one more thing...",
+      "Working through the long take...", "The audio map is thinking...", "Patience, but with diagnostics...",
+      "Making progress behind the curtain...", "The next useful detail is on its way...",
+      "No panic: the worker is still alive...", "Counting carefully...", "Listening before deciding...",
+      "The session is larger than it looks...", "One careful step at a time...", "Still working on the good version...",
+      "The machine is thinking in bars...", "Almost a useful answer..."
+    ]
+  };
+
+  function loadingMessagesForState(state) {
+    const value = state || {};
+    const stage = String(value.current_stage || value.stage || value.detail || "").toLowerCase();
+    const song = Number(value.current || value.current_song || value.song_index || 0);
+    const total = Number(value.total_count || value.total || value.song_count || 0);
+    let key = Object.keys(LOADING_MESSAGE_CATALOG).find((name) => name !== "fallback" && stage.includes(name));
+    if (!key && String(value.status || "").toLowerCase() === "stopping") key = "cancelling";
+    if (!key && value.kind === "cut") key = "loading";
+    const base = LOADING_MESSAGE_CATALOG[key || "fallback"];
+    const prefix = song > 0 && total > 0 ? `Song ${song}/${total}: ` : "";
+    const contextual = base.map((message) => prefix + message);
+    if (stage.includes("transcrib") && value.allow_whisper === false) {
+      return [
+        "Whisper is optional here; using the acoustic timeline...",
+        "No presenter transcript required for this pass...",
+        "Checking song boundaries without waiting for Whisper...",
+        "The stems are providing the structure...",
+        "Using the session's musical evidence first..."
+      ];
+    }
+    return contextual;
+  }
+
 function renderLoadingOverlay() {
   const overlay = $("#loadingOverlay");
   if (!overlay) return;
@@ -3127,21 +3292,7 @@ function renderLoadingOverlay() {
   const detail = state.detail || state.stage_detail || "Please wait...";
   const progress = Number(state.kind === "redetect" ? state.progress : (state.progress ?? state.song_progress ?? 0));
   const renderProgress = Number(state.process_progress ?? state.song_progress ?? 0);
-  const messages = {
-    preparing: ["Opening the original session...", "Keeping every stem aligned..."],
-    scanning: ["Checking the room mics...", "Reading the session clock..."],
-    "analyzing stems": ["Listening to the drummer...", "Comparing the parallel stems..."],
-    "reading cached envelopes": ["Reusing the audio map...", "Reading cached activity envelopes..."],
-    "transcribing speech": ["Listening to the commentator...", "Waiting for Whisper's transcript..."],
-    "detecting songs": ["Finding where the MC talks...", "Looking for the next song..."],
-    "validating cuts": ["Checking the proposed boundaries...", "Preparing the cuts for review..."],
-    mixing: ["Balancing the band...", "Giving every stem its place..."],
-    mastering: ["Making it loud enough for the bar...", "Polishing the final bounce..."],
-    encoding: ["Packing the mix for listening...", "Putting the finishing label on it..."],
-    loading: ["Warming up the tape machine...", "Finding the exact waveform..."],
-  };
-  const messageKey = Object.keys(messages).find((key) => stage.includes(key));
-  const choices = messages[messageKey] || (state.kind === "cut" ? messages.loading : ["Keeping the session moving...", "The band is still tuning..."]);
+  const choices = loadingMessagesForState(state);
   const fun = choices[Math.floor(Date.now() / 5000) % choices.length];
   const safeProgress = Math.max(0, Math.min(100, Number.isFinite(progress) ? progress : 0));
   const safeRenderProgress = Math.max(0, Math.min(100, Number.isFinite(renderProgress) ? renderProgress : 0));
@@ -3375,16 +3526,8 @@ function renderJobs(items) {
       : "";
     $("#queuePosition").textContent = `${detail}${reviewDetail}${blockedDetail}${reasonDetail} · PID ${workerPid} · ${position} of ${total} · ${active.song_progress || 0}% · ${elapsed || "0:00"} elapsed · ${formatRemaining(active.eta_seconds)}${memoryText}${stallText}`;
     $("#progressFill").style.width = `${active.song_progress || 0}%`;
-    const messages = {
-      scanning: ["Checking the room mics...", "Reading the session clock..."],
-      "analyzing stems": ["Listening to the drummer...", "Counting the groove..."],
-      "detecting songs": ["Finding where the MC talks...", "Looking for the next song..."],
-      mixing: ["Balancing the band...", "Giving every stem its place..."],
-      mastering: ["Making it loud enough for the bar...", "Polishing the final bounce..."],
-      encoding: ["Packing the mix for listening...", "Putting the finishing label on it..."],
-    };
     const fun = $("#progressFun");
-    const choices = messages[String(active.current_stage || "").toLowerCase()] || ["Keeping the session moving..."];
+    const choices = loadingMessagesForState(active);
     if (fun) fun.textContent = choices[Math.floor(Date.now() / 5000) % choices.length];
     const stall = $("#progressStall");
     const updated = Number(active.progress_updated_at || active.heartbeat || Date.now() / 1000) * 1000;
