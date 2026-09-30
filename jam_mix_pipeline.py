@@ -8303,8 +8303,8 @@ def render_segment(
                         if np.max(kick_env) > 1e-8:
                             norm = kick_env / np.max(kick_env)
                             # Keep the kick/bass relationship audible without
-                        # erasing the bass note on every kick transient.
-                        duck = np.power(10.0, (-1.5 * norm) / 20.0).astype(np.float32)
+                            # erasing the bass note on every kick transient.
+                            duck = np.power(10.0, (-1.5 * norm) / 20.0).astype(np.float32)
                         else:
                             duck = np.ones(nframes, dtype=np.float32)
                         for bass_stereo in bass_items:
