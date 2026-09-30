@@ -1465,6 +1465,10 @@ function renderFaders(root, songIndex) {
       button.addEventListener("click", async () => {
         const key = button.dataset.effect;
         ov[key] = !(ov[key] === true);
+        if (key === "space_enabled" || key === "echo_enabled") {
+          ov.effects_user_confirmed = true;
+          setLinkedOverride(songIndex, linked, "effects_user_confirmed", true);
+        }
         setLinkedOverride(songIndex, linked, key, ov[key]);
         button.classList.toggle("active", ov[key]);
         linked.forEach((item) => {
