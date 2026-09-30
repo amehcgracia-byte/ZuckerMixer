@@ -3253,15 +3253,16 @@ function renderLoadingOverlay() {
       songStates.innerHTML = queueRows.map((row) => {
         const number = row.song ?? row.index ?? row.id ?? "?";
         const status = String(row.status || row.state || "queued").toLowerCase();
+        const finished = ["done", "completed", "rendered", "written", "mp3_written", "finished"].includes(status);
         const cls = status.includes("fail") || status.includes("error")
           ? "error"
-          : status === "done" || status === "completed"
+          : finished
             ? "done"
             : Number(number) === Number(state.current)
               ? "active"
               : "";
-        const mark = status === "done" || status === "completed" ? "✓" : status.includes("fail") || status.includes("error") ? "!" : status === "working" || Number(number) === Number(state.current) ? "●" : "○";
-        const detail = status === "done" || status === "completed" ? "completed" : (row.detail || row.status || row.state || "queued");
+        const mark = finished ? "✓" : status.includes("fail") || status.includes("error") ? "!" : status === "working" || Number(number) === Number(state.current) ? "●" : "○";
+        const detail = finished ? "completed" : (row.detail || row.status || row.state || "queued");
         return `<div class="loading-song-state ${cls}" data-song-status="${esc(status)}"><span><span class="loading-song-check" aria-hidden="true">${mark}</span> Song ${String(number).padStart(2, "0")}</span><span>${esc(detail)}</span></div>`;
       }).join("");
     } else {
