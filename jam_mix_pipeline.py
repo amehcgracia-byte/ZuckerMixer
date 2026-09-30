@@ -167,6 +167,11 @@ MASTERING_INTENSITY = "natural"
 MASTERING_TARGETS = {"natural": -14.0, "loud": -9.5}
 TRUE_PEAK_CEILING_DBFS = -1.0
 PREMASTER_HEADROOM_DB = -6.0
+MASTER_GLUE_PROFILE_VERSION = 2
+MASTER_GLUE_RATIO = 1.6
+MASTER_GLUE_THRESHOLD_DB = -18.0
+MASTER_GLUE_RELEASE_MS = 280
+MASTER_GLUE_SATURATION = 1.02
 MATCHERING_REFERENCE: Path | None = None
 EXPORT_SAMPLE_RATE = 44100
 MP3_BITRATE = "320k"
@@ -6525,11 +6530,18 @@ def effective_mix_snapshot(
         "master_db": override_float(song_overrides.get("master_db"), 0.0),
         "bus_processing": {
             "vocal_bus": {"type": "rms_compressor_streaming", "threshold_db": -12, "ratio": 2, "attack_ms": 150, "release_ms": 600},
-            "mix_bus": {"type": "mix_bus_streaming"},
+            "mix_bus": {
+                "type": "mix_bus_streaming",
+                "glue_profile_version": MASTER_GLUE_PROFILE_VERSION,
+                "ratio": MASTER_GLUE_RATIO,
+                "threshold_db": MASTER_GLUE_THRESHOLD_DB,
+                "release_ms": MASTER_GLUE_RELEASE_MS,
+            },
             "mastering": {
                 "type": "matchering" if MATCHERING_REFERENCE is not None else "master_temp_wav_streaming",
                 "target_lufs": TARGET_LUFS,
                 "intensity": MASTERING_INTENSITY,
+                "glue_profile_version": MASTER_GLUE_PROFILE_VERSION,
                 "reference": str(MATCHERING_REFERENCE) if MATCHERING_REFERENCE is not None else None,
             },
         },
@@ -6698,13 +6710,13 @@ def mix_bus(x: np.ndarray, sr: int) -> np.ndarray:
 
 def mix_bus_streaming(x: np.ndarray, sr: int, state: dict[str, np.ndarray]) -> np.ndarray:
     mono = np.mean(x, axis=1)
-    comp = compressor_streaming(mono, sr, ratio=2.0, threshold_db=-14.0, release_ms=250, state=state, key="bus")
+    comp = compressor_streaming(mono, sr, ratio=MASTER_GLUE_RATIO, threshold_db=MASTER_GLUE_THRESHOLD_DB, release_ms=MASTER_GLUE_RELEASE_MS, state=state, key="bus")
     gain = np.divide(comp, mono, out=np.ones_like(comp), where=np.abs(mono) > 1e-8)
-    gain = np.clip(gain, 0.25, 1.0)
+    gain = np.clip(gain, 0.35, 1.0)
     x = x * gain[:, None]
-    x = np.tanh(x * 1.15) / np.tanh(1.15)
+    x = np.tanh(x * MASTER_GLUE_SATURATION) / np.tanh(MASTER_GLUE_SATURATION)
     for ch in range(2):
-        x[:, ch] = sosfilt_streaming(x[:, ch].astype(np.float32), sr, "highshelf", 10000, state, f"bus:air:{ch}", q=0.707, gain_db=1.0)
+        x[:, ch] = sosfilt_streaming(x[:, ch].astype(np.float32), sr, "highshelf", 10000, state, f"bus:air:{ch}", q=0.707, gain_db=0.7)
     return x.astype(np.float32)
 
 
