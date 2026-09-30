@@ -143,7 +143,27 @@ AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0, "flute": 2.0, "horn"
 # in the user's real sessions. This is applied before per-song caps and is
 # included in the analysis signature so old plans cannot survive unnoticed.
 AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -4.5}
-AUTO_MIX_PROFILE_VERSION = 7
+# Versioned role profiles keep EQ, dynamics, hierarchy and effects auditable.
+# These are starting points only; the per-song analysis below can trim them
+# within bounded limits, and explicit user overrides remain authoritative.
+ROLE_DSP_PROFILE_VERSION = 1
+ROLE_COMPRESSOR_PROFILES = {
+    "kick": {"ratio": 4.0, "threshold_db": -18.0, "release_ms": 90.0},
+    "snare": {"ratio": 3.5, "threshold_db": -20.0, "release_ms": 110.0},
+    "hh": {"ratio": 2.0, "threshold_db": -26.0, "release_ms": 80.0},
+    "overhead": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 120.0},
+    "drums": {"ratio": 3.0, "threshold_db": -20.0, "release_ms": 100.0},
+    "bass": {"ratio": 3.0, "threshold_db": -24.0, "release_ms": 180.0},
+    "guitar": {"ratio": 2.0, "threshold_db": -22.0, "release_ms": 140.0},
+    "keys": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 160.0},
+    "keys_l": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 160.0},
+    "keys_r": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 160.0},
+    "synth": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 150.0},
+    "horn": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 120.0},
+    "sax": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 120.0},
+    "flute": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 120.0},
+}
+AUTO_MIX_PROFILE_VERSION = 8
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -5938,38 +5958,39 @@ def process_track_streaming(
         x = downward_expander_streaming(x, sr, state, key)
         return x.astype(np.float32)
 
-    if role == "bass":
-        x = compressor_streaming(x, sr, ratio=3.0, threshold_db=-24.0, release_ms=180, state=state, key=f"{key}:bass")
-    elif role in {"kick", "snare", "hh", "overhead", "drums"}:
-        x = compressor_streaming(x, sr, ratio=4.0, threshold_db=-20.0, release_ms=100, state=state, key=f"{key}:drums")
-    elif role in {"keys", "keys_l", "keys_r", "guitar", "synth"}:
-        x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-21.0, release_ms=140, state=state, key=f"{key}:other")
-    elif role in {"horn", "sax", "flute"}:
-        x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-22.0, release_ms=120, state=state, key=f"{key}:lead")
-    else:
-        x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-22.0, release_ms=150, state=state, key=f"{key}:misc")
+    profile = ROLE_COMPRESSOR_PROFILES.get(
+        role,
+        {"ratio": 2.0, "threshold_db": -22.0, "release_ms": 150.0},
+    )
+    x = compressor_streaming(
+        x,
+        sr,
+        ratio=float(profile["ratio"]),
+        threshold_db=float(profile["threshold_db"]),
+        release_ms=float(profile["release_ms"]),
+        state=state,
+        key=f"{key}:{role}:compressor",
+    )
     return x.astype(np.float32)
 
 
 def base_level_db(role: str) -> float:
     return {
         "kick": 0.0,
-        "snare": -7.0,
+        "snare": -4.5,
         "drums": -8.0,
-        "bass": -2.0,
-        "keys_l": -7.0,
-        "keys_r": -7.0,
-        "keys": -8.0,
-        "guitar": -12.0,
-        "hh": -13.0,
-        "overhead": -10.0,
-        "synth": -11.0,
+        "bass": -1.0,
+        "keys_l": -9.5,
+        "keys_r": -9.5,
+        "keys": -9.5,
+        "guitar": -13.5,
+        "hh": -12.0,
+        "overhead": -9.0,
+        "synth": -11.5,
         "sax": -8.0,
         "horn": -8.0,
-        "flute": -5.5,
-        "hh": -13.0,
-        "overhead": -10.0,
-        "vocal": -5.0,
+        "flute": -4.5,
+        "vocal": -4.0,
     }.get(role, -12.0)
 
 
@@ -6241,6 +6262,60 @@ def per_song_role_balance_corrections(
                 role_corrections[name] = min(float(role_corrections.get(name, 0.0)), trim)
                 role_reasons[name] = f"{role} held below drum reference"
 
+    # Equalize competing harmonic instruments without flattening the
+    # intentional hierarchy. A piano/guitar that is materially above the
+    # harmonic median is trimmed; a quiet part is not blindly boosted.
+    harmonic_balance_corrections: dict[str, float] = {}
+    harmonic_names = [
+        name for name, role in effective_roles.items()
+        if role in {"guitar", "keys", "keys_l", "keys_r", "synth"}
+    ]
+    harmonic_levels = [
+        float(active_levels_db[name])
+        for name in harmonic_names
+        if name in active_levels_db and np.isfinite(active_levels_db[name])
+    ]
+    if len(harmonic_levels) >= 2:
+        harmonic_target = float(np.median(harmonic_levels))
+        for name in harmonic_names:
+            if name not in active_levels_db:
+                continue
+            excess = float(active_levels_db[name]) - harmonic_target
+            correction = -float(np.clip(excess - 1.5, 0.0, 3.0))
+            if abs(correction) > 0.01:
+                harmonic_balance_corrections[name] = correction
+                role_corrections[name] = float(np.clip(
+                    role_corrections.get(name, 0.0) + correction,
+                    -6.0,
+                    AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(effective_roles.get(name, ""), AUTO_MIX_MAX_BOOST_DB),
+                ))
+                role_reasons[name] = "harmonic role held near per-song median"
+
+    # A flute/trumpet pair is not one generic mic group: the louder wind is
+    # trimmed and the quieter wind is allowed a bounded lift so the melody is
+    # not decided by capture level alone.
+    wind_pair_corrections: dict[str, float] = {}
+    wind_names = [name for name, role in effective_roles.items() if role in {"horn", "sax", "flute"}]
+    wind_levels = [
+        float(active_levels_db[name])
+        for name in wind_names
+        if name in active_levels_db and np.isfinite(active_levels_db[name])
+    ]
+    if len(wind_levels) >= 2:
+        wind_target = float(np.median(wind_levels))
+        for name in wind_names:
+            if name not in active_levels_db:
+                continue
+            correction = float(np.clip(wind_target - float(active_levels_db[name]), -2.5, 2.5))
+            if abs(correction) > 0.01:
+                wind_pair_corrections[name] = correction
+                role_corrections[name] = float(np.clip(
+                    role_corrections.get(name, 0.0) + correction,
+                    -6.0,
+                    AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(effective_roles.get(name, ""), AUTO_MIX_MAX_BOOST_DB),
+                ))
+                role_reasons[name] = "wind pair equalized around per-song active median"
+
     # Bass is referenced to the kick, not to the vocal/harmonic group. This
     # restores presence on quiet bass captures while keeping the kick transient
     # above the bass fundamental.
@@ -6322,8 +6397,11 @@ def per_song_role_balance_corrections(
 
         "mic_voice_wind_corrections_db": mic_voice_wind_corrections,
         "harmonic_hierarchy_corrections_db": harmonic_hierarchy_corrections,
+        "harmonic_balance_corrections_db": harmonic_balance_corrections,
+        "wind_pair_corrections_db": wind_pair_corrections,
         "drum_reference_level_db": drum_anchor_level,
-        "role_balance_method": "per-song drum-reference hierarchy plus vocal/wind active-level balance",
+        "role_balance_method": "per-song drum-reference hierarchy plus harmonic median, wind-pair and vocal/wind active-level balance",
+        "role_balance_profile_version": ROLE_DSP_PROFILE_VERSION,
     }
 
 
@@ -6544,14 +6622,14 @@ def override_bool(value: object, default: bool = False) -> bool:
 
 def reverb_send_level_db(role: str) -> float | None:
     return {
-        "vocal": -9.0,
-        "sax": -13.0,
-        "horn": -13.0,
-        "flute": -12.0,
+        "vocal": -8.0,
+        "sax": -12.0,
+        "horn": -12.0,
+        "flute": -11.0,
         "guitar": -15.0,
-        "keys": -16.0,
-        "keys_l": -16.0,
-        "keys_r": -16.0,
+        "keys": -14.5,
+        "keys_l": -14.5,
+        "keys_r": -14.5,
         "synth": -17.0,
         "snare": -20.0,
         "drums": -24.0,
@@ -6564,9 +6642,9 @@ def reverb_send_level_db(role: str) -> float | None:
 
 def delay_send_level_db(role: str, lead_bonus: float) -> float | None:
     if role == "vocal":
-        return -14.0
+        return -13.0
     if role in {"sax", "horn", "flute", "guitar"}:
-        return -18.0 if lead_bonus > 0.0 else -22.0
+        return -17.0 if lead_bonus > 0.0 else -21.0
     if role in {"keys", "keys_l", "keys_r", "synth"} and lead_bonus > 0.0:
         return -22.0
     return None
@@ -6596,6 +6674,8 @@ def effective_mix_snapshot(
         "target_lufs": TARGET_LUFS,
         "mastering_intensity": MASTERING_INTENSITY,
         "master_db": override_float(song_overrides.get("master_db"), 0.0),
+        "role_dsp_profile_version": ROLE_DSP_PROFILE_VERSION,
+        "role_compressor_profiles": ROLE_COMPRESSOR_PROFILES,
         "bus_processing": {
             "vocal_bus": {"type": "rms_compressor_streaming", "threshold_db": -12, "ratio": 2, "attack_ms": 150, "release_ms": 600},
             "mix_bus": {
