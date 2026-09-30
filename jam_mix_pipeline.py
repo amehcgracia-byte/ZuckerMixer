@@ -98,6 +98,7 @@ RHYTHM_ONSET_TOLERANCE_BEATS = 0.16
 RHYTHM_INCONSISTENT_ATTENUATION_DB = -3.0
 RHYTHM_SPARSE_ATTENUATION_DB = -2.0
 VOCAL_PRIORITY_MARGIN_DB = 2.0
+MIC_PAIR_MAX_CORRECTION_DB = 4.5
 VOICE_WIND_EXPLICIT_TERMS = ("flute", "trumpet", "trombone", "sax", "horn", "brass", "woodwind")
 SYNTH_BELOW_MELODIC_MARGIN_DB = 3.0
 NOISE_ANALYSIS_MAX_SECONDS = 300.0
@@ -139,7 +140,7 @@ AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0}
 # in the user's real sessions. This is applied before per-song caps and is
 # included in the analysis signature so old plans cannot survive unnoticed.
 AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -3.0}
-AUTO_MIX_PROFILE_VERSION = 2
+AUTO_MIX_PROFILE_VERSION = 3
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -6071,7 +6072,7 @@ def vocal_harmonic_balance(
     envelopes: dict[str, np.ndarray] | None = None,
 ) -> dict[str, object]:
     """Measure the per-song vocal-vs-harmonic relationship."""
-    vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room"}]
+    vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room", "horn", "sax"}]
     harmonic_names = [
         name for name, role in effective_roles.items()
         if role in {"keys", "keys_l", "keys_r", "synth"}
@@ -6183,10 +6184,24 @@ def per_song_role_balance_corrections(
             continue
         target = float(np.median(levels))
         for name in names:
-            vocal_pair_corrections[name] = float(np.clip(target - float(active_levels_db.get(name, target)), -3.0, 3.0))
+            vocal_pair_corrections[name] = float(np.clip(target - float(active_levels_db.get(name, target)), -MIC_PAIR_MAX_CORRECTION_DB, MIC_PAIR_MAX_CORRECTION_DB))
 
+    pair_diagnostics = {}
+    for pair in sorted(set(vocal_pair_keys.values())):
+        names = [name for name in vocal_names if vocal_pair_keys[name] == pair]
+        levels = [float(active_levels_db[name]) for name in names if name in active_levels_db]
+        if len(names) >= 2 and levels:
+            pair_diagnostics[pair] = {
+                "stems": names,
+                "active_levels_db": {name: float(active_levels_db[name]) for name in names if name in active_levels_db},
+                "spread_db": round(max(levels) - min(levels), 3),
+                "target_db": round(float(np.median(levels)), 3),
+                "max_correction_db": MIC_PAIR_MAX_CORRECTION_DB,
+                "method": "per-song active-level median with bounded pair correction",
+            }
     return {
         "vocal_pair_corrections_db": vocal_pair_corrections,
+        "vocal_pair_diagnostics": pair_diagnostics,
         "role_corrections_db": role_corrections,
         "role_reasons": role_reasons,
         "role_levels_db": role_levels,
@@ -7033,12 +7048,23 @@ def _onset_positions(audio: np.ndarray, sr: int) -> np.ndarray:
 
 
 def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, object]:
-    """Classify vocal-role mic content using wind purity vs voice formants/transients."""
+    """Classify a mic by content while keeping the physical pair intact.
+
+    The source role tells us that this is a microphone, not what is in front
+    of it. Use filename hints when present, but also allow a strict,
+    narrow-spectrum detector to identify flute/brass-like material when the
+    file is generically named (for example Vox 1/Vox 2). Voice remains the
+    conservative default when the evidence is ambiguous.
+    """
     audio = _analysis_mono(stem, segment, max_seconds=180.0)
     label = stem.path.name.lower()
     explicit_wind = any(term in label for term in VOICE_WIND_EXPLICIT_TERMS)
     if len(audio) < RHYTHM_ANALYSIS_SR * 2:
-        return {"classification": "wind" if explicit_wind else "voice", "confidence": 0.55 if explicit_wind else 0.35, "reason": "filename hint" if explicit_wind else "insufficient spectral evidence"}
+        return {
+            "classification": "wind" if explicit_wind else "voice",
+            "confidence": 0.55 if explicit_wind else 0.35,
+            "reason": "filename hint" if explicit_wind else "insufficient spectral evidence",
+        }
     frame, hop = 2048, 512
     frames = np.lib.stride_tricks.sliding_window_view(audio, frame)[::hop]
     windowed = frames * np.hanning(frame).astype(np.float32)
@@ -7048,7 +7074,11 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
     energy = power[:, band].sum(axis=1)
     active = energy > np.percentile(energy, 45)
     if not np.any(active):
-        return {"classification": "wind" if explicit_wind else "voice", "confidence": 0.55 if explicit_wind else 0.25, "reason": "no stable active frames"}
+        return {
+            "classification": "wind" if explicit_wind else "voice",
+            "confidence": 0.55 if explicit_wind else 0.25,
+            "reason": "no stable active frames",
+        }
     selected = power[active][:, band]
     selected_freqs = freqs[band]
     flatness = np.exp(np.mean(np.log(selected), axis=1)) / np.mean(selected, axis=1)
@@ -7056,18 +7086,17 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
     peak_counts = []
     harmonicity = []
     for spectrum in selected:
-        peaks, props = signal.find_peaks(spectrum, prominence=max(float(np.max(spectrum)) * 0.025, 1e-9), distance=3)
+        peaks, _props = signal.find_peaks(
+            spectrum,
+            prominence=max(float(np.max(spectrum)) * 0.025, 1e-9),
+            distance=3,
+        )
         peak_counts.append(len(peaks))
         harmonicity.append(float(np.max(spectrum) / np.sum(spectrum)))
     mean_flatness = float(np.median(flatness))
     mean_centroid = float(np.median(centroid))
     mean_peaks = float(np.median(peak_counts))
     mean_harmonicity = float(np.median(harmonicity))
-    # Flute and similar winds concentrate energy in one fundamental plus a
-    # small number of harmonics. Voice normally has several formant regions,
-    # more upper-band energy, and noisier consonant/breath transients. The
-    # pure-tone gate is deliberately strict so a vocal mic is not promoted to
-    # vocal priority merely because one vowel happens to be tonal.
     upper = selected[:, selected_freqs >= 1800.0].sum(axis=1)
     total = selected.sum(axis=1) + 1e-12
     upper_ratio = float(np.median(upper / total))
@@ -7078,22 +7107,42 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
         and mean_peaks <= 7.0
         and upper_ratio < 0.24
     )
-    wind_score = (1.5 if pure_wind else 0.0) + (1.0 if mean_flatness < 0.22 else 0.0) + (1.0 if mean_harmonicity > 0.20 else 0.0) + (0.5 if mean_centroid > 1800.0 else 0.0)
-    # A stable narrow spectrum is stronger evidence for wind than a single
-    # high harmonicity frame; voice formants move and broaden over time.
+    wind_score = (
+        (1.5 if pure_wind else 0.0)
+        + (1.0 if mean_flatness < 0.22 else 0.0)
+        + (1.0 if mean_harmonicity > 0.20 else 0.0)
+        + (0.5 if mean_centroid > 1800.0 else 0.0)
+    )
     if pure_wind and peak_stability < 2.5:
         wind_score += 0.5
     if explicit_wind:
         wind_score += 1.5
-    # A stem whose filename already identifies it as a vocal microphone must
-    # remain vocal unless the filename explicitly names a wind instrument.
-    # Spectral purity alone is not sufficient: sustained vowels can resemble
-    # narrow-band wind material and otherwise lose vocal-bus processing.
-    is_wind = bool(explicit_wind and wind_score >= 2.0)
+    # Generic microphone names can still be classified as wind, but only with
+    # a stricter profile than an explicit filename hint. This prevents a
+    # sustained vowel from being routed through the horn EQ and compressor.
+    generic_wind = bool(
+        not explicit_wind
+        and pure_wind
+        and mean_flatness < 0.14
+        and mean_harmonicity > 0.30
+        and mean_peaks <= 6.0
+        and peak_stability < 2.0
+        and 1200.0 <= mean_centroid <= 3200.0
+    )
+    is_wind = bool((explicit_wind and wind_score >= 2.0) or generic_wind)
+    confidence = float(np.clip(
+        0.45 + abs(wind_score - 1.5) * 0.18 + (0.12 if generic_wind else 0.0),
+        0.0,
+        0.95,
+    ))
     return {
         "classification": "wind" if is_wind else "voice",
-        "confidence": float(np.clip(0.45 + abs(wind_score - 1.5) * 0.18, 0.0, 0.95)),
-        "reason": "tonal narrow-spectrum wind profile" if is_wind else "formant-like broadband vocal profile",
+        "confidence": confidence,
+        "reason": (
+            "explicit wind filename and tonal profile" if explicit_wind and is_wind
+            else "generic mic narrow-spectrum wind profile" if generic_wind
+            else "formant-like broadband vocal profile"
+        ),
         "spectral_flatness": mean_flatness,
         "spectral_centroid_hz": mean_centroid,
         "median_peak_count": mean_peaks,
@@ -7102,7 +7151,6 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
         "peak_count_stability": peak_stability,
         "pure_wind_profile": pure_wind,
     }
-
 
 def analyze_rhythmic_consistency(stem: Stem, segment: Segment, bpm: float) -> dict[str, object]:
     """Measure onset/grid alignment and activity continuity for one stem/song."""
@@ -7199,7 +7247,7 @@ def analyze_song_mix_controls(
             "horn"
             if stem.role == "vocal"
             and mic_content.get(stem.path.name, {}).get("classification") == "wind"
-            and any(term in stem.path.name.lower() for term in VOICE_WIND_EXPLICIT_TERMS)
+            and float(mic_content.get(stem.path.name, {}).get("confidence", 0.0)) >= 0.68
             else stem.role
         )
         for stem in stems
@@ -7251,6 +7299,13 @@ def analyze_song_mix_controls(
         "vocal_pair_keys": pair_keys,
         "balance": balance,
         "role_balance": role_balance,
+        "automatic_mix_profile": {
+            "version": AUTO_MIX_PROFILE_VERSION,
+            "mic_pair_balance": role_balance.get("vocal_pair_diagnostics", {}),
+            "content_adaptive_mic_eq": True,
+            "content_adaptive_mic_role": True,
+            "guitar_vocal_overlap_trim": True,
+        },
         "voice_floor_db": voice_floor,
         "synth_floor_db": synth_floor,
         "pan_assignments": {
