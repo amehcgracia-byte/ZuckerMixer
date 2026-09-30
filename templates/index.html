@@ -11,10 +11,10 @@
     <div id="loadingOverlay" hidden aria-live="polite">
       <div class="loading-stage">
         <div class="loading-stage-visual">
-          <video class="loading-stage-media" autoplay loop muted playsinline preload="auto">
+          <video id="loadingStageVideo" class="loading-stage-media" autoplay loop muted playsinline preload="auto">
             <source src="/static/zucker_loading_fragment.mp4" type="video/mp4">
-            <img class="loading-stage-media" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
           </video>
+          <img id="loadingStageFallback" class="loading-stage-media loading-stage-fallback" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="" hidden>
           <div class="loading-stage-info">
             <h2 id="loadingOverlayTitle">Working...</h2>
             <p id="loadingOverlayDetail">Please wait...</p>
