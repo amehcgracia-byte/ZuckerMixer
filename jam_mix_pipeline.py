@@ -7458,7 +7458,7 @@ def analyze_song_mix_controls(
             "guitar_vocal_overlap_trim": True,
             "instrument_profile_version": 3,
             "noise_watchdog": "spectral subtraction, hum notches and raw wind/mic gating",
-            "role_profiles": ["kick", "snare", "bass", "guitar", "keys", "synth", "vocal", "horn", "sax", "flute"],
+            "role_profiles": ["kick", "snare", "hh", "overhead", "bass", "guitar", "keys", "synth", "vocal", "horn", "sax", "flute"],
         },
         "voice_floor_db": voice_floor,
         "synth_floor_db": synth_floor,
