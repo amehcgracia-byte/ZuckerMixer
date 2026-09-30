@@ -195,8 +195,9 @@ def main() -> None:
     window.events.loaded += on_loaded
     window.events.closing += on_closing
     webview.start(debug=False)
-    # Closing the WebView must never wait forever for Whisper/ffmpeg.
-    jam_app.wait_for_jobs_to_stop(timeout_seconds=5.0)
+    # Closing the WebView must never wait for a multi-minute Whisper/ffmpeg
+    # worker. Process groups were already signalled by on_closing.
+    jam_app.wait_for_jobs_to_stop(timeout_seconds=2.5)
 
 
 if __name__ == "__main__":
