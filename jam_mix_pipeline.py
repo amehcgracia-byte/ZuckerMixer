@@ -140,7 +140,7 @@ AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0}
 # in the user's real sessions. This is applied before per-song caps and is
 # included in the analysis signature so old plans cannot survive unnoticed.
 AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -3.0}
-AUTO_MIX_PROFILE_VERSION = 3
+AUTO_MIX_PROFILE_VERSION = 4
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -6219,6 +6219,91 @@ def per_song_role_balance_corrections(
     }
 
 
+def per_song_effect_profile(
+    effective_roles: dict[str, str],
+    active_levels_db: dict[str, float],
+    bpm: float,
+    bpm_confidence: float,
+    mic_content: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Choose restrained, content-aware send defaults for each song.
+
+    This is an automatic scene, not a destructive override: explicit effect
+    edits are marked by the UI and remain authoritative. The scene keeps
+    dense grooves drier, gives presenter/voice material a little space, and
+    lets wind-led songs breathe without putting the same reverb and echo on
+    every export.
+    """
+    classifications = [
+        str(info.get("classification", "voice"))
+        for info in mic_content.values()
+        if isinstance(info, dict)
+    ]
+    has_voice = "voice" in classifications or not classifications
+    has_wind = "wind" in classifications
+    fast_groove = bool(float(bpm_confidence) >= 0.45 and float(bpm) >= 105.0)
+    if has_wind and not has_voice:
+        scene = "open-wind"
+        reverb_offset_db = 0.5
+        delay_offset_db = -1.0
+    elif fast_groove:
+        scene = "tight-groove"
+        reverb_offset_db = -1.5
+        delay_offset_db = -2.0
+    elif has_voice:
+        scene = "vocal-room"
+        reverb_offset_db = 0.0
+        delay_offset_db = -1.0
+    else:
+        scene = "dry-band"
+        reverb_offset_db = -2.0
+        delay_offset_db = -2.0
+
+    role_space = {
+        "vocal": has_voice,
+        "horn": has_wind,
+        "sax": has_wind,
+        "guitar": scene == "open-wind",
+        "keys": scene in {"vocal-room", "open-wind"},
+        "keys_l": scene in {"vocal-room", "open-wind"},
+        "keys_r": scene in {"vocal-room", "open-wind"},
+        "synth": False,
+    }
+    role_echo = {
+        "vocal": bool(has_voice and not fast_groove),
+        "horn": bool(has_wind and not fast_groove),
+        "sax": bool(has_wind and not fast_groove),
+        "guitar": False,
+        "keys": scene == "open-wind",
+        "keys_l": scene == "open-wind",
+        "keys_r": scene == "open-wind",
+        "synth": False,
+    }
+    role_offsets = {
+        role: {
+            "reverb_db": float(reverb_offset_db + (0.5 if role in {"vocal", "horn", "sax"} else 0.0)),
+            "delay_db": float(delay_offset_db),
+        }
+        for role in set(effective_roles.values())
+    }
+    return {
+        "version": 1,
+        "scene": scene,
+        "reason": (
+            "wind-led microphone content" if scene == "open-wind"
+            else "tempo-confident dense groove" if scene == "tight-groove"
+            else "voice-present space" if scene == "vocal-room"
+            else "conservative dry-band default"
+        ),
+        "bpm": float(bpm),
+        "bpm_confidence": float(bpm_confidence),
+        "role_space_enabled": role_space,
+        "role_echo_enabled": role_echo,
+        "role_offsets_db": role_offsets,
+        "method": "per-song content and tempo scene; explicit effect edits remain authoritative",
+    }
+
+
 def role_norms_from_detection_cache(stems: list[Stem]) -> dict[str, float]:
     """Return per-role active-level norms from the current session cache."""
     cache = load_detection_cache(stems)
@@ -7268,6 +7353,13 @@ def analyze_song_mix_controls(
     active_levels_db = active_levels_db or dict(rms_values_db)
     balance = vocal_harmonic_balance(effective_roles, active_levels_db, segment_envelopes)
     role_balance = per_song_role_balance_corrections(effective_roles, active_levels_db, segment_envelopes)
+    effect_profile = per_song_effect_profile(
+        effective_roles,
+        active_levels_db,
+        bpm,
+        bpm_confidence,
+        mic_content,
+    )
     vocal_names = set(balance["vocal_names"])
     harmonic_names = set(balance["harmonic_names"])
     vocal_group_correction = float(balance["vocal_group_correction_db"] or 0.0)
@@ -7299,6 +7391,7 @@ def analyze_song_mix_controls(
         "vocal_pair_keys": pair_keys,
         "balance": balance,
         "role_balance": role_balance,
+        "effect_profile": effect_profile,
         "automatic_mix_profile": {
             "version": AUTO_MIX_PROFILE_VERSION,
             "mic_pair_balance": role_balance.get("vocal_pair_diagnostics", {}),
