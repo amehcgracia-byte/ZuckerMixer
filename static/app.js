@@ -595,13 +595,23 @@ async function loadState() {
   let res;
   try {
     res = await fetch("/api/state");
-    appState = await res.json();
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const next = await res.json();
+    appState = {
+      songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [],
+      source_folder: "Not available", ...next,
+    };
+    if (!Array.isArray(appState.songs)) appState.songs = [];
+    // Bind the initial job before the first /api/jobs poll.
+    if (appState.detection_job && ["queued", "running", "stopping"].includes(appState.detection_job.status)) {
+      setLoadingOverlayJob(appState.detection_job);
+    }
   } catch (error) {
     appState = appState || {
       songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [],
       source_folder: "Not available", last_error: error?.message || String(error),
     };
-    showToast(`Error loading folder: ${appState.last_error}`);
+    showToast(`Error loading folder: ${appState.last_error || error?.message || String(error)}`);
   }
   renderBuildInfo();
   renderSlotAudit();
@@ -620,12 +630,12 @@ async function loadState() {
   renderSongs();
   renderResults();
   fetch("/api/redetect/second-pass").then((response) => response.json()).then((candidate) => { if (candidate?.status === "pending_confirmation" || candidate?.status === "incomplete") showSecondPassCandidate(candidate); }).catch(() => {});
-  // /api/state may have been serialized before a newly queued detection was
-  // visible. Reconcile the lightweight live job channel after the large state
-  // response so an old 0% snapshot cannot overwrite current progress.
   pollJobs().catch((err) => console.warn("[state jobs refresh failed]", err));
 }
 
+function visibleSongs() {
+  return (Array.isArray(appState?.songs) ? appState.songs : []).filter((song) => !song.skipped);
+}
 function visibleSongs() {
   return appState.songs.filter((song) => !song.skipped);
 }
