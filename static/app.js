@@ -3260,7 +3260,9 @@ function renderLoadingOverlay() {
             : Number(number) === Number(state.current)
               ? "active"
               : "";
-        return `<div class="loading-song-state ${cls}"><span>Song ${String(number).padStart(2, "0")}</span><span>${esc(row.detail || row.status || row.state || "queued")}</span></div>`;
+        const mark = status === "done" || status === "completed" ? "✓" : status.includes("fail") || status.includes("error") ? "!" : status === "working" || Number(number) === Number(state.current) ? "●" : "○";
+        const detail = status === "done" || status === "completed" ? "completed" : (row.detail || row.status || row.state || "queued");
+        return `<div class="loading-song-state ${cls}" data-song-status="${esc(status)}"><span><span class="loading-song-check" aria-hidden="true">${mark}</span> Song ${String(number).padStart(2, "0")}</span><span>${esc(detail)}</span></div>`;
       }).join("");
     } else {
       const facts = [
