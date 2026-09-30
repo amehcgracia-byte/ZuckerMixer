@@ -3478,6 +3478,7 @@ def index() -> str:
     return render_template(
         "index.html",
         static_version=f"{build.get('app_version', 'dev')}-{build.get('source_revision', 'unbuilt')}-{build.get('app_js_sha256', '')[:16]}",
+        build_version=build.get("app_version", "development"),
     )
 
 
