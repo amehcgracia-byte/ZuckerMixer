@@ -3140,6 +3140,13 @@ function renderLoadingOverlay() {
   const activityAge = $("#loadingActivityAge");
   const health = $("#loadingOverlayHealth");
   const songStates = $("#loadingSongStates");
+  const cancelNode = $("#cancelLoadingWork");
+  const cancellable = state.kind !== "cut" && ["queued", "running", "stopping"].includes(String(state.status || ""));
+  if (cancelNode) {
+    cancelNode.hidden = !cancellable;
+    cancelNode.disabled = String(state.status || "") === "stopping";
+    cancelNode.textContent = String(state.status || "") === "stopping" ? "Stopping…" : "Cancel loading";
+  }
   if (titleNode) titleNode.textContent = title;
   if (detailNode) detailNode.textContent = detail;
   if (timingNode) {
@@ -3395,6 +3402,54 @@ function friendlyStatus(job) {
   return "Finished";
 }
 
+async function cancelActiveWork() {
+  if (!window.confirm("Are you sure you want to cancel all active work?")) return;
+  const buttons = [$("#cancelLoadingWork"), $("#cancelJob")].filter(Boolean);
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    const response = await fetch("/api/cancel", { method: "POST" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.error || "Could not cancel the active work.");
+    }
+    showToast("Cancellation requested. Stopping the active processes...");
+    if (loadingOverlayJob) {
+      loadingOverlayJob = {
+        ...loadingOverlayJob,
+        status: "stopping",
+        current_stage: "cancelling",
+        stage_detail: "Stopping active workers...",
+        last_event: "Cancellation requested",
+      };
+      renderLoadingOverlay();
+    }
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const jobs = await pollJobs();
+      const active = jobs.some((job) => ["queued", "running", "stopping"].includes(job.status));
+      if (!active) break;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+    const cutDialog = $("#cutSelectorDialog");
+    if (cutDialog?.open) cutDialog.close("cancel");
+    cutSelector = null;
+    loadingOverlayJob = null;
+    loadingOverlayCut = null;
+    document.body.classList.remove("loading-mode");
+    renderLoadingOverlay();
+    const box = $("#loadingStatus");
+    if (box) box.hidden = true;
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    await refreshState({ renderLarge: true });
+    showToast("All active work was cancelled. Ready.");
+  } catch (error) {
+    showToast(error.message || String(error));
+    await pollJobs().catch(() => {});
+  } finally {
+    buttons.forEach((button) => { button.disabled = false; });
+  }
+}
+
 async function pollJobs() {
   const res = await fetch("/api/jobs");
   const jobs = await res.json();
@@ -3508,10 +3563,8 @@ if (typeof document !== "undefined") {
   $("#mixAll").addEventListener("click", () => mixEverything());
   $("#editAllCuts").addEventListener("click", () => editAllCuts().catch((error) => { setCutLoading("Error", error.message || String(error)); showToast(error.message || String(error)); }));
   $("#secondWhisperPass").addEventListener("click", () => startOptionalWhisperAnalysis().catch((error) => { setCutLoading("Error", error.message || String(error), 100); showToast(error.message || String(error)); }));
-  $("#cancelJob").addEventListener("click", () => {
-    if (!window.confirm("Are you sure you want to cancel?")) return;
-    fetch("/api/cancel", { method: "POST" }).then(pollJobs);
-  });
+  $("#cancelJob")?.addEventListener("click", () => { cancelActiveWork(); });
+  $("#cancelLoadingWork")?.addEventListener("click", () => { cancelActiveWork(); });
   $("#audioScanMode").addEventListener("change", () => {
     saveSettings({ audio_scan_mode: $("#audioScanMode").value });
   });
