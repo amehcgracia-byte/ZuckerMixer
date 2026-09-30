@@ -1906,7 +1906,7 @@ def visible_songs(
     return songs
 
 
-def _loading_state(error: str = "") -> dict[str, Any]:
+def _loading_state(error: str = "", detection_job: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a useful state even when detection has not completed."""
     settings = load_settings()
     source = str(pipeline.SOURCE_DIR)
@@ -1939,6 +1939,7 @@ def _loading_state(error: str = "") -> dict[str, Any]:
         "settings": settings,
         "source_config": load_source_config(),
         "jobs": current_jobs(),
+        "detection_job": detection_job,
         "output_dir": str(out_dir()),
         "average_render_seconds": 180.0,
         "ffmpeg": ffmpeg_status(),
@@ -3493,16 +3494,16 @@ def api_state() -> Response:
     # the files found before the failure.
     with state_lock:
         state_ready = pipeline_state is not None
-        detection_active = any(
-            job.get("kind") == "redetect" and job.get("status") in {"queued", "running", "stopping"}
-            for job in jobs
-        )
+    settings = load_settings()
+    source = Path(settings.get("source_folder") or pipeline.SOURCE_DIR).expanduser().resolve()
+    current_source = Path(pipeline.SOURCE_DIR).expanduser().resolve()
+    # The first /api/state must initialize the same source-scoped paths as
+    # Change Folder. Without this, a stale/default pipeline source can scan
+    # one folder while the settings and cache belong to another.
+    if source != current_source or str(pipeline.audio_scan_report().get("source") or "") != str(source):
+        configure_source_folder(source)
     if not state_ready:
-        settings = load_settings()
-        source = Path(settings.get("source_folder") or pipeline.SOURCE_DIR).expanduser().resolve()
-        if source != Path(pipeline.SOURCE_DIR).resolve():
-            configure_source_folder(source)
-        # A valid snapshot can be hydrated synchronously and cheaply.  Only
+        # A valid snapshot can be hydrated synchronously and cheaply. Only
         # a cache miss starts the expensive detection worker; this keeps the
         # file list visible instead of making /api/state wait for Whisper.
         try:
@@ -3524,14 +3525,14 @@ def api_state() -> Response:
                 pipeline.AUDIO_SCAN_REPORT = report
             except Exception as exc:
                 return jsonify(_loading_state(f"{type(exc).__name__}: {exc}")), 200
-        if not detection_active:
+        detection_job = _active_redetect_job(source)
+        if detection_job is None:
             # A cache miss must perform the real song detection. The lightweight
             # scan is useful for diagnostics, but it cannot produce usable slots
             # without Whisper and otherwise leaves a misleading one-block session.
-            api_redetect(False)
-        return jsonify(_loading_state()), 200
+            detection_job = _queue_redetect_job(False)
+        return jsonify(_loading_state(detection_job=detection_job)), 200
     return jsonify(public_state()), 200
-
 
 @app.get("/api/cuts/<int:song_id>")
 def api_cuts(song_id: int) -> Response:
@@ -4011,10 +4012,25 @@ def api_song_name(segment_id: int) -> Response:
 
 
 @app.post("/api/redetect")
-def api_redetect(allow_whisper: bool = False) -> Response:
-    payload = request.get_json(force=True, silent=True) or {}
-    if "allow_whisper" in payload:
-        allow_whisper = bool(payload.get("allow_whisper"))
+def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | None:
+    """Return the live detection job for the selected source, if any."""
+    expected = str(Path(source or pipeline.SOURCE_DIR).expanduser().resolve())
+    with state_lock:
+        live = [
+            job for job in jobs
+            if job.get("kind") == "redetect"
+            and str(Path(job.get("source_folder") or "").expanduser().resolve()) == expected
+            and job.get("status") in {"queued", "running", "stopping"}
+        ]
+        return dict(live[-1]) if live else None
+
+
+def _queue_redetect_job(allow_whisper: bool = False) -> dict[str, Any]:
+    """Queue exactly one source-scoped detection job and return its snapshot."""
+    source = str(Path(pipeline.SOURCE_DIR).expanduser().resolve())
+    existing = _active_redetect_job(source)
+    if existing:
+        return existing
     job_id = f"{int(time.time())}-{len(jobs) + 1}"
     job = {
         "id": job_id,
@@ -4026,15 +4042,15 @@ def api_redetect(allow_whisper: bool = False) -> Response:
         "song_progress": 0,
         "created": time.time(),
         "current": None,
-        "current_stage": "waiting",
-        "stage_detail": "",
+        "current_stage": "scanning folder",
+        "stage_detail": "Scanning source folder before detection",
         "started": None,
         "heartbeat": None,
         "done_count": 0,
         "total_count": 1,
         "lifecycle_log_path": str(LIFECYCLE_LOG_PATH),
         "allow_whisper": bool(allow_whisper),
-        "source_folder": str(Path(pipeline.SOURCE_DIR).expanduser().resolve()),
+        "source_folder": source,
         "build": runtime_build_metadata(),
     }
     with state_lock:
@@ -4043,15 +4059,22 @@ def api_redetect(allow_whisper: bool = False) -> Response:
     lifecycle_log(
         "redetect_queued",
         job_id,
-        source_folder=str(pipeline.SOURCE_DIR),
+        source_folder=source,
         audio_scan_mode=str(load_settings().get("audio_scan_mode") or "auto"),
         cache_path=str(pipeline.detection_cache_path()),
+        allow_whisper=bool(allow_whisper),
     )
     job_queue.put(job)
     append_log(job["id"], "Queued song search.")
-    return jsonify(job)
+    return dict(job)
 
 
+@app.post("/api/redetect")
+def api_redetect(allow_whisper: bool = False) -> Response:
+    payload = request.get_json(force=True, silent=True) or {}
+    if "allow_whisper" in payload:
+        allow_whisper = bool(payload.get("allow_whisper"))
+    return jsonify(_queue_redetect_job(allow_whisper))
 def configured_slot_target() -> int | None:
     raw = getattr(pipeline, "EXPECTED_SLOT_COUNT", None)
     if raw in (None, ""):
