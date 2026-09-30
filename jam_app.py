@@ -528,6 +528,10 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     role_balance_reasons = role_balance.get("role_reasons", {}) if isinstance(role_balance, dict) else {}
     vocal_pair_diagnostics = role_balance.get("vocal_pair_diagnostics", {}) if isinstance(role_balance, dict) else {}
     automatic_mix_profile = mix_controls.get("automatic_mix_profile", {}) if isinstance(mix_controls, dict) else {}
+    effect_profile = mix_controls.get("effect_profile", {}) if isinstance(mix_controls, dict) else {}
+    effect_space_roles = effect_profile.get("role_space_enabled", {}) if isinstance(effect_profile, dict) else {}
+    effect_echo_roles = effect_profile.get("role_echo_enabled", {}) if isinstance(effect_profile, dict) else {}
+    effect_role_offsets = effect_profile.get("role_offsets_db", {}) if isinstance(effect_profile, dict) else {}
     loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
     # All successfully decoded stems enter every song plan. Explicit mute and
     # solo overrides are applied later; low energy must not hide a track.
@@ -628,9 +632,27 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         if "solo" not in stem_ov:
             stem_ov["solo"] = False
             changed = True
-        for effect_key in ("gate_enabled", "space_enabled", "echo_enabled"):
-            if effect_key not in stem_ov:
-                stem_ov[effect_key] = False
+        if "gate_enabled" not in stem_ov:
+            stem_ov["gate_enabled"] = False
+            changed = True
+        # Automatic effects are content-aware by song. Once the user toggles
+        # an effect in the editor, the explicit marker keeps that choice.
+        effects_user_confirmed = bool(stem_ov.get("effects_user_confirmed", False))
+        if not effects_user_confirmed:
+            auto_space = bool(effect_space_roles.get(mix_role, False))
+            auto_echo = bool(effect_echo_roles.get(mix_role, False))
+            if stem_ov.get("space_enabled") != auto_space:
+                stem_ov["space_enabled"] = auto_space
+                changed = True
+            if stem_ov.get("echo_enabled") != auto_echo:
+                stem_ov["echo_enabled"] = auto_echo
+                changed = True
+        else:
+            if "space_enabled" not in stem_ov:
+                stem_ov["space_enabled"] = False
+                changed = True
+            if "echo_enabled" not in stem_ov:
+                stem_ov["echo_enabled"] = False
                 changed = True
         if "pan" not in stem_ov:
             stem_ov["pan"] = pipeline.enforced_pan(stem.role, stem.name)
@@ -653,6 +675,9 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         solo = bool(stem_ov.get("solo", False))
         base_reverb = pipeline.reverb_send_level_db(mix_role)
         base_delay = pipeline.delay_send_level_db(mix_role, lead_bonus)
+        effect_offsets = effect_role_offsets.get(mix_role, {}) if isinstance(effect_role_offsets, dict) else {}
+        reverb_scene_offset_db = float(effect_offsets.get("reverb_db", 0.0) or 0.0)
+        delay_scene_offset_db = float(effect_offsets.get("delay_db", 0.0) or 0.0)
         stem_params[stem.path.name] = {
             "file": stem.path.name,
             "label": f"{musician_labels.get(stem.role)} — {stem_display_label(stem)}" if musician_labels.get(stem.role) else stem_display_label(stem),
@@ -697,6 +722,10 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "gate_enabled": bool(stem_ov.get("gate_enabled", False)),
             "space_enabled": bool(stem_ov.get("space_enabled", False)),
             "echo_enabled": bool(stem_ov.get("echo_enabled", False)),
+            "effects_user_confirmed": bool(stem_ov.get("effects_user_confirmed", False)),
+            "effect_scene": effect_profile.get("scene") if isinstance(effect_profile, dict) else None,
+            "reverb_scene_offset_db": reverb_scene_offset_db,
+            "delay_scene_offset_db": delay_scene_offset_db,
             "muted_by_solo": bool(solo_files and stem.path.name not in solo_files),
             "pan": pipeline.enforced_pan(mix_role, stem.name, stem_ov.get("pan")),
             "eq_low_cut_hz": float(stem_ov.get("eq_low_cut_hz", eq_defaults["eq_low_cut_hz"])),
@@ -704,10 +733,10 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "eq_air_gain_db": float(stem_ov.get("eq_air_gain_db", eq_defaults["eq_air_gain_db"])),
             "reverb_base_db": base_reverb,
             "reverb_send_db": float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
-            "reverb_total_db": None if base_reverb is None else base_reverb + float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
+            "reverb_total_db": None if base_reverb is None else base_reverb + reverb_scene_offset_db + float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
             "delay_base_db": base_delay,
             "delay_send_db": float(stem_ov.get("delay_send_db", 0.0) or 0.0),
-            "delay_total_db": None if base_delay is None else base_delay + float(stem_ov.get("delay_send_db", 0.0) or 0.0),
+            "delay_total_db": None if base_delay is None else base_delay + delay_scene_offset_db + float(stem_ov.get("delay_send_db", 0.0) or 0.0),
         }
     active_vocal_names = [
         stem.path.name
@@ -755,6 +784,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "role_balance": role_balance,
             "vocal_pair_diagnostics": vocal_pair_diagnostics,
             "automatic_mix_profile": automatic_mix_profile,
+            "effect_profile": effect_profile,
             "guitar_original_level_db": role_balance.get("guitar_original_level_db"),
             "guitar_reduction_db": role_balance.get("guitar_reduction_db", 0.0),
             "guitar_reduction_reason": role_balance.get("guitar_reduction_reason", "no reliable vocal overlap evidence"),
