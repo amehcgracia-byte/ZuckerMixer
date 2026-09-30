@@ -362,7 +362,7 @@ def active_stems_for_segment(stems: list[pipeline.Stem], segment: pipeline.Segme
     return [stem.path.name for stem in stems]
 
 
-MIX_PLAN_VERSION = 4
+MIX_PLAN_VERSION = 5
 
 
 def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
@@ -526,6 +526,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     role_corrections = role_balance.get("role_corrections_db", {}) if isinstance(role_balance, dict) else {}
     vocal_pair_corrections = role_balance.get("vocal_pair_corrections_db", {}) if isinstance(role_balance, dict) else {}
     role_balance_reasons = role_balance.get("role_reasons", {}) if isinstance(role_balance, dict) else {}
+    vocal_pair_diagnostics = role_balance.get("vocal_pair_diagnostics", {}) if isinstance(role_balance, dict) else {}
+    automatic_mix_profile = mix_controls.get("automatic_mix_profile", {}) if isinstance(mix_controls, dict) else {}
     loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
     # All successfully decoded stems enter every song plan. Explicit mute and
     # solo overrides are applied later; low energy must not hide a track.
@@ -559,6 +561,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "segment_peaks_db": segment_peaks,
         "role_norms_db": role_norms_db,
         "mix_controls": mix_controls,
+        "mix_profile_version": getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1),
         "noise_diagnostics": pipeline.classify_noise_stems(state["stems"], segment, sr),
         "flattening": pipeline.build_per_song_flattening(segment_envelopes),
         "drum_bpm": pipeline.estimate_segment_drum_bpm(state["stems"], segment, sr),
@@ -750,11 +753,13 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "auto_mix_balance": {
             **(mix_controls.get("balance", {}) if isinstance(mix_controls.get("balance", {}), dict) else {}),
             "role_balance": role_balance,
+            "vocal_pair_diagnostics": vocal_pair_diagnostics,
+            "automatic_mix_profile": automatic_mix_profile,
             "guitar_original_level_db": role_balance.get("guitar_original_level_db"),
             "guitar_reduction_db": role_balance.get("guitar_reduction_db", 0.0),
             "guitar_reduction_reason": role_balance.get("guitar_reduction_reason", "no reliable vocal overlap evidence"),
         },
-        "auto_mix_method": "per-song active-envelope RMS power groups with vocal/harmonic overlap",
+        "auto_mix_method": "per-song content-aware mic pair balance plus active-envelope vocal/harmonic overlap",
         "stems": stem_params,
     }
     plan_signature = mix_plan_signature(segment_id, segment, song_overrides)
@@ -763,6 +768,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     plan["analysis_cache_path"] = str(cache_path)
     plan["analysis_cache_signature"] = plan_signature
     plan["analysis_cache_version"] = 2
+    plan["mix_profile_version"] = getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1)
     plan["effective_dsp_plan_hash"] = plan_signature
     save_mix_plan(segment_id, segment, song_overrides, plan)
     return plan
