@@ -6046,7 +6046,7 @@ def mix_role_group(role: str, name: str = "") -> str:
         return "harmonic_keys"
     if role == "guitar":
         return "harmonic_guitar"
-    if role in {"sax", "horn"}:
+    if role in {"sax", "horn", "flute"}:
         return "melodic_winds"
     if role == "bass":
         return "bass"
@@ -6303,7 +6303,7 @@ def per_song_effect_profile(
     }
     role_offsets = {
         role: {
-            "reverb_db": float(reverb_offset_db + (0.5 if role in {"vocal", "horn", "sax"} else 0.0)),
+            "reverb_db": float(reverb_offset_db + (0.5 if role in {"vocal", "horn", "sax", "flute"} else 0.0)),
             "delay_db": float(delay_offset_db),
         }
         for role in set(effective_roles.values())
@@ -6351,7 +6351,7 @@ def pan_for_role(role: str, name: str) -> float:
         return -0.35
     if role == "synth":
         return 0.0
-    if role in {"sax", "horn"}:
+    if role in {"sax", "horn", "flute"}:
         return 0.25
     if role == "vocal" and re.search(r"mic\s*2", name.lower()):
         return 0.15
@@ -6472,7 +6472,7 @@ def reverb_send_level_db(role: str) -> float | None:
 def delay_send_level_db(role: str, lead_bonus: float) -> float | None:
     if role == "vocal":
         return -16.0
-    if role in {"sax", "horn", "guitar"}:
+    if role in {"sax", "horn", "flute", "guitar"}:
         return -18.0 if lead_bonus > 0.0 else -24.0
     if role in {"keys", "keys_l", "keys_r", "synth"} and lead_bonus > 0.0:
         return -22.0
@@ -7046,7 +7046,7 @@ def creative_title_from_features(mix: np.ndarray, sr: int, index: int, bpm: floa
         pool = ["Glass in the Sun", "Lucid Machinery", "A Brightness Between Us", "Prism Through Dust", "Daylight on Reeds", "Gold Thread in the Air"]
     elif dominant_role in {"bass", "kick"}:
         pool = ["Ground Wire Bloom", "The Low Road Turns", "Underneath the Engine", "Copper in the Floorboards", "Orbit Below the Room", "Weight of the Evening"]
-    elif dominant_role in {"horn", "sax"}:
+    elif dominant_role in {"horn", "sax", "flute"}:
         pool = ["Brass After Midnight", "A Signal in Blue", "Reeds Across the Hall", "Weather for Brass", "The Broadcast Fades", "Smoke on the Bell"]
     elif dominant_role in {"keys", "keys_l", "keys_r", "synth"}:
         pool = ["Rooms Made of Light", "Soft Circuitry", "Keys Underwater", "The Arcade at Closing", "Electric Rooms", "A Door in the Chord"]
