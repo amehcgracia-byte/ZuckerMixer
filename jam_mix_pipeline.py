@@ -98,6 +98,9 @@ RHYTHM_ONSET_TOLERANCE_BEATS = 0.16
 RHYTHM_INCONSISTENT_ATTENUATION_DB = -3.0
 RHYTHM_SPARSE_ATTENUATION_DB = -2.0
 VOCAL_PRIORITY_MARGIN_DB = 2.0
+HARMONIC_BELOW_DRUM_REFERENCE_DB = 2.0
+EMPTY_STEM_RMS_DBFS = -72.0
+EMPTY_STEM_SPREAD_DB = 8.0
 MIC_PAIR_MAX_CORRECTION_DB = 4.5
 VOICE_WIND_EXPLICIT_TERMS = ("flute", "trumpet", "trombone", "sax", "horn", "brass", "woodwind")
 SYNTH_BELOW_MELODIC_MARGIN_DB = 3.0
@@ -6194,9 +6197,10 @@ def per_song_role_balance_corrections(
             role_reasons[name] = reason
 
     vocal_pair_corrections: dict[str, float] = {}
-    vocal_pair_keys = {name: vocal_pair_key(name) for name in vocal_names}
+    mic_names = [name for name, role in effective_roles.items() if role in {"vocal", "room", "horn", "sax", "flute"}]
+    vocal_pair_keys = {name: vocal_pair_key(name) for name in mic_names}
     for pair in sorted(set(vocal_pair_keys.values())):
-        names = [name for name in vocal_names if vocal_pair_keys[name] == pair]
+        names = [name for name in mic_names if vocal_pair_keys[name] == pair]
         if len(names) < 2:
             continue
         levels = [float(active_levels_db[name]) for name in names if name in active_levels_db]
@@ -6205,6 +6209,27 @@ def per_song_role_balance_corrections(
         target = float(np.median(levels))
         for name in names:
             vocal_pair_corrections[name] = float(np.clip(target - float(active_levels_db.get(name, target)), -MIC_PAIR_MAX_CORRECTION_DB, MIC_PAIR_MAX_CORRECTION_DB))
+
+    drum_anchor_names = [name for name, role in effective_roles.items() if role == "snare"]
+    drum_anchor_level = group_active_level_db(drum_anchor_names, active_levels_db)
+    if drum_anchor_level is None:
+        drum_anchor_names = [name for name, role in effective_roles.items() if role in {"overhead", "hh", "drums"}]
+        drum_anchor_level = group_active_level_db(drum_anchor_names, active_levels_db)
+    harmonic_hierarchy_corrections: dict[str, float] = {}
+    if drum_anchor_level is not None:
+        harmonic_target = float(drum_anchor_level) - HARMONIC_BELOW_DRUM_REFERENCE_DB
+        for role, names in role_groups.items():
+            level = role_levels.get(role)
+            if level is None or not names:
+                continue
+            excess = float(level - harmonic_target)
+            if excess <= 0.5:
+                continue
+            trim = -float(np.clip(excess, 0.0, 6.0))
+            for name in names:
+                harmonic_hierarchy_corrections[name] = trim
+                role_corrections[name] = min(float(role_corrections.get(name, 0.0)), trim)
+                role_reasons[name] = f"{role} held below drum reference"
 
     mic_voice_wind_corrections: dict[str, float] = {}
     wind_names = [name for name, role in effective_roles.items() if role in {"horn", "sax", "flute"}]
@@ -6256,7 +6281,9 @@ def per_song_role_balance_corrections(
             "no reliable vocal overlap evidence",
         ),
         "mic_voice_wind_corrections_db": mic_voice_wind_corrections,
-        "role_balance_method": "per-song vocal-active envelope balance plus voice/wind correction; guitar correction is independent from keys/harmonic correction",
+        "harmonic_hierarchy_corrections_db": harmonic_hierarchy_corrections,
+        "drum_reference_level_db": drum_anchor_level,
+        "role_balance_method": "per-song drum-reference hierarchy plus vocal/wind active-level balance",
     }
 
 
@@ -7381,11 +7408,30 @@ def analyze_song_mix_controls(
         stem.path.name: classify_mic_content(stem, segment, sr)
         for stem in stems if stem.role == "vocal"
     }
+    wind_mic_names = [
+        name for name, info in mic_content.items()
+        if isinstance(info, dict) and info.get("classification") == "wind"
+    ]
+    explicit_wind_name = lambda name: any(
+        term in str(name).lower()
+        for term in ("flute", "trump", "horn", "sax", "trombone", "brass")
+    )
+    generic_wind_names = [name for name in wind_mic_names if not explicit_wind_name(name)]
+    if len(generic_wind_names) >= 2:
+        ranked_wind = sorted(
+            generic_wind_names,
+            key=lambda name: float(mic_content[name].get("spectral_centroid_hz") or 0.0),
+        )
+        mic_content[ranked_wind[0]]["instrument_variant"] = "flute"
+        mic_content[ranked_wind[-1]]["instrument_variant"] = "horn"
+        mic_content[ranked_wind[0]]["variant_reason"] = "lower spectral centroid in generic wind pair"
+        mic_content[ranked_wind[-1]]["variant_reason"] = "higher spectral centroid in generic wind pair"
     effective_roles = {
         stem.path.name: (
             (
                 "flute"
-                if "flute" in stem.path.name.lower()
+                if str(mic_content.get(stem.path.name, {}).get("instrument_variant") or "").lower() == "flute"
+                or "flute" in stem.path.name.lower()
                 else "horn"
             )
             if stem.role == "vocal"
@@ -7600,8 +7646,15 @@ def render_segment(
     if not isinstance(noise_diagnostics, dict):
         noise_diagnostics = {}
     noise_names = [name for name, info in noise_diagnostics.items() if info.get("case") == "B"]
+    quiet_empty_names = [
+        name for name, info in noise_diagnostics.items()
+        if isinstance(info, dict)
+        and float(info.get("rms_dbfs", -120.0) or -120.0) <= EMPTY_STEM_RMS_DBFS
+        and float(info.get("level_spread_db", 0.0) or 0.0) <= EMPTY_STEM_SPREAD_DB
+    ]
+    noise_names = sorted(set(noise_names + quiet_empty_names))
     if noise_names:
-        print(f"NOISE DETECTION song={index}: empty noisy inputs muted: {', '.join(noise_names)}", flush=True)
+        print(f"NOISE DETECTION song={index}: empty/noisy inputs muted: {', '.join(noise_names)}", flush=True)
     watchdog_names = [name for name, info in noise_diagnostics.items() if info.get("flagged")]
     if watchdog_names:
         print("NOISE WATCHDOG " + json.dumps(
@@ -7693,6 +7746,8 @@ def render_segment(
             inactive_reasons.append("silenced by fader")
         if solo_names and stem.path.name not in solo_names:
             inactive_reasons.append("not soloed")
+        if not stem_activity:
+            inactive_reasons.append(activity_reason)
         if inactive_reasons:
             eq_defaults = role_eq_defaults(mix_role)
             requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
