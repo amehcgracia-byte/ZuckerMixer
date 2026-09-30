@@ -7578,6 +7578,8 @@ def render_segment(
     role_corrections = role_balance.get("role_corrections_db", {}) if isinstance(role_balance, dict) else {}
     vocal_pair_corrections = role_balance.get("vocal_pair_corrections_db", {}) if isinstance(role_balance, dict) else {}
     role_balance_reasons = role_balance.get("role_reasons", {}) if isinstance(role_balance, dict) else {}
+    effect_profile = mix_controls.get("effect_profile", {}) if isinstance(mix_controls, dict) else {}
+    effect_role_offsets = effect_profile.get("role_offsets_db", {}) if isinstance(effect_profile, dict) else {}
     mic_content = mix_controls["mic_content"]
     active_levels_db = {
         name: active_level_db(rms_values_db.get(name, -120.0), segment_envelopes.get(name))
@@ -7745,6 +7747,9 @@ def render_segment(
             makeup_gain_db = min(makeup_gain_db, AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB))
         user_gain_db = override_float(overrides.get("gain_db"), 0.0)
         lead_bonus = 1.5 if energies[stem.path.name] > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
+        effect_offsets = effect_role_offsets.get(mix_role, {}) if isinstance(effect_role_offsets, dict) else {}
+        reverb_scene_offset_db = float(effect_offsets.get("reverb_db", 0.0) or 0.0)
+        delay_scene_offset_db = float(effect_offsets.get("delay_db", 0.0) or 0.0)
         fader_gain_db = override_float(overrides.get("fader_db"), 0.0)
         level_gain_db = fader_gain_db
         trace_row["dsp_applied"] = {
@@ -7777,6 +7782,9 @@ def render_segment(
             "lead_bonus_db": lead_bonus,
             "reverb_send_db": override_float(overrides.get("reverb_send_db"), 0.0),
             "delay_send_db": override_float(overrides.get("delay_send_db"), 0.0),
+            "reverb_scene_offset_db": reverb_scene_offset_db,
+            "delay_scene_offset_db": delay_scene_offset_db,
+            "effect_scene": effect_profile.get("scene") if isinstance(effect_profile, dict) else None,
             "fx_enabled": bool(overrides.get("fx_enabled", True)),
             "gate_enabled": override_bool(overrides.get("gate_enabled"), False),
             "space_enabled": override_bool(overrides.get("space_enabled"), False),
@@ -8098,10 +8106,12 @@ def render_segment(
                         meter_stage("post_stem_gain", stereo)
                         send_db = reverb_send_level_db(processing_role) if fx_enabled and bool(settings.get("space_enabled", False)) else None
                         if send_db is not None:
+                            send_db += float(settings.get("reverb_scene_offset_db", 0.0))
                             send_db += float(settings.get("reverb_send_db", 0.0))
                             reverb_send[: len(stereo)] += stereo * db_to_amp(send_db)
                         delay_db = delay_send_level_db(processing_role, lead_bonus) if fx_enabled and bool(settings.get("echo_enabled", False)) else None
                         if delay_db is not None:
+                            delay_db += float(settings.get("delay_scene_offset_db", 0.0))
                             delay_db += float(settings.get("delay_send_db", 0.0))
                             delay_send[: len(stereo)] += stereo * db_to_amp(delay_db)
                         if processing_role == "vocal":
