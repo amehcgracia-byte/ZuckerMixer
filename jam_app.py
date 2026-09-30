@@ -362,7 +362,7 @@ def active_stems_for_segment(stems: list[pipeline.Stem], segment: pipeline.Segme
     return [stem.path.name for stem in stems]
 
 
-MIX_PLAN_VERSION = 10
+MIX_PLAN_VERSION = 11
 
 
 def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
@@ -4370,8 +4370,15 @@ def api_render_many() -> Response:
 
 @app.post("/api/cancel")
 def api_cancel() -> Response:
-    request_cancel()
-    return jsonify({"ok": True})
+    # Do not make the browser wait for filesystem writes or process cleanup.
+    # The cancellation routine marks the job and signals its process group in
+    # the background; the UI can close its loading surface immediately.
+    threading.Thread(
+        target=request_cancel,
+        name="zucker-cancel",
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True, "status": "stopping"}), 202
 
 
 @app.get("/api/jobs")
@@ -4549,9 +4556,17 @@ def start_server(port: int | None = None) -> tuple[str, Any]:
 
 
 def stop_server() -> None:
+    # Signal workers synchronously so closing the native window cannot leave a
+    # render orphaned. Shutdown of the WSGI loop is deliberately asynchronous:
+    # Werkzeug may wait for an in-flight request and must never block app exit.
     request_cancel()
-    if server_ref is not None:
-        server_ref.shutdown()
+    server = server_ref
+    if server is not None:
+        threading.Thread(
+            target=server.shutdown,
+            name="zucker-server-shutdown",
+            daemon=True,
+        ).start()
 
 
 def has_active_jobs() -> bool:
