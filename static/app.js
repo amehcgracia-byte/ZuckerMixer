@@ -2769,7 +2769,11 @@ async function saveSettings(partial) {
 async function refreshState(options = {}) {
   const renderLarge = options.renderLarge !== false;
   const res = await fetch("/api/state");
-  const next = await res.json();
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const rawNext = await res.json();
+  const next = { songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [], ...rawNext };
+  if (!Array.isArray(next.songs)) next.songs = [];
+  if (next.detection_job && ["queued", "running", "stopping"].includes(next.detection_job.status)) setLoadingOverlayJob(next.detection_job);
   const protectedOverrideSongs = new Set([...pendingOverrideSongs, ...openPreviewSongIds(), ...Object.keys(livePreviewOverrides)]);
   if (appState?.overrides && (protectedOverrideSongs.size || overrideSaveTimer || overrideWritesInFlight)) {
     next.overrides ||= {};
@@ -3294,7 +3298,18 @@ function renderJobs(items) {
   // was reporting real progress.
   const active = [...items].reverse().find((job) => ["running", "stopping"].includes(job.status))
     || [...items].reverse().find((job) => job.status === "queued");
-  setLoadingOverlayJob(active);
+  // Keep the job received from /api/state through the first polling race.
+  // Clear it only when the same job is observed terminal, never merely
+  // because /api/jobs returned an incomplete snapshot for a moment.
+  const trackedOverlay = loadingOverlayJob && items.find((job) => String(job.id) === String(loadingOverlayJob.id));
+  const overlayLive = loadingOverlayJob && ["queued", "running", "stopping"].includes(String(loadingOverlayJob.status || ""));
+  if (active) {
+    setLoadingOverlayJob(active);
+  } else if (trackedOverlay && !["queued", "running", "stopping"].includes(String(trackedOverlay.status || ""))) {
+    setLoadingOverlayJob(null);
+  } else if (!overlayLive) {
+    setLoadingOverlayJob(null);
+  }
   const activeRender = active && ["render", "mix"].includes(active.kind) ? active : null;
   if (!renderInProgress && activeRender) {
     activeRenderJobId = activeRender.id;
