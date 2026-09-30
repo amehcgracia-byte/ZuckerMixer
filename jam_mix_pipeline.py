@@ -138,12 +138,12 @@ AUTO_MIX_MAX_BOOST_DB = 0.0
 # Auto-Mix may make a small, explicit correction only for roles where a quiet
 # capture would otherwise disappear. All other roles can only be attenuated
 # automatically. These limits are per song, never session-global.
-AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0}
+AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0, "flute": 2.0, "horn": 1.5, "sax": 1.5}
 # Deliberate first-pass guitar trim: guitars were repeatedly masking vocals
 # in the user's real sessions. This is applied before per-song caps and is
 # included in the analysis signature so old plans cannot survive unnoticed.
 AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -4.5}
-AUTO_MIX_PROFILE_VERSION = 5
+AUTO_MIX_PROFILE_VERSION = 6
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
