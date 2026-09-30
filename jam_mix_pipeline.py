@@ -529,8 +529,10 @@ ROLE_SYNONYMS: dict[str, tuple[str, ...]] = {
     # Keep this table intentionally human-editable: technicians' labels vary
     # from session to session and matching is case-insensitive/substring based.
     "kick": ("kick", "kickdrum", "bd", "bdjam", "bombo", "bass drum", "low drum"),
-    "snare": ("snare", "snr", "hh", "hihat", "hi-hat", "hi hat", "high hat", "cymbal"),
-    "drums": ("drum", "drums", "kit", "overhead", "overheads", "ov", "ovjam", "beatbox"),
+    "snare": ("snare", "snr"),
+    "hh": ("hh", "hihat", "hi-hat", "hi hat", "high hat", "cymbal"),
+    "overhead": ("overhead", "overheads", "ov", "ovjam"),
+    "drums": ("drum", "drums", "kit", "beatbox"),
     "bass": ("bass", "bassgtr", "bass gtr", "low end", "electric bass"),
     "keys": ("keys", "keybd", "keyboard", "piano", "organ", "epiano", "rhodes", "synth keys"),
     "guitar": ("guit", "gtr", "guitar", "acoustic guitar", "electric guitar"),
@@ -570,7 +572,7 @@ def drum_equivalent_stems(stems: list[Stem]) -> list[Stem]:
     """Return kit drums plus named and generic alternate rhythm sources."""
     return [
         stem for stem in stems
-        if stem.role in {"kick", "snare", "drums"}
+        if stem.role in {"kick", "snare", "hh", "overhead", "drums"}
         or is_rhythm_source_stem(stem)
         or is_generic_stem_name(stem)
     ]
@@ -589,12 +591,16 @@ def classify_role(name: str) -> str:
     low = str(name or "").lower()
     # Beatbox is a percussion/room label, not a vocal label; resolve it before
     # the intentionally broad "box" vocal synonym.
-    if _has_role_synonym(low, ROLE_SYNONYMS["drums"]):
-        return "drums"
     if _has_role_synonym(low, ROLE_SYNONYMS["kick"]):
         return "kick"
     if _has_role_synonym(low, ROLE_SYNONYMS["snare"]):
         return "snare"
+    if _has_role_synonym(low, ROLE_SYNONYMS["hh"]):
+        return "hh"
+    if _has_role_synonym(low, ROLE_SYNONYMS["overhead"]):
+        return "overhead"
+    if _has_role_synonym(low, ROLE_SYNONYMS["drums"]):
+        return "drums"
     if _has_role_synonym(low, ROLE_SYNONYMS["bass"]):
         return "bass"
     if "keys l" in low or "keysl" in low or "keyboard l" in low:
@@ -4126,7 +4132,7 @@ def trim_dead_air_segments(
     # Drum-core activity is the reliable indicator of the band actually
     # starting; guitars/keys can contain room bleed while the MC is still
     # finishing. Fall back to all non-voice stems only when no drums exist.
-    activity_stems = [stem for stem in stems if stem.role in {"kick", "snare", "drums"}]
+    activity_stems = [stem for stem in stems if stem.role in {"kick", "snare", "hh", "overhead", "drums"}]
     activity_stems = activity_stems or [stem for stem in stems if stem.role not in {"vocal", "room"}] or stems
     combined = smooth_envelope(combine_normalized_envelope(activity_stems, timelines), 7.0)
     if len(combined) == 0:
@@ -4624,7 +4630,7 @@ def per_stem_activity_threshold(env: np.ndarray, stem: Stem) -> float:
         threshold_db = floor + 0.45 * (high - floor)
     else:
         threshold_db = floor + 8.0
-    if stem.role in {"kick", "snare", "drums"}:
+    if stem.role in {"kick", "snare", "hh", "overhead", "drums"}:
         threshold_db -= 2.0
     return db_to_amp(threshold_db)
 
@@ -5843,6 +5849,10 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 2500, 0.9, 1.5), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role == "synth":
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 2500, 0.9, 1.5), ("fixed", "peaking", 320, 1.0, -1.5), ("air", "highshelf", 10000, 0.707, 0.0)]
+    elif role == "hh":
+        bands = [("low", "highpass", 350, 0.707, 0.0), ("mid", "peaking", 7500, 0.9, 1.5), ("air", "highshelf", 12000, 0.707, 1.0)]
+    elif role == "overhead":
+        bands = [("low", "highpass", 180, 0.707, 0.0), ("mid", "peaking", 450, 1.0, -2.0), ("air", "highshelf", 9000, 0.707, 1.0)]
     elif role == "drums":
         bands = [("low", "highpass", 150, 0.707, 0.0), ("mid", "peaking", 300, 1.0, 0.0), ("air", "highshelf", 9000, 0.707, 1.0)]
     elif role == "snare":
@@ -5914,7 +5924,7 @@ def process_track_streaming(
 
     if role == "bass":
         x = compressor_streaming(x, sr, ratio=3.0, threshold_db=-22.0, release_ms=140, state=state, key=f"{key}:bass")
-    elif role in {"kick", "snare", "drums"}:
+    elif role in {"kick", "snare", "hh", "overhead", "drums"}:
         x = compressor_streaming(x, sr, ratio=4.0, threshold_db=-20.0, release_ms=100, state=state, key=f"{key}:drums")
     elif role in {"keys", "keys_l", "keys_r", "guitar", "synth"}:
         x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-21.0, release_ms=140, state=state, key=f"{key}:other")
@@ -5935,10 +5945,14 @@ def base_level_db(role: str) -> float:
         "keys_r": -7.0,
         "keys": -8.0,
         "guitar": -12.0,
+        "hh": -13.0,
+        "overhead": -10.0,
         "synth": -11.0,
         "sax": -8.0,
         "horn": -8.0,
         "flute": -5.5,
+        "hh": -13.0,
+        "overhead": -10.0,
         "vocal": -5.0,
     }.get(role, -12.0)
 
@@ -5956,7 +5970,7 @@ def automatic_makeup_gain_db(
     vocal.  Keep this calculation in one place for preview and export paths.
     """
     requested = TARGET_TRACK_RMS_DBFS - float(raw_rms_db)
-    cap = MAX_DRUM_MAKEUP_GAIN_DB if role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
+    cap = MAX_DRUM_MAKEUP_GAIN_DB if role in {"kick", "snare", "hh", "overhead", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
     gain = min(requested, cap) + base_level_db(role) + AUTO_MIX_ROLE_TRIMS_DB.get(role, 0.0)
     if role_norm_db is not None and raw_rms_db > -90.0:
         # Move unusually loud/quiet performances toward the session's own
@@ -5970,7 +5984,7 @@ def automatic_makeup_gain_db(
 
 def automatic_drum_peak_guard_gain_db(role: str, computed_gain_db: float, raw_peak_db: float) -> float:
     """Keep automatic drum input peaks below -8 dBFS before role DSP."""
-    if role not in {"kick", "snare", "drums"} or not np.isfinite(raw_peak_db):
+    if role not in {"kick", "snare", "hh", "overhead", "drums"} or not np.isfinite(raw_peak_db):
         return computed_gain_db
     return min(float(computed_gain_db), -8.0 - float(raw_peak_db))
 
@@ -6050,7 +6064,7 @@ def mix_role_group(role: str, name: str = "") -> str:
         return "melodic_winds"
     if role == "bass":
         return "bass"
-    if role in {"kick", "snare", "drums"}:
+    if role in {"kick", "snare", "hh", "overhead", "drums"}:
         return "rhythm"
     return role or "other"
 
@@ -6285,6 +6299,7 @@ def per_song_effect_profile(
         "vocal": has_voice,
         "horn": has_wind,
         "sax": has_wind,
+        "flute": has_wind,
         "guitar": scene == "open-wind",
         "keys": scene in {"vocal-room", "open-wind"},
         "keys_l": scene in {"vocal-room", "open-wind"},
@@ -6295,6 +6310,7 @@ def per_song_effect_profile(
         "vocal": bool(has_voice and not fast_groove),
         "horn": bool(has_wind and not fast_groove),
         "sax": bool(has_wind and not fast_groove),
+        "flute": bool(has_wind and not fast_groove),
         "guitar": False,
         "keys": scene == "open-wind",
         "keys_l": scene == "open-wind",
@@ -6344,17 +6360,19 @@ def pan_for_role(role: str, name: str) -> float:
     # sides from song to song is harder to audit and can collapse the guitar
     # and keys into one speaker.
     if role == "guitar":
-        return -0.35
-    if role in {"keys", "keys_r"}:
+        return 0.25
+    if role in {"keys", "keys_l", "keys_r"}:
         return 0.35
-    if role == "keys_l":
-        return -0.35
     if role == "synth":
-        return 0.0
+        return 0.15
     if role in {"sax", "horn", "flute"}:
         return 0.25
-    if role == "vocal" and re.search(r"mic\s*2", name.lower()):
-        return 0.15
+    if role == "vocal":
+        return 0.25
+    if role == "overhead":
+        return -0.35
+    if role == "hh":
+        return -0.45
     return 0.0
 
 
@@ -6466,6 +6484,8 @@ def reverb_send_level_db(role: str) -> float | None:
         "drums": -24.0,
         "kick": -42.0,
         "bass": -42.0,
+        "hh": -36.0,
+        "overhead": -28.0,
     }.get(role)
 
 
@@ -7424,7 +7444,7 @@ def analyze_song_mix_controls(
             "content_adaptive_mic_eq": True,
             "content_adaptive_mic_role": True,
             "guitar_vocal_overlap_trim": True,
-            "instrument_profile_version": 2,
+            "instrument_profile_version": 3,
             "noise_watchdog": "spectral subtraction, hum notches and raw wind/mic gating",
             "role_profiles": ["kick", "snare", "bass", "guitar", "keys", "synth", "vocal", "horn", "sax", "flute"],
         },
@@ -7664,7 +7684,7 @@ def render_segment(
         if inactive_reasons:
             eq_defaults = role_eq_defaults(mix_role)
             requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
-            makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
+            makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "hh", "overhead", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
             role_norm_db = role_norms_db.get(mix_role)
             gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
             computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
@@ -7756,7 +7776,7 @@ def render_segment(
             continue
 
         requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
-        makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
+        makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "hh", "overhead", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
         role_norm_db = role_norms_db.get(mix_role)
         gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
         computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
@@ -7775,10 +7795,14 @@ def render_segment(
             makeup_gain_db = override_float(overrides.get("auto_mix_gain_db", overrides.get("makeup_gain_db")), computed_makeup_gain_db)
             makeup_gain_db = min(makeup_gain_db, AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB))
         user_gain_db = override_float(overrides.get("gain_db"), 0.0)
-        lead_bonus = 1.5 if energies[stem.path.name] > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
+        lead_bonus = 1.5 if energies[stem.path.name] > median_energy * 1.35 and mix_role not in {"kick", "snare", "hh", "overhead", "drums", "bass"} else 0.0
         effect_offsets = effect_role_offsets.get(mix_role, {}) if isinstance(effect_role_offsets, dict) else {}
+        effect_space = effect_profile.get("role_space_enabled", {}) if isinstance(effect_profile, dict) else {}
+        effect_echo = effect_profile.get("role_echo_enabled", {}) if isinstance(effect_profile, dict) else {}
         reverb_scene_offset_db = float(effect_offsets.get("reverb_db", 0.0) or 0.0)
         delay_scene_offset_db = float(effect_offsets.get("delay_db", 0.0) or 0.0)
+        automatic_space_enabled = bool(effect_space.get(mix_role, False)) if isinstance(effect_space, dict) else False
+        automatic_echo_enabled = bool(effect_echo.get(mix_role, False)) if isinstance(effect_echo, dict) else False
         fader_gain_db = override_float(overrides.get("fader_db"), 0.0)
         level_gain_db = fader_gain_db
         trace_row["dsp_applied"] = {
@@ -7816,8 +7840,8 @@ def render_segment(
             "effect_scene": effect_profile.get("scene") if isinstance(effect_profile, dict) else None,
             "fx_enabled": bool(overrides.get("fx_enabled", True)),
             "gate_enabled": override_bool(overrides.get("gate_enabled"), False),
-            "space_enabled": override_bool(overrides.get("space_enabled"), False),
-            "echo_enabled": override_bool(overrides.get("echo_enabled"), False),
+            "space_enabled": override_bool(overrides.get("space_enabled"), automatic_space_enabled),
+            "echo_enabled": override_bool(overrides.get("echo_enabled"), automatic_echo_enabled),
             "activity_decision": activity_reason,
             "flattening_range_db": float(flattening.get(stem.path.name, {}).get("range_db", 0.0)),
             "pan": enforced_pan(mix_role, stem.name, overrides.get("pan")),
