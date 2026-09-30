@@ -3496,6 +3496,7 @@ async function cancelActiveWork() {
     showToast(error.message || String(error));
     await pollJobs().catch(() => {});
   } finally {
+    suppressLoadingOverlay = false;
     buttons.forEach((button) => { button.disabled = false; });
   }
 }
