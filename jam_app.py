@@ -362,7 +362,7 @@ def active_stems_for_segment(stems: list[pipeline.Stem], segment: pipeline.Segme
     return [stem.path.name for stem in stems]
 
 
-MIX_PLAN_VERSION = 5
+MIX_PLAN_VERSION = 6
 
 
 def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
