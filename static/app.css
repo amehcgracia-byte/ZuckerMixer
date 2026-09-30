@@ -795,7 +795,9 @@ button:active:not(:disabled), button.active { transform: translateY(0); backgrou
 .loading-song-state { display: flex; justify-content: space-between; gap: 8px; padding: 6px 8px; border-radius: 6px; background: rgba(12, 10, 8, .42); color: var(--muted); font-size: .75rem; }
 .loading-song-check { display: inline-grid; place-items: center; width: 1.25em; height: 1.25em; margin-right: 4px; border-radius: 50%; color: #b9e6b6; font-weight: 900; }
 .loading-song-state:not(.done) .loading-song-check { color: var(--orange2); }
-.loading-song-state.done .loading-song-check { color: #b9e6b6; }\n.loading-song-state span:last-child { overflow-wrap: anywhere; text-align: right; }\n.loading-song-state:not(.active):not(.done):not(.error) { opacity: .76; }
+.loading-song-state.done .loading-song-check { color: #b9e6b6; }
+.loading-song-state span:last-child { overflow-wrap: anywhere; text-align: right; }
+.loading-song-state:not(.active):not(.done):not(.error) { opacity: .76; }
 .loading-song-state.active { color: var(--cream); outline: 1px solid rgba(236, 163, 94, .62); }
 .loading-song-state.done { color: #b9e6b6; }
 .loading-song-state.error { color: #ffb09d; }
