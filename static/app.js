@@ -3587,7 +3587,21 @@ async function pollingLoop() {
   }
 }
 
+function setupLoadingMedia() {
+  const video = $("#loadingStageVideo");
+  const fallback = $("#loadingStageFallback");
+  if (!video || !fallback) return;
+  const showFallback = () => { video.hidden = true; fallback.hidden = false; };
+  const showVideo = () => { video.hidden = false; fallback.hidden = true; };
+  video.addEventListener("loadeddata", showVideo);
+  video.addEventListener("canplay", showVideo);
+  video.addEventListener("error", showFallback);
+  video.play().then(showVideo).catch(showFallback);
+  if (video.readyState >= 2) showVideo();
+}
+
 if (typeof document !== "undefined") {
+  setupLoadingMedia();
   $("#mixSelected").addEventListener("click", () => mixSongs([...checkedSongs], true, true).catch((error) => showToast(`Render failed: ${error.message || error}`)));
   $("#mixAll").addEventListener("click", () => mixEverything());
   $("#editAllCuts").addEventListener("click", () => editAllCuts().catch((error) => { setCutLoading("Error", error.message || String(error)); showToast(error.message || String(error)); }));
