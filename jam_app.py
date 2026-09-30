@@ -3502,6 +3502,12 @@ def api_state() -> Response:
     # one folder while the settings and cache belong to another.
     if source != current_source or str(pipeline.audio_scan_report().get("source") or "") != str(source):
         configure_source_folder(source)
+        with state_lock:
+            # Settings may point at a new source while the process still holds
+            # the previous source's in-memory snapshot.
+            pipeline_state = None
+            pipeline_state_signature = None
+        state_ready = False
     if not state_ready:
         # A valid snapshot can be hydrated synchronously and cheaply. Only
         # a cache miss starts the expensive detection worker; this keeps the
