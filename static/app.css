@@ -145,6 +145,19 @@ button:disabled {
   color: var(--red);
 }
 
+.loading-cancel {
+  align-self: center;
+  margin-top: 12px;
+  min-width: 170px;
+  background: rgba(100, 30, 20, .42);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .22);
+}
+
+.loading-cancel:hover:not(:disabled) {
+  background: rgba(180, 55, 35, .62);
+  color: #fff3e6;
+}
+
 .ghost {
   background: transparent;
 }
