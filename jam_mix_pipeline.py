@@ -139,8 +139,8 @@ AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0}
 # Deliberate first-pass guitar trim: guitars were repeatedly masking vocals
 # in the user's real sessions. This is applied before per-song caps and is
 # included in the analysis signature so old plans cannot survive unnoticed.
-AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -3.0}
-AUTO_MIX_PROFILE_VERSION = 4
+AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -4.5}
+AUTO_MIX_PROFILE_VERSION = 5
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -5839,7 +5839,7 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 250, 1.0, -2.0), ("fixed", "peaking", 2800, 1.0, 0.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role in {"keys", "keys_l", "keys_r"}:
         bands = [("low", "highpass", 80, 0.707, 0.0), ("mid", "peaking", 320, 1.0, -2.0), ("air", "highshelf", 10000, 0.707, 0.0)]
-    elif role in {"sax", "horn"}:
+    elif role in {"sax", "horn", "flute"}:
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 2500, 0.9, 1.5), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role == "synth":
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 2500, 0.9, 1.5), ("fixed", "peaking", 320, 1.0, -1.5), ("air", "highshelf", 10000, 0.707, 0.0)]
@@ -5918,7 +5918,7 @@ def process_track_streaming(
         x = compressor_streaming(x, sr, ratio=4.0, threshold_db=-20.0, release_ms=100, state=state, key=f"{key}:drums")
     elif role in {"keys", "keys_l", "keys_r", "guitar", "synth"}:
         x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-21.0, release_ms=140, state=state, key=f"{key}:other")
-    elif role in {"horn", "sax"}:
+    elif role in {"horn", "sax", "flute"}:
         x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-22.0, release_ms=120, state=state, key=f"{key}:lead")
     else:
         x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-22.0, release_ms=150, state=state, key=f"{key}:misc")
@@ -5934,10 +5934,11 @@ def base_level_db(role: str) -> float:
         "keys_l": -7.0,
         "keys_r": -7.0,
         "keys": -8.0,
-        "guitar": -10.5,
+        "guitar": -12.0,
         "synth": -11.0,
         "sax": -8.0,
         "horn": -8.0,
+        "flute": -5.5,
         "vocal": -5.0,
     }.get(role, -12.0)
 
@@ -6072,7 +6073,7 @@ def vocal_harmonic_balance(
     envelopes: dict[str, np.ndarray] | None = None,
 ) -> dict[str, object]:
     """Measure the per-song vocal-vs-harmonic relationship."""
-    vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room", "horn", "sax"}]
+    vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room", "horn", "sax", "flute"}]
     harmonic_names = [
         name for name, role in effective_roles.items()
         if role in {"keys", "keys_l", "keys_r", "synth"}
@@ -6186,6 +6187,26 @@ def per_song_role_balance_corrections(
         for name in names:
             vocal_pair_corrections[name] = float(np.clip(target - float(active_levels_db.get(name, target)), -MIC_PAIR_MAX_CORRECTION_DB, MIC_PAIR_MAX_CORRECTION_DB))
 
+    mic_voice_wind_corrections: dict[str, float] = {}
+    wind_names = [name for name, role in effective_roles.items() if role in {"horn", "sax", "flute"}]
+    wind_level = group_active_level_db(wind_names, active_levels_db)
+    if vocal_level is not None and wind_level is not None and wind_names:
+        voice_wind_gap = float(vocal_level - wind_level)
+        if voice_wind_gap < -1.0:
+            voice_lift = float(np.clip((-voice_wind_gap) - 1.0, 0.0, 4.0))
+            wind_trim = -float(np.clip((-voice_wind_gap) - 1.0, 0.0, 5.0))
+            for name in vocal_names:
+                mic_voice_wind_corrections[name] = voice_lift
+            for name in wind_names:
+                mic_voice_wind_corrections[name] = wind_trim
+        elif voice_wind_gap > 2.0:
+            wind_lift = float(np.clip(voice_wind_gap - 2.0, 0.0, 3.0))
+            for name in wind_names:
+                mic_voice_wind_corrections[name] = wind_lift
+        for name, correction in mic_voice_wind_corrections.items():
+            role_corrections[name] = float(np.clip(role_corrections.get(name, 0.0) + correction, -6.0, 4.0))
+            role_reasons[name] = "voice/wind active-level balance correction"
+
     pair_diagnostics = {}
     for pair in sorted(set(vocal_pair_keys.values())):
         names = [name for name in vocal_names if vocal_pair_keys[name] == pair]
@@ -6215,7 +6236,8 @@ def per_song_role_balance_corrections(
             (role_reasons[name] for name in role_groups["guitar"] if role_reasons.get(name)),
             "no reliable vocal overlap evidence",
         ),
-        "role_balance_method": "per-song vocal-active envelope balance; guitar correction is independent from keys/harmonic correction",
+        "mic_voice_wind_corrections_db": mic_voice_wind_corrections,
+        "role_balance_method": "per-song vocal-active envelope balance plus voice/wind correction; guitar correction is independent from keys/harmonic correction",
     }
 
 
@@ -6240,7 +6262,7 @@ def per_song_effect_profile(
         if isinstance(info, dict)
     ]
     has_voice = "voice" in classifications or not classifications
-    has_wind = "wind" in classifications
+    has_wind = any(item in {"wind", "flute"} for item in classifications)
     fast_groove = bool(float(bpm_confidence) >= 0.45 and float(bpm) >= 105.0)
     if has_wind and not has_voice:
         scene = "open-wind"
@@ -7329,7 +7351,11 @@ def analyze_song_mix_controls(
     }
     effective_roles = {
         stem.path.name: (
-            "horn"
+            (
+                "flute"
+                if "flute" in stem.path.name.lower()
+                else "horn"
+            )
             if stem.role == "vocal"
             and mic_content.get(stem.path.name, {}).get("classification") == "wind"
             and float(mic_content.get(stem.path.name, {}).get("confidence", 0.0)) >= 0.68
@@ -7398,6 +7424,9 @@ def analyze_song_mix_controls(
             "content_adaptive_mic_eq": True,
             "content_adaptive_mic_role": True,
             "guitar_vocal_overlap_trim": True,
+            "instrument_profile_version": 2,
+            "noise_watchdog": "spectral subtraction, hum notches and raw wind/mic gating",
+            "role_profiles": ["kick", "snare", "bass", "guitar", "keys", "synth", "vocal", "horn", "sax", "flute"],
         },
         "voice_floor_db": voice_floor,
         "synth_floor_db": synth_floor,
