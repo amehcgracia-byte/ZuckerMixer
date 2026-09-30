@@ -1,6 +1,7 @@
 let appState = null;
 let loadingOverlayJob = null;
 let loadingOverlayCut = null;
+let suppressLoadingOverlay = false;
 let checkedSongs = new Set();
 let lastLogId = -1;
 let songListSignature = "";
@@ -3113,7 +3114,7 @@ function renderLoadingOverlay() {
   // Whisper/render job must not cover or block waveform editing.
   const cutEditorOpen = Boolean(document.querySelector("#cutSelectorDialog[open]"));
   const state = cutEditorOpen ? loadingOverlayCut : (loadingOverlayCut || loadingOverlayJob);
-  const busy = Boolean(state);
+  const busy = Boolean(state) && !suppressLoadingOverlay;
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
   if (!busy) return;
@@ -3306,11 +3307,11 @@ function renderJobs(items) {
   // because /api/jobs returned an incomplete snapshot for a moment.
   const trackedOverlay = loadingOverlayJob && items.find((job) => String(job.id) === String(loadingOverlayJob.id));
   const overlayLive = loadingOverlayJob && ["queued", "running", "stopping"].includes(String(loadingOverlayJob.status || ""));
-  if (active) {
+  if (active && !suppressLoadingOverlay) {
     setLoadingOverlayJob(active);
-  } else if (trackedOverlay && !["queued", "running", "stopping"].includes(String(trackedOverlay.status || ""))) {
+  } else if (!suppressLoadingOverlay && trackedOverlay && !["queued", "running", "stopping"].includes(String(trackedOverlay.status || ""))) {
     setLoadingOverlayJob(null);
-  } else if (!overlayLive) {
+  } else if (!suppressLoadingOverlay && !overlayLive) {
     setLoadingOverlayJob(null);
   }
   const activeRender = active && ["render", "mix"].includes(active.kind) ? active : null;
@@ -3434,6 +3435,24 @@ function friendlyStatus(job) {
   return "Finished";
 }
 
+function hideLoadingOverlayImmediately() {
+  loadingOverlayJob = null;
+  loadingOverlayCut = null;
+  const video = $("#loadingStageVideo");
+  if (video) {
+    video.pause();
+    video.currentTime = 0;
+  }
+  const fallback = $("#loadingStageFallback");
+  if (fallback) fallback.hidden = true;
+  const overlay = $("#loadingOverlay");
+  if (overlay) overlay.hidden = true;
+  document.body.classList.remove("loading-mode");
+  const loading = $("#loadingStatus");
+  if (loading) loading.hidden = true;
+  renderLoadingOverlay();
+}
+
 async function cancelActiveWork() {
   if (!window.confirm("Are you sure you want to cancel all active work?")) return;
   const buttons = [$("#cancelLoadingWork"), $("#cancelJob")].filter(Boolean);
@@ -3445,6 +3464,9 @@ async function cancelActiveWork() {
       throw new Error(data.error || "Could not cancel the active work.");
     }
     showToast("Cancellation requested. Stopping the active processes...");
+    suppressLoadingOverlay = true;
+    hideLoadingOverlayImmediately();
+    setRenderControlsBusy(false);
     if (loadingOverlayJob) {
       loadingOverlayJob = {
         ...loadingOverlayJob,
@@ -3465,12 +3487,8 @@ async function cancelActiveWork() {
     const cutDialog = $("#cutSelectorDialog");
     if (cutDialog?.open) cutDialog.close("cancel");
     cutSelector = null;
-    loadingOverlayJob = null;
-    loadingOverlayCut = null;
-    document.body.classList.remove("loading-mode");
-    renderLoadingOverlay();
-    const box = $("#loadingStatus");
-    if (box) box.hidden = true;
+    suppressLoadingOverlay = false;
+    hideLoadingOverlayImmediately();
     window.scrollTo({ top: 0, behavior: "smooth" });
     await refreshState({ renderLarge: true });
     showToast("All active work was cancelled. Ready.");
