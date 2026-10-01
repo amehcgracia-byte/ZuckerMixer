@@ -4019,17 +4019,116 @@ def api_song_name(segment_id: int) -> Response:
 
 
 @app.post("/api/redetect")
+def _pid_is_alive(value: Any) -> bool:
+    """Return whether a recorded worker PID still exists."""
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | None:
-    """Return the live detection job for the selected source, if any."""
+    """Return a genuinely live detection job for the selected source.
+
+    A stale in-memory job used to block both initial loading and Redetect
+    Songs forever. The status file is authoritative when available, and an
+    active job is only retained while its worker is alive or its heartbeat is
+    still fresh.
+    """
     expected = str(Path(source or pipeline.SOURCE_DIR).expanduser().resolve())
+    active_statuses = {"queued", "running", "stopping"}
+    terminal_statuses = {
+        "done",
+        "pending_review",
+        "pending_confirmation",
+        "error",
+        "cancelled",
+        "finished",
+    }
     with state_lock:
-        live = [
+        candidates = [
             job for job in jobs
             if job.get("kind") == "redetect"
             and str(Path(job.get("source_folder") or "").expanduser().resolve()) == expected
-            and job.get("status") in {"queued", "running", "stopping"}
+            and job.get("status") in active_statuses
         ]
-        return dict(live[-1]) if live else None
+
+    live: list[dict[str, Any]] = []
+    now = time.time()
+    for job in candidates:
+        status = read_job_status_for_job(job)
+        if isinstance(status, dict):
+            with state_lock:
+                job.update(status)
+
+        current_status = str(job.get("status") or "")
+        if current_status in terminal_statuses or current_status not in active_statuses:
+            continue
+
+        child_pid = job.get("child_pid") or job.get("pid")
+        heartbeat_raw = (
+            job.get("heartbeat")
+            or job.get("progress_updated_at")
+            or job.get("updated_at")
+            or job.get("created")
+            or 0
+        )
+        try:
+            heartbeat = float(heartbeat_raw)
+        except (TypeError, ValueError):
+            heartbeat = 0.0
+
+        orphaned = False
+        orphan_reason = ""
+        if child_pid not in (None, ""):
+            if not _pid_is_alive(child_pid):
+                orphaned = True
+                orphan_reason = f"recorded worker PID {child_pid} is no longer alive"
+        elif heartbeat and now - heartbeat > ORPHANED_ACTIVE_JOB_SECONDS:
+            orphaned = True
+            orphan_reason = "no worker PID or fresh heartbeat was recorded"
+
+        if orphaned:
+            finished_at = time.time()
+            recovered = {
+                "status": "error",
+                "error": (
+                    "Redetect job was recovered as orphaned; its worker is no longer running. "
+                    "Start Redetect Songs again."
+                ),
+                "current_stage": "error",
+                "stage_detail": "stale/orphaned detection recovered",
+                "finished_at": finished_at,
+                "updated_at": finished_at,
+                "heartbeat": finished_at,
+                "termination": "orphaned redetect recovered",
+                "orphan_reason": orphan_reason,
+            }
+            with state_lock:
+                job.update(recovered)
+            write_job_status(job)
+            lifecycle_log(
+                "redetect_orphaned_recovered",
+                str(job.get("id") or ""),
+                source_folder=expected,
+                reason=orphan_reason,
+            )
+            continue
+
+        live.append(job)
+
+    return dict(live[-1]) if live else None
 
 
 def _queue_redetect_job(allow_whisper: bool = True) -> dict[str, Any]:
