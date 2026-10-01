@@ -1043,6 +1043,33 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
         return None
 
 
+def legacy_single_slot_snapshot_reason(snapshot: dict[str, Any] | None) -> str:
+    """Explain why a one-window multi-stem snapshot cannot be a session."""
+    if not isinstance(snapshot, dict):
+        return ""
+    slots = snapshot.get("raw_songs", [])
+    stems = snapshot.get("stems", [])
+    if not isinstance(slots, list) or not isinstance(stems, list):
+        return ""
+    if len(slots) != 1 or len(stems) <= 1:
+        return ""
+    duration = max(
+        (
+            float(item.get("offset_seconds", 0.0))
+            + float(item.get("timeline_duration", item.get("duration", 0.0)))
+            for item in stems
+            if isinstance(item, dict)
+        ),
+        default=0.0,
+    )
+    if duration <= pipeline.HARD_MAX_SONG_SECONDS:
+        return ""
+    return (
+        f"Rejected legacy one-slot snapshot: {len(stems)} parallel stems span "
+        f"{duration:.1f}s. It is a diagnostic candidate, not a song session."
+    )
+
+
 def snapshot_has_valid_segment_windows(snapshot: dict[str, Any]) -> bool:
     """Return whether a cached detection can be exposed without redetecting.
 
@@ -1524,6 +1551,15 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
         if pipeline_state is not None and pipeline_state_signature == signature:
             return pipeline_state
     snapshot = None if pipeline.DETECTION_RESCAN_MODE else load_detection_snapshot(signature)
+    legacy_snapshot_reason = legacy_single_slot_snapshot_reason(snapshot)
+    if legacy_snapshot_reason:
+        lifecycle_log(
+            "legacy_one_slot_snapshot_ignored",
+            source_folder=str(pipeline.SOURCE_DIR),
+            reason=legacy_snapshot_reason,
+        )
+        print("DETECTION SNAPSHOT IGNORED: " + legacy_snapshot_reason, flush=True)
+        snapshot = None
     if snapshot is not None:
         snapshot_segments = snapshot.get("segments", []) if isinstance(snapshot, dict) else []
         invalid_snapshot_durations = []
@@ -3516,6 +3552,15 @@ def api_state() -> Response:
         try:
             signature = detection_state_signature()
             snapshot = None if pipeline.DETECTION_RESCAN_MODE else load_detection_snapshot(signature)
+            legacy_snapshot_reason = legacy_single_slot_snapshot_reason(snapshot)
+            if legacy_snapshot_reason:
+                lifecycle_log(
+                    "legacy_one_slot_snapshot_ignored",
+                    source_folder=str(source),
+                    reason=legacy_snapshot_reason,
+                )
+                print("API STATE: ignoring legacy one-slot snapshot: " + legacy_snapshot_reason, flush=True)
+                snapshot = None
         except Exception as exc:
             snapshot = None
             lifecycle_log("source_scan_signature_failed", error=f"{type(exc).__name__}: {exc}")
@@ -3534,6 +3579,23 @@ def api_state() -> Response:
                 return jsonify(_loading_state(f"{type(exc).__name__}: {exc}")), 200
         detection_job = _active_redetect_job(source)
         if detection_job is None:
+            recent_incomplete = None
+            for candidate in reversed(current_jobs()):
+                if (
+                    candidate.get("kind") == "redetect"
+                    and str(Path(candidate.get("source_folder") or "").expanduser().resolve()) == str(source)
+                    and candidate.get("status") == "pending_review"
+                    and int(candidate.get("candidate_count") or 0) < 2
+                ):
+                    recent_incomplete = candidate
+                    break
+            if recent_incomplete is not None:
+                warning = str(
+                    recent_incomplete.get("warning")
+                    or recent_incomplete.get("stage_detail")
+                    or "Detection produced no usable multi-song session."
+                )
+                return jsonify(_loading_state(warning, recent_incomplete)), 200
             # A cache miss must perform the real song detection. The lightweight
             # scan is useful for diagnostics, but it cannot produce usable slots
             # without Whisper and otherwise leaves a misleading one-block session.
