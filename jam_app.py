@@ -3537,7 +3537,7 @@ def api_state() -> Response:
             # A cache miss must perform the real song detection. The lightweight
             # scan is useful for diagnostics, but it cannot produce usable slots
             # without Whisper and otherwise leaves a misleading one-block session.
-            detection_job = _queue_redetect_job(False)
+            detection_job = _queue_redetect_job(True)
         return jsonify(_loading_state(detection_job=detection_job)), 200
     return jsonify(public_state()), 200
 
@@ -4032,7 +4032,7 @@ def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | N
         return dict(live[-1]) if live else None
 
 
-def _queue_redetect_job(allow_whisper: bool = False) -> dict[str, Any]:
+def _queue_redetect_job(allow_whisper: bool = True) -> dict[str, Any]:
     """Queue exactly one source-scoped detection job and return its snapshot."""
     source = str(Path(pipeline.SOURCE_DIR).expanduser().resolve())
     existing = _active_redetect_job(source)
@@ -4077,7 +4077,7 @@ def _queue_redetect_job(allow_whisper: bool = False) -> dict[str, Any]:
 
 
 @app.post("/api/redetect")
-def api_redetect(allow_whisper: bool = False) -> Response:
+def api_redetect(allow_whisper: bool = True) -> Response:
     payload = request.get_json(force=True, silent=True) or {}
     if "allow_whisper" in payload:
         allow_whisper = bool(payload.get("allow_whisper"))
