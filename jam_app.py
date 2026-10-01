@@ -4018,7 +4018,6 @@ def api_song_name(segment_id: int) -> Response:
     return jsonify({"ok": True, "name": name})
 
 
-@app.post("/api/redetect")
 def _pid_is_alive(value: Any) -> bool:
     """Return whether a recorded worker PID still exists."""
     try:
