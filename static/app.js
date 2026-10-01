@@ -3835,7 +3835,7 @@ if (typeof document !== "undefined") {
   $("#redetectSongs").addEventListener("click", async () => {
     if (!window.confirm("Re-detect the complete original session? Current slots remain until you confirm the comparison.")) return;
     setCutLoading("Re-detecting songs", "Preparing full original session", 2);
-    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: false }) });
+    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: true }) });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       showToast(data.error || "Could not start song detection.");
@@ -3903,7 +3903,7 @@ if (typeof document !== "undefined") {
     const detection = await fetch("/api/redetect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allow_whisper: false }),
+      body: JSON.stringify({ allow_whisper: true }),
     });
     if (!detection.ok) {
       showToast("Source folder changed, but automatic detection could not start.");
