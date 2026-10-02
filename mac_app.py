@@ -14,7 +14,7 @@ def record_worker_bootstrap() -> None:
     """Leave a record even if importing the application fails."""
     if len(sys.argv) < 3 or sys.argv[1] != "--worker":
         return
-    state_root = Path.home() / "Music" / "JamMixes" / "ZuckerMixerState"
+    state_root = Path(os.environ.get("ZUCKER_MIXER_STATE_ROOT", str(Path.home() / "Music" / "JamMixes" / "ZuckerMixerState"))).expanduser().resolve()
     record = {
         "ts": time.time(),
         "pid": os.getpid(),

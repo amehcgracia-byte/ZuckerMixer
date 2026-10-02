@@ -34,13 +34,22 @@ import numpy as np
 import pyloudnorm as pyln
 import soundfile as sf
 from scipy import ndimage, signal
-try:
-    import matchering as matchering_api
-except Exception as _matchering_import_error:
-    matchering_api = None
-    MATCHERING_IMPORT_ERROR = f"{type(_matchering_import_error).__name__}: {_matchering_import_error}"
-else:
-    MATCHERING_IMPORT_ERROR = ""
+matchering_api = None
+MATCHERING_IMPORT_ERROR = ""
+_MATCHERING_IMPORT_ATTEMPTED = False
+
+
+def ensure_matchering_available() -> None:
+    """Load optional reference mastering only when rendering requests it."""
+    global matchering_api, MATCHERING_IMPORT_ERROR, _MATCHERING_IMPORT_ATTEMPTED
+    if matchering_api is not None or _MATCHERING_IMPORT_ATTEMPTED:
+        return
+    _MATCHERING_IMPORT_ATTEMPTED = True
+    try:
+        import matchering
+        matchering_api = matchering
+    except Exception as exc:
+        MATCHERING_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 # ------------------------- configurable defaults -------------------------
@@ -3382,24 +3391,23 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
             "whisper": LAST_WHISPER_STATUS,
         }
     else:
-        # Without a sufficiently trusted commentator transcript there is no
-        # defensible slot boundary. Do not replace it with drum/acoustic or
-        # fixed-clock windows; expose one conservative review block instead.
-        segments = provisional_segments_from_metadata(stems)
+        # Preserve acoustic proposals when Whisper is unavailable or incomplete.
+        # They remain diagnostic until reviewed; never replace current cuts.
+        segments = list(probe_segments) or provisional_segments_from_metadata(stems)
         provisional_reason = str(
             LAST_WHISPER_STATUS.get("reason")
             or "Commentator-led slot boundaries were not available"
         )
         if segments:
             segments = [replace(
-                segments[0],
-                boundary_source="whisper-incomplete-provisional",
+                segment,
+                boundary_source="acoustic-whisper-incomplete",
                 boundary_validation="needs_review",
                 boundary_validation_reason=(
-                    "Candidate only; not a valid single-song session: "
+                    "Acoustic candidate; Whisper incomplete: "
                     + provisional_reason
                 ),
-            )]
+            ) for segment in segments]
         DETECTION_STRATEGY = {
             **(DETECTION_STRATEGY if isinstance(DETECTION_STRATEGY, dict) else {}),
             "id": "commentator_missing_review",
@@ -6980,6 +6988,7 @@ def master_temp_wav_streaming(premaster_path: Path, master_path: Path, sr: int) 
         )
 
     if MATCHERING_REFERENCE is not None:
+        ensure_matchering_available()
         reference = Path(MATCHERING_REFERENCE).expanduser()
         if matchering_api is None:
             raise RuntimeError(

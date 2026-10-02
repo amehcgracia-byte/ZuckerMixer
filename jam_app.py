@@ -34,7 +34,7 @@ import jam_mix_pipeline as pipeline
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT))
-STATE_ROOT = Path.home() / "Music" / "JamMixes" / "ZuckerMixerState"
+STATE_ROOT = Path(os.environ.get("ZUCKER_MIXER_STATE_ROOT", str(Path.home() / "Music" / "JamMixes" / "ZuckerMixerState"))).expanduser().resolve()
 STATE_ROOT.mkdir(parents=True, exist_ok=True)
 ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "sources" / "default"
 ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -876,6 +876,8 @@ def load_settings() -> dict[str, Any]:
     settings["skipped_segments"] = sorted(load_skipped_segments())
     settings.setdefault("last_render_dir", "")
     settings.setdefault("source_folder", str(pipeline.SOURCE_DIR))
+    if child_status_snapshot and child_status_snapshot.get("source_folder"):
+        settings["source_folder"] = child_status_snapshot["source_folder"]
     settings.setdefault("audio_scan_mode", "auto")
     settings.setdefault("known_song_count", None)
     settings.setdefault("matchering_reference", "")
@@ -1036,6 +1038,8 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
             "raw_songs": payload["raw_songs"],
             "stem_info": payload["stem_info"],
             "active_stems_by_song": {},
+            "candidate_pending": bool(payload.get("candidate_pending")),
+            "segmentation_status": payload.get("segmentation_status"),
             "audio_scan": payload.get("audio_scan", {}),
             "detection_calibration": payload.get("detection_calibration", {}),
         }
@@ -1120,6 +1124,10 @@ def _ensure_snapshot_scan_report(snapshot: dict[str, Any]) -> dict[str, Any]:
 def save_detection_snapshot(state: dict[str, Any], signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> None:
     payload = {
         "version": 1,
+        "job_id": (child_status_snapshot or {}).get("id"),
+        **source_job_identity(signature),
+        "candidate_pending": bool(state.get("candidate_pending")),
+        "segmentation_status": state.get("segmentation_status"),
         "source_signature": [signature[0], signature[1], [list(item) for item in signature[2]]],
         "stems": [{**asdict(stem), "path": str(stem.path)} for stem in state["stems"]],
         "segments": [asdict(segment) for segment in state["segments"]],
@@ -1128,11 +1136,21 @@ def save_detection_snapshot(state: dict[str, Any], signature: tuple[str, float |
         "audio_scan": state.get("audio_scan", {}),
         "detection_calibration": state.get("detection_calibration", {}),
     }
-    save_json_atomic(DETECTION_STATE_PATH, payload)
+    target = REDETECTION_CANDIDATE_PATH if pipeline.DETECTION_RESCAN_MODE else DETECTION_STATE_PATH
+    save_json_atomic(target, payload)
 
 
 def session_id_for_signature(signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> str:
     return hashlib.sha256(json.dumps(signature, sort_keys=True, default=str).encode()).hexdigest()[:20]
+
+
+def source_job_identity(signature: tuple) -> dict[str, str]:
+    source = str(Path(pipeline.SOURCE_DIR).expanduser().resolve())
+    return {
+        "source_id": hashlib.sha256(source.encode()).hexdigest()[:20],
+        "fingerprint": hashlib.sha256(json.dumps([source, signature[2]], default=str).encode()).hexdigest(),
+        "session_id": session_id_for_signature(signature),
+    }
 
 
 def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int, int], ...]]:
@@ -1548,7 +1566,7 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     pipeline.configure_detection_profile(source_config)
     signature = detection_state_signature()
     with state_lock:
-        if pipeline_state is not None and pipeline_state_signature == signature:
+        if not pipeline.DETECTION_RESCAN_MODE and pipeline_state is not None and pipeline_state_signature == signature:
             return pipeline_state
     snapshot = None if pipeline.DETECTION_RESCAN_MODE else load_detection_snapshot(signature)
     legacy_snapshot_reason = legacy_single_slot_snapshot_reason(snapshot)
@@ -1799,6 +1817,8 @@ def ensure_pipeline_state() -> dict[str, Any]:
 def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
     global pipeline_state, pipeline_state_signature
     is_redetect = job_id != "detect"
+    settings = load_settings()
+    configure_source_folder(settings.get("source_folder") or pipeline.SOURCE_DIR)
     had_previous_snapshot = DETECTION_STATE_PATH.exists()
     previous_count = 0
     if is_redetect and had_previous_snapshot:
@@ -1806,6 +1826,9 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
         if isinstance(previous_snapshot, dict):
             previous_count = len(previous_snapshot.get("raw_songs", []) or [])
         shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_BACKUP_PATH)
+        archive = STATE_ROOT / "migrations" / ACTIVE_SOURCE_STATE_ROOT.name
+        archive.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(DETECTION_STATE_PATH, archive / f"detection_state-{time.time_ns()}.json")
     append_log(job_id, "Searching again from a clean deterministic detection pass; suspicious regions will be rescanned.")
     app_progress({
         "current_stage": "preparing session",
@@ -1825,18 +1848,17 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
         state = ensure_pipeline_state()
         candidate_count = len(state.get("raw_songs", []))
         if is_redetect:
-            if candidate_count < 2:
+            if candidate_count < 2 or state.get("candidate_pending"):
                 incomplete_reason = (
-                    f"Fresh detection produced only {candidate_count} slot(s); "
+                    f"Fresh detection is incomplete ({candidate_count} candidate slot(s)); "
                     f"the current session with {previous_count} slot(s) was preserved."
                 )
                 # Keep the one-slot result as a diagnostic candidate, but never
                 # let it replace the usable session or turn a recoverable
                 # Whisper miss into a worker crash.
-                if DETECTION_STATE_PATH.exists():
-                    shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
-                if REDETECTION_BACKUP_PATH.exists():
-                    shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
+                with state_lock:
+                    pipeline_state = None
+                    pipeline_state_signature = None
                 append_log(job_id, "INCOMPLETE REDetect: " + incomplete_reason)
                 app_progress({
                     "status": "pending_review",
@@ -1855,9 +1877,6 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
                 incomplete_state["_redetect_previous_count"] = previous_count
                 incomplete_state["_redetect_warning"] = incomplete_reason
                 return incomplete_state
-            shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
-            if REDETECTION_BACKUP_PATH.exists():
-                shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
             with state_lock:
                 pipeline_state = None
                 pipeline_state_signature = None
@@ -2905,7 +2924,7 @@ def run_child_job(job_path: Path) -> int:
             snapshot = load_json(DETECTION_STATE_PATH, {})
             previous_count = len(snapshot.get("raw_songs", []) or []) if isinstance(snapshot, dict) else 0
             warning = (
-                f"Fresh detection produced only {candidate_count} slot(s); "
+                f"Fresh detection is incomplete ({candidate_count} candidate slot(s)); "
                 f"the current session with {previous_count} slot(s) was preserved."
             )
             recovery = {
@@ -3042,6 +3061,10 @@ def _run_child_job(job_path: Path) -> int:
         })
         return 0
     if kind == "redetect":
+        configure_source_folder(payload.get("source_folder") or pipeline.SOURCE_DIR)
+        actual = source_job_identity(detection_state_signature())
+        if payload.get("fingerprint") and payload["fingerprint"] != actual["fingerprint"]:
+            raise RuntimeError("Source fingerprint changed after the job was queued; run Detect Songs again.")
         app_progress(
             {
                 "status": "running",
@@ -3387,7 +3410,7 @@ def worker() -> None:
     while True:
         job = job_queue.get()
         try:
-            if job.get("status") == "cancelled":
+            if job.get("status") in {"cancelled", "error"}:
                 lifecycle_log("queued_job_skipped_cancelled", str(job.get("id")))
                 continue
             set_job(job, status="running", progress=0, started=time.time(), heartbeat=time.time())
@@ -3584,8 +3607,8 @@ def api_state() -> Response:
                 if (
                     candidate.get("kind") == "redetect"
                     and str(Path(candidate.get("source_folder") or "").expanduser().resolve()) == str(source)
-                    and candidate.get("status") == "pending_review"
-                    and int(candidate.get("candidate_count") or 0) < 2
+                    and candidate.get("status") in {"pending_review", "pending_confirmation"}
+                    and candidate.get("fingerprint") == source_job_identity(signature)["fingerprint"]
                 ):
                     recent_incomplete = candidate
                     break
@@ -3596,10 +3619,9 @@ def api_state() -> Response:
                     or "Detection produced no usable multi-song session."
                 )
                 return jsonify(_loading_state(warning, recent_incomplete)), 200
-            # A cache miss must perform the real song detection. The lightweight
-            # scan is useful for diagnostics, but it cannot produce usable slots
-            # without Whisper and otherwise leaves a misleading one-block session.
-            detection_job = _queue_redetect_job(True)
+            # Initial loading uses acoustic detection. Optional Whisper analysis
+            # is a separate explicit UI action and cannot block registration.
+            detection_job = _queue_redetect_job(False)
         return jsonify(_loading_state(detection_job=detection_job)), 200
     return jsonify(public_state()), 200
 
@@ -4152,7 +4174,13 @@ def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | N
 
         orphaned = False
         orphan_reason = ""
-        if child_pid not in (None, ""):
+        if job.get("fingerprint") != source_job_identity(detection_state_signature())["fingerprint"]:
+            orphaned = True
+            orphan_reason = "source fingerprint changed or is missing"
+        elif heartbeat and now - heartbeat > ORPHANED_ACTIVE_JOB_SECONDS:
+            orphaned = True
+            orphan_reason = "worker heartbeat expired"
+        elif child_pid not in (None, ""):
             if not _pid_is_alive(child_pid):
                 orphaned = True
                 orphan_reason = f"recorded worker PID {child_pid} is no longer alive"
@@ -4161,6 +4189,14 @@ def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | N
             orphan_reason = "no worker PID or fresh heartbeat was recorded"
 
         if orphaned:
+            # Signal only a child owned by this process, never an arbitrary
+            # persisted PID that could have been reused by macOS.
+            owned_child = child_processes.get(str(job.get("id")))
+            if owned_child is not None and owned_child.poll() is None:
+                try:
+                    os.killpg(owned_child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
             finished_at = time.time()
             recovered = {
                 "status": "error",
@@ -4193,8 +4229,17 @@ def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | N
 
 
 def _queue_redetect_job(allow_whisper: bool = True) -> dict[str, Any]:
+    """Serialize simultaneous requests so double clicks cannot queue duplicates."""
+    with state_lock:
+        return _queue_redetect_job_locked(allow_whisper)
+
+
+def _queue_redetect_job_locked(allow_whisper: bool) -> dict[str, Any]:
     """Queue exactly one source-scoped detection job and return its snapshot."""
-    source = str(Path(pipeline.SOURCE_DIR).expanduser().resolve())
+    source = str(Path(load_settings().get("source_folder") or pipeline.SOURCE_DIR).expanduser().resolve())
+    configure_source_folder(source)
+    signature = detection_state_signature()
+    identity = source_job_identity(signature)
     existing = _active_redetect_job(source)
     if existing:
         return existing
@@ -4218,6 +4263,8 @@ def _queue_redetect_job(allow_whisper: bool = True) -> dict[str, Any]:
         "lifecycle_log_path": str(LIFECYCLE_LOG_PATH),
         "allow_whisper": bool(allow_whisper),
         "source_folder": source,
+        **identity,
+        "detection_mode": "fresh",
         "build": runtime_build_metadata(),
     }
     with state_lock:
@@ -4257,6 +4304,9 @@ def api_redetect_candidate() -> Response:
     candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
     if not isinstance(candidate, dict):
         return jsonify({"available": False})
+    requested_job = request.args.get("job_id")
+    if requested_job and candidate.get("job_id") != requested_job:
+        return jsonify({"available": False, "error": "Candidate belongs to another detection job."}), 409
     current = load_json(DETECTION_STATE_PATH, {})
     old_count = len(current.get("raw_songs", [])) if isinstance(current, dict) else 0
     new_count = len(candidate.get("raw_songs", []))
@@ -4277,9 +4327,17 @@ def api_redetect_commit() -> Response:
     candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
     if not isinstance(candidate, dict):
         return jsonify({"error": "No pending full-session detection is available."}), 409
+    requested_job = (request.get_json(silent=True) or {}).get("job_id")
+    if requested_job and candidate.get("job_id") != requested_job:
+        return jsonify({"error": "Candidate belongs to another detection job."}), 409
     count = len(candidate.get("raw_songs", []))
     if count < 2:
         return jsonify({"error": f"Refusing to replace the current session with only {count} detected slot(s)."}), 409
+    if candidate.get("candidate_pending") or legacy_single_slot_snapshot_reason(candidate):
+        return jsonify({"error": "Detection is incomplete; current session preserved."}), 409
+    expected = detection_state_signature()
+    if candidate.get("source_signature") != [expected[0], list(expected[1]), [list(item) for item in expected[2]]]:
+        return jsonify({"error": "Source changed since detection; run Detect Songs again."}), 409
     save_json_atomic(DETECTION_STATE_PATH, candidate)
     try:
         REDETECTION_CANDIDATE_PATH.unlink()

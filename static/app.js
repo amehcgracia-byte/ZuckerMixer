@@ -3463,8 +3463,11 @@ function renderJobs(items) {
   // than a running one (for example after a double click); showing its 0%
   // status made the live analysis bar appear frozen even while the worker
   // was reporting real progress.
-  const active = [...items].reverse().find((job) => ["running", "stopping"].includes(job.status))
-    || [...items].reverse().find((job) => job.status === "queued");
+  const currentSource = loadingOverlayJob?.source_folder || appState?.source_folder || appState?.settings?.source_folder;
+  const sourceItems = items.filter((job) => !job.source_folder || !currentSource || job.source_folder === currentSource);
+  const requestedJob = loadingOverlayJob && sourceItems.find((job) => String(job.id) === String(loadingOverlayJob.id));
+  const active = (requestedJob && ["queued", "running", "stopping"].includes(requestedJob.status) ? requestedJob : null) || [...sourceItems].reverse().find((job) => ["running", "stopping"].includes(job.status))
+    || [...sourceItems].reverse().find((job) => job.status === "queued");
   // Keep the job received from /api/state through the first polling race.
   // Clear it only when the same job is observed terminal, never merely
   // because /api/jobs returned an incomplete snapshot for a moment.
@@ -3484,7 +3487,7 @@ function renderJobs(items) {
   }
   const redetectButton = $("#redetectSongs");
   if (redetectButton) {
-    redetectButton.disabled = items.some((job) => job.kind === "redetect" && ["queued", "running", "stopping"].includes(job.status));
+    redetectButton.disabled = sourceItems.some((job) => job.kind === "redetect" && ["queued", "running", "stopping"].includes(job.status));
   }
   const loading = $("#loadingStatus");
   const loadingFill = $("#loadingProgressFill");
@@ -3756,13 +3759,13 @@ async function pollLogs() {
 async function reviewRedetectCandidate(job) {
   if (!job || redetectPromptedJobId === job.id) return;
   redetectPromptedJobId = job.id;
-  const response = await fetch("/api/redetect/candidate");
+  const response = await fetch(`/api/redetect/candidate?job_id=${encodeURIComponent(job.id)}`);
   const candidate = await response.json().catch(() => ({}));
   if (!candidate.available) return;
   const warning = candidate.warning ? `\nWARNING: ${candidate.warning}` : "";
   const approve = window.confirm(`Re-detect finished on the complete original session.\n\nCurrent slots: ${candidate.old_count}\nCandidate slots: ${candidate.new_count}\nOriginal stems: ${candidate.source_stem_count || "?"}\nSource duration: ${cutTime(candidate.source_duration_sec || 0)}${warning}\n\nReplace the current list only if this comparison is correct?\nCancel keeps all current and manual cuts.`);
   const endpoint = approve ? "/api/redetect/commit" : "/api/redetect/discard";
-  const result = await fetch(endpoint, { method: "POST" }).then((r) => r.json().catch(() => ({})));
+  const result = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.id }) }).then((r) => r.json().catch(() => ({})));
   if (!approve) { showToast("Re-detect cancelled; current slots and manual cuts preserved."); return; }
   if (!result.ok) return showToast(result.error || "Could not replace the current slot list.");
   await refreshState({ renderLarge: true });
@@ -3780,7 +3783,7 @@ async function pollingLoop() {
   if (document.visibilityState === "visible") {
     await pollLogs();
     const jobs = await pollJobs();
-    const pendingRedetect = [...(jobs || [])].reverse().find((job) => job.kind === "redetect" && job.status === "pending_confirmation");
+    const pendingRedetect = [...(jobs || [])].reverse().find((job) => job.kind === "redetect" && job.status === "pending_confirmation" && job.source_folder === appState?.source_folder);
     if (pendingRedetect) await reviewRedetectCandidate(pendingRedetect);
     const active = (jobs || []).some((job) => ["queued", "running", "stopping"].includes(job.status));
     await refreshState({ renderLarge: !active });
@@ -3835,7 +3838,7 @@ if (typeof document !== "undefined") {
   $("#redetectSongs").addEventListener("click", async () => {
     if (!window.confirm("Re-detect the complete original session? Current slots remain until you confirm the comparison.")) return;
     setCutLoading("Re-detecting songs", "Preparing full original session", 2);
-    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: true }) });
+    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: false }) });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       showToast(data.error || "Could not start song detection.");
@@ -3852,7 +3855,7 @@ if (typeof document !== "undefined") {
     // fetch is the authoritative post-Re-detect count/boundary refresh.
     const waitForFreshDetection = async () => {
       const jobs = await pollJobs();
-      const job = jobs.find((item) => item.id === queuedJob.id) || [...jobs].reverse().find((item) => item.kind === "redetect");
+      const job = jobs.find((item) => item.id === queuedJob.id);
       if (job?.status === "pending_confirmation") {
         setLoadingOverlayJob(null);
         clearCutLoading();
@@ -3903,7 +3906,7 @@ if (typeof document !== "undefined") {
     const detection = await fetch("/api/redetect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allow_whisper: true }),
+      body: JSON.stringify({ allow_whisper: false }),
     });
     if (!detection.ok) {
       showToast("Source folder changed, but automatic detection could not start.");
@@ -3914,8 +3917,10 @@ if (typeof document !== "undefined") {
     await pollJobs();
     const waitForSourceDetection = async () => {
       const jobs = await pollJobs();
-      const job = jobs.find((item) => item.id === detectionJob.id) || [...jobs].reverse().find((item) => item.kind === "redetect");
-      if (job?.status === "done") {
+      const job = jobs.find((item) => item.id === detectionJob.id);
+      if (job?.status === "pending_confirmation") {
+        await reviewRedetectCandidate(job);
+      } else if (job?.status === "done") {
         await loadState();
         showToast(`${appState.audio_scan?.accepted?.length || 0} WAV/audio files loaded.`);
       } else if (job?.status === "pending_review") {
