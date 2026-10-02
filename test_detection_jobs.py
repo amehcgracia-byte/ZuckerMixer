@@ -117,3 +117,18 @@ def test_no_vocal_stem_uses_drum_detection_without_whisper():
         assert len(segments) == 2
         transcribe.assert_not_called()
         assert pipeline.LAST_WHISPER_STATUS['status'] == 'skipped'
+
+
+def test_legacy_one_slot_is_rejected_after_stems_are_hydrated():
+    from types import SimpleNamespace
+    snapshot = {'raw_songs': [{}], 'stems': [SimpleNamespace(offset_seconds=0, timeline_duration=22140)] * 2}
+    assert app.legacy_single_slot_snapshot_reason(snapshot)
+    snapshot['raw_songs'][0]['proposal_status'] = 'manual'
+    assert app.legacy_single_slot_snapshot_reason(snapshot) == ''
+
+
+def test_loading_legacy_one_slot_snapshot_never_exposes_session():
+    signature = ('source', (None, None), ())
+    payload = {'source_signature': ['source', [None, None], []], 'raw_songs': [{}], 'stems': [{'duration': 22140}] * 2}
+    with patch.object(app, 'load_json', return_value=payload):
+        assert app.load_detection_snapshot(signature) is None

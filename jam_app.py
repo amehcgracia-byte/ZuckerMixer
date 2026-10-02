@@ -1023,6 +1023,8 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
     ]
     if not isinstance(payload, dict) or payload.get("source_signature") != expected_signature:
         return None
+    if legacy_single_slot_snapshot_reason(payload):
+        return None
     try:
         stems = [pipeline.Stem(path=Path(item["path"]), **{key: item[key] for key in ("name", "role", "samplerate", "channels", "frames", "duration", "timeline_frames", "offset_seconds", "offset_source")}) for item in payload["stems"]]
         segments = []
@@ -1057,12 +1059,15 @@ def legacy_single_slot_snapshot_reason(snapshot: dict[str, Any] | None) -> str:
         return ""
     if len(slots) != 1 or len(stems) <= 1:
         return ""
+    if slots[0].get("proposal_status") == "manual":
+        return ""
     duration = max(
         (
             float(item.get("offset_seconds", 0.0))
             + float(item.get("timeline_duration", item.get("duration", 0.0)))
-            for item in stems
             if isinstance(item, dict)
+            else float(item.offset_seconds) + float(item.timeline_duration)
+            for item in stems
         ),
         default=0.0,
     )
