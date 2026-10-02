@@ -3190,12 +3190,13 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     DETECTION_STRATEGY = {"id": "starting", "label": "fresh deterministic detection"}
     LAST_DETECTION_CALIBRATION = {}
 
-    if not WHISPER_ALLOWED:
+    has_voice_stems = any(stem.role in {"vocal", "room"} for stem in stems)
+    if not WHISPER_ALLOWED or not has_voice_stems:
         # Whisper is optional. Use the acoustic MC/drum boundary detector for
         # the normal pass so sessions without a commentator still get slots.
         LAST_WHISPER_STATUS = {
             "status": "skipped",
-            "reason": "optional analysis disabled; acoustic detection used",
+            "reason": "optional analysis disabled; acoustic detection used" if has_voice_stems else "no vocal/room stem; drum acoustic detection used",
         }
         report_progress({
             "current_stage": "reading cached envelopes",
@@ -3213,7 +3214,7 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
         session_end = active_session_end_from_timelines(stems, timelines, metadata_session_end)
         voice_stems = [stem for stem in stems if stem.role in {"vocal", "room"}]
         instrument_stems = [stem for stem in stems if stem.role not in {"vocal", "room"}]
-        if not voice_stems or not instrument_stems:
+        if not instrument_stems:
             segments = provisional_segments_from_metadata(stems)
             DETECTION_STRATEGY = {
                 "id": "metadata_provisional",
@@ -3225,9 +3226,13 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
                 "whisper": LAST_WHISPER_STATUS,
             }
             return segments, np.array([], dtype=np.float32)
-        mc_data, segments = auto_calibrate_detection(
-            voice_stems, instrument_stems, timelines, session_end
-        )
+        if voice_stems:
+            mc_data, segments = auto_calibrate_detection(
+                voice_stems, instrument_stems, timelines, session_end
+            )
+        else:
+            mc_data = {"mc_mask": np.zeros(int(math.ceil(session_end / DETECTION_FRAME_SECONDS)), dtype=bool)}
+            segments = []
         if not segments:
             segments = auto_calibrate_drum_fallback(
                 stems, timelines, session_end, voice_stems, instrument_stems, mc_data

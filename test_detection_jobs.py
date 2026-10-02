@@ -99,3 +99,21 @@ def test_candidate_from_other_job_cannot_be_committed():
     with patch.object(app, 'load_json', return_value={'job_id': 'old', 'raw_songs': [{}, {}]}):
         response = app.app.test_client().post('/api/redetect/commit', json={'job_id': 'new'})
         assert response.status_code == 409
+
+
+def test_no_vocal_stem_uses_drum_detection_without_whisper():
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+    pipeline = app.pipeline
+    stems = [SimpleNamespace(path=Path('Kick.wav'), role='drums', offset_seconds=0, timeline_duration=1200)]
+    proposals = [pipeline.Segment(0, 600), pipeline.Segment(600, 1200)]
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(pipeline, 'WHISPER_ALLOWED', True))
+        stack.enter_context(patch.object(pipeline, 'load_cached_timelines_or_die', return_value={}))
+        stack.enter_context(patch.object(pipeline, 'active_session_end_from_timelines', return_value=1200))
+        stack.enter_context(patch.object(pipeline, 'auto_calibrate_drum_fallback', return_value=proposals))
+        transcribe = stack.enter_context(patch.object(pipeline, 'transcribe_speech_candidates'))
+        segments, _ = pipeline.detect_segments(stems)
+        assert len(segments) == 2
+        transcribe.assert_not_called()
+        assert pipeline.LAST_WHISPER_STATUS['status'] == 'skipped'
