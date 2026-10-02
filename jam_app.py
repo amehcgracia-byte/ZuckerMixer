@@ -922,7 +922,7 @@ def default_source_config() -> dict[str, Any]:
     return {
         "config_version": 1,
         "expected_song_count": None,
-        "min_song_seconds": 90.0,
+        "min_song_seconds": 480.0,
         "max_song_seconds": 4 * 3600.0,
         "structural_min_song_seconds": 90.0,
         "structural_max_song_seconds": 4 * 3600.0,
