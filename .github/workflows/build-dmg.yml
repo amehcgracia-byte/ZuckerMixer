@@ -14,8 +14,34 @@ concurrency:
 
 
 jobs:
+  test-suite:
+    name: Run ZuckerMixer test suite
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install application and test dependencies
+        shell: bash
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements_app.txt
+          python3 -m pip install pytest
+
+      - name: Run pytest
+        shell: bash
+        run: |
+          python3 -m pytest -q
+
   build-dmg:
     name: Build ZuckerMixer DMG
+    needs: test-suite
     runs-on: macos-15-intel
 
     steps:
@@ -63,6 +89,7 @@ jobs:
 
   build-windows:
     name: Build ZuckerMixer Windows EXE
+    needs: test-suite
     runs-on: windows-latest
 
     steps:
