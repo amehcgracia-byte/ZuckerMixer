@@ -51,7 +51,7 @@ SESSION_DATE = date.today().isoformat()
 
 SILENCE_GAP_SECONDS = 8.0
 DEFAULT_SILENCE_GAP_SECONDS = SILENCE_GAP_SECONDS
-MIN_SONG_SECONDS = 90.0
+MIN_SONG_SECONDS = 480.0
 DETECTION_FRAME_SECONDS = 1.0
 DETECTION_SMOOTH_SECONDS = 9.0
 SILENCE_THRESHOLD_DB = -25.0
@@ -88,7 +88,7 @@ MC_SANITY_ANCHORS = []
 SUSPICIOUS_SHORT_SONG_SECONDS = 5 * 60.0
 SUSPICIOUS_LONG_SONG_SECONDS = 20 * 60.0
 # Permissive defaults. Each source can define its own review policy.
-HARD_MIN_SONG_SECONDS = 90.0
+HARD_MIN_SONG_SECONDS = 480.0
 HARD_MAX_SONG_SECONDS = 4 * 3600.0
 EXPECTED_SONG_COUNT = None
 EXPECTED_SLOT_COUNT = None
@@ -350,7 +350,7 @@ def configure_detection_profile(profile: dict[str, object] | None = None) -> dic
     EXPECTED_SONG_COUNT = expected
     EXPECTED_SLOT_COUNT = expected
 
-    minimum = _profile_number(raw, ("min_song_seconds", "hard_min_song_seconds"), 90.0)
+    minimum = _profile_number(raw, ("min_song_seconds", "hard_min_song_seconds"), 480.0)
     maximum = _profile_number(raw, ("max_song_seconds", "hard_max_song_seconds"), 4 * 3600.0)
     structural_min = _profile_number(raw, ("structural_min_song_seconds",), minimum)
     structural_max = _profile_number(raw, ("structural_max_song_seconds",), maximum)
