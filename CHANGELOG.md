@@ -1,5 +1,10 @@
 # Changes
 
+## 2.1.64
+
+- Show registered renders saved to user-selected external folders in Finished Mixes.
+- Includes the Windows startup/cancellation repairs and every-song render fixes below.
+
 ## 2.1.63
 
 - Render every requested, non-skipped song, including song 1 and songs with boundary warnings.

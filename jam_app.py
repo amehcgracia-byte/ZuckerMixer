@@ -1498,6 +1498,29 @@ def disk_versions() -> dict[int, list[dict[str, Any]]]:
                     if isinstance(entry, dict) and entry.get("path"):
                         metadata_by_path[str(Path(str(entry["path"])).resolve())] = entry
     seen: set[Path] = set()
+    # Registered renders can live in any user-selected destination. Include
+    # those exact files without recursively scanning external drives.
+    if isinstance(history, dict):
+        for raw_song, entries in history.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or not entry.get("path"):
+                    continue
+                try:
+                    path = Path(str(entry["path"])).resolve()
+                    song_no = int(entry.get("song_id") or raw_song)
+                    if path in seen or path.suffix.lower() != ".mp3" or not path.is_file():
+                        continue
+                    registered = dict(entry)
+                    registered.update(path=str(path), size=path.stat().st_size)
+                    registered.setdefault("version", 1)
+                    registered.setdefault("created", "")
+                    registered.setdefault("title", path.stem)
+                except (OSError, TypeError, ValueError):
+                    continue
+                seen.add(path)
+                versions.setdefault(song_no, []).append(registered)
     for root in render_roots:
         if not root.exists():
             continue
