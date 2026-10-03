@@ -1014,3 +1014,7 @@ body.loading-mode #loadingStatus { display: none !important; }
 .loading-render-progress .progress-track > div {
   background: var(--orange2);
 }
+
+.progress-box.success { border-color: #4bba75; }
+.progress-box.success #currentWork { color: #70dc95; }
+.progress-box.warning #currentWork { color: #efbd70; }

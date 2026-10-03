@@ -6663,6 +6663,19 @@ def delay_send_level_db(role: str, lead_bonus: float) -> float | None:
     return None
 
 
+def resolved_effect_settings(overrides: dict, role: str, profile: dict) -> dict:
+    """Automatic defaults remain automatic until the user edits effects."""
+    manual = override_bool(overrides.get("effects_user_confirmed"), False)
+    offsets = profile.get("role_offsets_db", {}).get(role, {})
+    return {
+        "fx_enabled": override_bool(overrides.get("fx_enabled"), True),
+        "space_enabled": override_bool(overrides.get("space_enabled"), False) if manual else bool(profile.get("role_space_enabled", {}).get(role, False)),
+        "echo_enabled": override_bool(overrides.get("echo_enabled"), False) if manual else bool(profile.get("role_echo_enabled", {}).get(role, False)),
+        "reverb_scene_offset_db": float(offsets.get("reverb_db", 0.0)),
+        "delay_scene_offset_db": float(offsets.get("delay_db", 0.0)),
+    }
+
+
 def effective_mix_snapshot(
     index: int,
     song_overrides: dict[str, object],
@@ -6722,8 +6735,8 @@ def effective_mix_snapshot(
         role = str(row.get("effective_role") or row.get("role", ""))
         fx_enabled = override_bool(stem_override(song_overrides, name).get("fx_enabled"), True)
         gate_enabled = override_bool(stem_override(song_overrides, name).get("gate_enabled"), False)
-        space_enabled = override_bool(stem_override(song_overrides, name).get("space_enabled"), False)
-        echo_enabled = override_bool(stem_override(song_overrides, name).get("echo_enabled"), False)
+        space_enabled = override_bool(row.get("space_enabled"), False)
+        echo_enabled = override_bool(row.get("echo_enabled"), False)
         stems_payload[name] = {
             "file": name,
             "label": name,
@@ -6828,10 +6841,17 @@ def delay_line_streaming(
     buf = state.get(key)
     if buf is None or buf.shape != (delay_samples, x.shape[1]):
         buf = np.zeros((delay_samples, x.shape[1]), dtype=np.float32)
-    combined = np.vstack([buf, x.astype(np.float32)])
-    out = combined[: len(x)].copy()
-    state[key] = (combined[len(x) : len(x) + delay_samples] + out[-delay_samples:] * feedback if len(out) >= delay_samples else combined[-delay_samples:]).astype(np.float32)
-    return out.astype(np.float32)
+    frames = len(x)
+    combined = np.empty((delay_samples + frames, x.shape[1]), dtype=np.float32)
+    combined[:delay_samples] = buf
+    if feedback == 0:
+        combined[delay_samples:] = x
+    else:
+        for start in range(0, frames, delay_samples):
+            end = min(frames, start + delay_samples)
+            combined[delay_samples + start:delay_samples + end] = x[start:end] + feedback * combined[start:end]
+    state[key] = combined[frames:frames + delay_samples].copy()
+    return combined[:frames].copy()
 
 
 def slap_delay_streaming(
@@ -7681,6 +7701,7 @@ def render_segment(
     verify_announcement: bool = True,
     prepared_plan: dict[str, object] | None = None,
     artifact_dir: Path | None = None,
+    retain_diagnostic_audio: bool = True,
 ) -> dict[str, object]:
     render_t0 = time.perf_counter()
     song_overrides = current_song_overrides(index)
@@ -7841,6 +7862,8 @@ def render_segment(
     vocal_pair_corrections = role_balance.get("vocal_pair_corrections_db", {}) if isinstance(role_balance, dict) else {}
     role_balance_reasons = role_balance.get("role_reasons", {}) if isinstance(role_balance, dict) else {}
     effect_profile = mix_controls.get("effect_profile", {}) if isinstance(mix_controls, dict) else {}
+    if not effect_profile:
+        effect_profile = per_song_effect_profile(effective_roles, rms_values_db, float(mix_controls.get("bpm", 0.0) or 0.0), 0.0, mix_controls.get("mic_content", {}))
     effect_role_offsets = effect_profile.get("role_offsets_db", {}) if isinstance(effect_profile, dict) else {}
     mic_content = mix_controls["mic_content"]
     active_levels_db = {
@@ -8055,8 +8078,8 @@ def render_segment(
             "effect_scene": effect_profile.get("scene") if isinstance(effect_profile, dict) else None,
             "fx_enabled": bool(overrides.get("fx_enabled", True)),
             "gate_enabled": override_bool(overrides.get("gate_enabled"), False),
-            "space_enabled": override_bool(overrides.get("space_enabled"), automatic_space_enabled),
-            "echo_enabled": override_bool(overrides.get("echo_enabled"), automatic_echo_enabled),
+            "space_enabled": resolved_effect_settings(overrides, mix_role, effect_profile)["space_enabled"],
+            "echo_enabled": resolved_effect_settings(overrides, mix_role, effect_profile)["echo_enabled"],
             "activity_decision": activity_reason,
             "flattening_range_db": float(flattening.get(stem.path.name, {}).get("range_db", 0.0)),
             "pan": enforced_pan(mix_role, stem.name, overrides.get("pan")),
@@ -8110,15 +8133,17 @@ def render_segment(
                 "total_gain_db": makeup_gain_db + user_gain_db + level_gain_db,
                 "override_gain_db": fader_gain_db,
                 "override_mute": override_bool(overrides.get("mute"), False),
-                "fx_enabled": override_bool(overrides.get("fx_enabled"), False),
+                "fx_enabled": track_settings[stem.path.name]["fx_enabled"],
+                "space_enabled": track_settings[stem.path.name]["space_enabled"],
+                "echo_enabled": track_settings[stem.path.name]["echo_enabled"],
                 "pan": enforced_pan(mix_role, stem.name, overrides.get("pan")),
                 "gain_overridden": abs(user_gain_db) > 0.001,
                 "reverb_base_db": reverb_send_level_db(mix_role),
                 "reverb_send_db": override_float(overrides.get("reverb_send_db"), 0.0),
-                "reverb_total_db": None if reverb_send_level_db(mix_role) is None else reverb_send_level_db(mix_role) + override_float(overrides.get("reverb_send_db"), 0.0),
+                "reverb_total_db": None if reverb_send_level_db(mix_role) is None else reverb_send_level_db(mix_role) + reverb_scene_offset_db + override_float(overrides.get("reverb_send_db"), 0.0),
                 "delay_base_db": delay_send_level_db(mix_role, lead_bonus),
                 "delay_send_db": override_float(overrides.get("delay_send_db"), 0.0),
-                "delay_total_db": None if delay_send_level_db(mix_role, lead_bonus) is None else delay_send_level_db(mix_role, lead_bonus) + override_float(overrides.get("delay_send_db"), 0.0),
+                "delay_total_db": None if delay_send_level_db(mix_role, lead_bonus) is None else delay_send_level_db(mix_role, lead_bonus) + delay_scene_offset_db + override_float(overrides.get("delay_send_db"), 0.0),
                 **eq_settings,
                 "status": "active",
                 "reason": reason,
@@ -8195,6 +8220,9 @@ def render_segment(
     vocal_bus_trim_db = override_float(song_overrides.get("vocal_bus_db"), VOCAL_BUS_TRIM_DB)
     effective_mix = effective_mix_snapshot(index, song_overrides, stem_report, used, vocal_bus_trim_db)
     print("PYTHON_EFFECTIVE_MIX_JSON " + json.dumps(effective_mix, sort_keys=True), flush=True)
+    required_bytes = max(1024 ** 3, int(segment.duration * sr * 2 * 7 * 3))
+    if shutil.disk_usage(tempfile.gettempdir()).free < required_bytes:
+        raise RuntimeError("Not enough disk space for rendering. Free space on the system disk and try again.")
     with tempfile.TemporaryDirectory(prefix=f"jam_song_{index:02d}_") as tmp:
         tmp_dir = Path(tmp)
         premaster_path = tmp_dir / f"song_{index:02d}_premaster.wav"
@@ -8450,7 +8478,7 @@ def render_segment(
                         meter_stage("vocal_bus_post_safety", vocal_bus)
                         mix += vocal_bus
                     mix += plate_reverb_streaming(reverb_send, sr, reverb_decay, fx_state)
-                    mix += slap_delay_streaming(delay_send, sr, drum_bpm, fx_state)
+                    mix += slap_delay_streaming(delay_send, sr, drum_bpm if drum_bpm > 0 else 90.0, fx_state)
                     meter_stage("post_sum", mix)
                     # Keep the summed premaster comfortably below full scale
                     # before the bus compressor and mastering gain. This is a
@@ -8599,7 +8627,7 @@ def render_segment(
                 print(f"  Announcement verification warning for song {index}: {announcement_verification['verification_warning']}", flush=True)
 
         preserved_artifacts: dict[str, str] = {}
-        if artifact_dir is not None:
+        if artifact_dir is not None and retain_diagnostic_audio:
             artifact_root = Path(artifact_dir)
             artifact_root.mkdir(parents=True, exist_ok=True)
             premaster_artifact = artifact_root / f"song_{index:02d}_premaster.wav"
@@ -8668,6 +8696,7 @@ def render_segment(
         "stage_metrics": stage_meters_final,
         "premaster_headroom_db": PREMASTER_HEADROOM_DB,
         "preserved_artifacts": preserved_artifacts,
+        "diagnostic_audio_retained": bool(artifact_dir is not None and retain_diagnostic_audio),
         "timings": {
             "scan_seconds": round(float(scan_seconds), 3),
             "mix_seconds": round(float(mix_seconds), 3),
@@ -9028,7 +9057,7 @@ def write_report(out_dir: Path, rows: list[dict[str, object]], segments: list[Se
         if final_cut:
             f.write("\nFinal render cut gate audit (exact source cut sample):\n")
             for item in final_cut:
-                active = ", ".join(str(x.get("stem")) for x in item.get("active_instruments", [])) or "none"
+                active = ", ".join(str(x.get("stem", x.get("name", "unknown"))) if isinstance(x, dict) else str(x) for x in (item.get("active_instruments") or [])) or "none"
                 f.write(f"  song {item.get('song')}: sample {item.get('cut_sample')} at {fmt_time(float(item.get('cut_seconds', 0)))}; safe={item.get('safe')}; active instruments={active}\n")
         titles = [str(row.get("title")) for row in rows if row.get("title")]
         if titles:

@@ -404,7 +404,15 @@ def load_mix_plan(
     if entry.get("signature") != expected:
         return None
     plan = entry.get("plan")
-    return plan if isinstance(plan, dict) else None
+    if isinstance(plan, dict):
+        profile = plan.get("auto_mix_balance", {}).get("effect_profile", {})
+        if not profile:
+            profile = pipeline.per_song_effect_profile({name: params.get("role", "") for name, params in plan.get("stems", {}).items()}, {}, 0.0, 0.0, {})
+        for name, params in plan.get("stems", {}).items():
+            if isinstance(params, dict):
+                params.update(pipeline.resolved_effect_settings(song_overrides.get("stems", {}).get(name, {}), str(params.get("role", "")), profile))
+        return plan
+    return None
 
 
 def save_mix_plan(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any], plan: dict[str, Any]) -> None:
@@ -2552,6 +2560,8 @@ def record_render(
     artifact_paths: dict[str, str] = {"mp3": str(dest.resolve())}
     for key, suffix in (("premaster_wav", "_premaster.wav"), ("master_wav", "_master.wav")):
         source_artifact = Path(str(preserved.get(key, ""))) if preserved.get(key) else None
+        if source_artifact is None and row.get("diagnostic_audio_retained") is False:
+            continue
         if source_artifact is None or not source_artifact.exists():
             raise RuntimeError(f"Missing {key} artifact for song {song_index}.")
         artifact_dest = diagnostic_root / f"{dest.stem}{suffix}"
@@ -2839,7 +2849,7 @@ def normalize_overrides(payload: Any) -> dict[str, Any]:
                             clean_stem[key] = float(stem_payload[key])
                         except (TypeError, ValueError):
                             continue
-                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "manual_makeup_gain_db"):
+                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "effects_user_confirmed", "manual_makeup_gain_db"):
                     if isinstance(stem_payload.get(key), bool):
                         clean_stem[key] = stem_payload[key]
                 if clean_stem:
@@ -3199,6 +3209,7 @@ def _run_child_job(job_path: Path) -> int:
                 output_path=render_tmp_path,
                 prepared_plan=prepared_plan,
                 artifact_dir=artifact_tmp_dir,
+                retain_diagnostic_audio=False,
             )
             elapsed = time.time() - started
             entry = record_render(

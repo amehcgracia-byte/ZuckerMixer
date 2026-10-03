@@ -386,7 +386,7 @@ function effectiveMixDump(songIndex, reason = "preview") {
         : numeric(params.user_fader_db, 0);
       const muted = Boolean(ov.mute) || faderDb <= -60;
       const solo = Boolean(ov.solo);
-      const fxEnabled = ov.fx_enabled === true;
+      const fxEnabled = ov.fx_enabled !== false;
       const mutedBySolo = Boolean(soloFiles.length && !soloFiles.includes(stem.file));
       const finalGainDb = preGainDb + faderDb;
       const eq = stemEq(songIndex, stem);
@@ -1336,7 +1336,12 @@ function renderFaders(root, songIndex) {
     const automaticFaderDb = Number(params?.automatic_fader_db ?? params?.computed_gain_db ?? 0);
     if (!Number.isFinite(Number(ov.pan))) ov.pan = defaultPan(stem);
     const pan = Number(ov.pan);
-    const fxEnabled = ov.fx_enabled === true;
+    ov.fx_enabled ??= params?.fx_enabled ?? true;
+    if (!ov.effects_user_confirmed) {
+      ov.space_enabled = Boolean(params?.space_enabled);
+      ov.echo_enabled = Boolean(params?.echo_enabled);
+    }
+    const fxEnabled = ov.fx_enabled !== false;
     const eq = stemEq(songIndex, stem);
     ov.eq_low_cut_hz ??= eq.eq_low_cut_hz;
     ov.eq_mid_gain_db ??= eq.eq_mid_gain_db;
@@ -1355,6 +1360,7 @@ function renderFaders(root, songIndex) {
       <div class="stem-effects" aria-label="Per-stem effects">
         ${[["gate_enabled", "Gate"], ["space_enabled", "Space"], ["echo_enabled", "Echo"]].map(([key, label]) => `<button type="button" class="effect-dot ${ov[key] === true ? "active" : ""}" data-effect="${key}" title="Toggle ${label}"><span></span>${label}</button>`).join("")}
       </div>
+      <div class="effect-levels" data-effect-levels></div>
       ${linked.length > 1 ? '<div class="pan-control linked-pan-note">Stereo pair · individual L/R panning preserved</div>' : `<label class="pan-control">Pan <input data-pan type="range" min="-1" max="1" step="0.05" value="${pan}"><span>${panText(pan)}</span></label>`}
       <div class="eq-controls">
         <label>Low cut <input data-eq="eq_low_cut_hz" type="range" min="20" max="220" step="5" value="${eq.eq_low_cut_hz}"><span>${Math.round(eq.eq_low_cut_hz)} Hz</span></label>
@@ -1366,6 +1372,11 @@ function renderFaders(root, songIndex) {
         <button class="${ov.solo ? "active" : ""}" data-solo>Solo</button>
       </div>
     `;
+    const updateEffectLabels = () => {
+      const sendLabel = (key, enabled) => ov.fx_enabled === false || !enabled ? "off" : `${signedDb(20 * Math.log10(Math.max(1e-12, previewSendGain(songIndex, stem, key))))}`;
+      strip.querySelector("[data-effect-levels]").textContent = `Space ${sendLabel("reverb_send_db", ov.space_enabled)} · Echo ${sendLabel("delay_send_db", ov.echo_enabled)}`;
+    };
+    updateEffectLabels();
     const slider = strip.querySelector("[data-fader]");
     const label = strip.querySelector(".amount");
     const gainSlider = strip.querySelector("[data-gain]");
@@ -1467,6 +1478,7 @@ function renderFaders(root, songIndex) {
       setLinkedOverride(songIndex, linked, "fx_enabled", ov.fx_enabled);
       event.currentTarget.classList.toggle("active", ov.fx_enabled);
       event.currentTarget.textContent = ov.fx_enabled ? "FX ON" : "FX OFF";
+      updateEffectLabels();
       linked.forEach((item) => reconnectPreviewStemFx(previewMixFor(songIndex), songIndex, item, ov.fx_enabled));
       persistPreviewChange(songIndex, `fx:${stem.file}`);
       await flushOverrideSaveVisible(songIndex, `fx:${stem.file}`);
@@ -1482,6 +1494,7 @@ function renderFaders(root, songIndex) {
         }
         setLinkedOverride(songIndex, linked, key, ov[key]);
         button.classList.toggle("active", ov[key]);
+        updateEffectLabels();
         linked.forEach((item) => {
           const live = livePreviewStemOverrides(songIndex, item.file);
           live[key] = ov[key];
@@ -1723,7 +1736,7 @@ function disconnectPreviewGraph(mix, reason = "teardown") {
 }
 
 function previewFxEnabled(songIndex, stem) {
-  return currentStemOverrides(songIndex, stem.file).fx_enabled === true;
+  return currentStemOverrides(songIndex, stem.file).fx_enabled !== false;
 }
 
 function previewEffectEnabled(songIndex, stem, key) {
@@ -2181,10 +2194,13 @@ function previewSendGain(songIndex, stem, key) {
     ? (key === "reverb_send_db" ? params.reverb_base_db : params.delay_base_db)
     : (key === "reverb_send_db" ? baseReverbSendDb(stem.role) : baseDelaySendDb(stem.role, leadBonusDb));
   if (base == null) return 0;
-  return dbToGain(base + Number(ov[key] || 0));
+  const sceneOffset = Number(params?.[key === "reverb_send_db" ? "reverb_scene_offset_db" : "delay_scene_offset_db"] || 0);
+  return dbToGain(base + sceneOffset + Number(ov[key] || 0));
 }
 
 function updatePreviewSends(songIndex, key) {
+  if (key === "space_enabled") key = "reverb_send_db";
+  if (key === "echo_enabled") key = "delay_send_db";
   const mix = previewMixFor(songIndex);
   if (!mix) return;
   const now = mix.ctx.currentTime;
@@ -2898,6 +2914,54 @@ function jobErrorText(job) {
   return parts.join("\n\n");
 }
 
+function renderResultSummary(job) {
+  if (!job) return "Ready";
+  if (job.status === "done") return ["render", "mix", "preview"].includes(job.kind || "render") ? "All done. Your renders are ready." : "All done.";
+  if (job.status === "pending_confirmation") return "Songs ready for confirmation.";
+  if (job.status === "pending_review") return "Some songs need review.";
+  if (job.status === "cancelled") return "Render cancelled.";
+  if (/no space left|not enough disk space/i.test(jobErrorText(job))) return "Not enough disk space. Free some space and try again.";
+  if (job.status === "partial_failed") return "Some renders failed. See the report for details.";
+  return "Render failed. See the report for details.";
+}
+
+function jobReportText(job) {
+  return `ZuckerMixer report · ${job.id}\nStatus: ${job.status}\n${renderResultSummary(job)}\n` +
+    (job.batch_summary ? JSON.stringify(job.batch_summary, null, 2) + "\n" : "") +
+    jobErrorText(job);
+}
+
+async function copyJobReport(job, button) {
+  const report = jobReportText(job);
+  try {
+    await navigator.clipboard.writeText(report);
+  } catch (_error) {
+    const text = document.createElement("textarea");
+    text.value = report;
+    text.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+    document.body.appendChild(text);
+    text.select();
+    const copied = document.execCommand("copy");
+    text.remove();
+    if (!copied) {
+      const dialog = document.createElement("dialog");
+      const field = document.createElement("textarea");
+      field.value = report;
+      field.readOnly = true;
+      field.style.cssText = "width:70vw;height:50vh";
+      const close = document.createElement("button");
+      close.textContent = "Close";
+      close.onclick = () => { dialog.close(); dialog.remove(); };
+      dialog.append(field, close);
+      document.body.appendChild(dialog);
+      dialog.showModal();
+      field.select();
+      return;
+    }
+  }
+  button.textContent = "Copied";
+}
+
 async function ensureRenderPlans(songIds) {
   const missing = [];
   for (let index = 0; index < songIds.length; index += 1) {
@@ -3020,7 +3084,7 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     await waitForRenderJob(jobId);
   } catch (error) {
     console.error("[render] failed", error);
-    const message = error.message || error;
+    const message = /no space left|not enough disk space/i.test(String(error.message || error)) ? "Not enough disk space. Free some space and try again." : "Render failed. See the report for details.";
     showToast(`Render failed: ${message}`);
     const status = document.querySelector("#currentWork");
     if (status) status.textContent = `Render failed: ${message}`;
@@ -3506,6 +3570,7 @@ function renderJobs(items) {
   }
   $(".progress-box").classList.toggle("working", Boolean(active));
   if (active) {
+    $(".progress-box").classList.remove("success", "warning");
     const current = active.current_item || (active.current ? `Song ${String(active.current).padStart(2, "0")}` : "Waiting");
     const stage = active.current_stage ? ` · ${active.current_stage}` : "";
     $("#currentWork").textContent = active.status === "stopping" ? "Stopping after this song" : `${current}${stage}`;
@@ -3540,15 +3605,16 @@ function renderJobs(items) {
       stall.textContent = stale ? `No worker event for ${Math.floor((Date.now() - updated) / 1000)}s — stage: ${active.current_stage || "unknown"}; last event: ${active.last_event || active.stage_detail || "unknown"}. Cancel if it does not resume.` : "";
     }
   } else {
-    const terminal = [...items].reverse().find((job) => ["pending_confirmation", "pending_review", "partial_failed", "error", "cancelled"].includes(job.status));
-    const terminalError = terminal ? jobErrorText(terminal) : "";
+    const terminal = [...sourceItems].reverse().find((job) => ["done", "pending_confirmation", "pending_review", "partial_failed", "error", "cancelled"].includes(job.status));
+    $(".progress-box").classList.toggle("success", terminal?.status === "done");
+    $(".progress-box").classList.toggle("warning", Boolean(terminal && ["error", "partial_failed", "pending_review"].includes(terminal.status)));
+    $("#currentWork").textContent = renderResultSummary(terminal);
+    $("#queuePosition").textContent = "";
     if (terminal) {
-      const label = terminal.status === "pending_confirmation" ? "Re-detect ready for confirmation" : terminal.status === "pending_review" ? "Pending review" : terminal.status === "partial_failed" ? "Render partially failed" : terminal.status === "cancelled" ? "Render cancelled" : "Render failed";
-      $("#currentWork").textContent = `${label} · ${terminal.id}`;
-      $("#queuePosition").textContent = `${terminalError || terminal.stage_detail || "see job details"} · PID ${terminal.child_pid || terminal.pid || terminal.launch_pid || "unknown"}`;
-    } else {
-      $("#currentWork").textContent = "Ready";
-      $("#queuePosition").textContent = "Ready";
+      const copy = document.createElement("button");
+      copy.textContent = "Copy report";
+      copy.onclick = () => copyJobReport(terminal, copy);
+      $("#queuePosition").appendChild(copy);
     }
     $("#progressFill").style.width = "0%";
     $("#progressFun").textContent = "";
@@ -3558,27 +3624,18 @@ function renderJobs(items) {
     const el = document.createElement("div");
     el.className = `job ${["error", "partial_failed"].includes(job.status) ? "error" : ""}`;
     const fullError = jobErrorText(job);
-    const errorText = fullError ? `<pre class="copyable-error">${esc(fullError)}</pre><button class="copy-error" data-copy-error="${esc(job.id)}">Copy error</button>` : "";
+    const errorText = `<button class="copy-error" data-copy-error="${esc(job.id)}">Copy report</button>`;
     el.innerHTML = `
       <div>
         <strong>${friendlyStatus(job)}</strong>
         <p>${job.current ? `Song ${String(job.current).padStart(2, "0")}` : `${job.songs.length} songs`}${job.current_stage ? ` · ${job.current_stage}` : ""}</p>
         ${errorText}
-        <small>PID ${job.child_pid || job.pid || job.launch_pid || "—"}${job.exit_code != null ? ` · exit ${job.exit_code}` : ""}${job.termination ? ` · ${esc(job.termination)}` : ""}</small>
       </div>
       <span>${job.progress || 0}%</span>
     `;
     box.appendChild(el);
     const copyButton = el.querySelector("[data-copy-error]");
-    if (copyButton) copyButton.addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(fullError);
-        copyButton.textContent = "Copied";
-      } catch (_err) {
-        showToast("Could not copy the error text.");
-      }
-    });
-    if (["error", "partial_failed"].includes(job.status)) showToast(`${friendlyStatus(job)} — see details`);
+    if (copyButton) copyButton.addEventListener("click", () => copyJobReport(job, copyButton));
   });
 }
 
@@ -3713,9 +3770,7 @@ async function pollJobs() {
     // Keep the historical terminal set visible for compatibility: if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status))
     // pending_review is an additional successful-but-incomplete terminal state.
     if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status) || tracked && tracked.status === "pending_review") {
-      const terminalMessage = tracked.status === "error" || tracked.status === "partial_failed"
-        ? `Render failed: ${tracked.error || "see job details"}`
-        : tracked.status === "pending_review" ? `Rendered approved songs. Pending review: ${tracked.needs_review_songs?.join(", ") || "see details"}.` : tracked.status === "cancelled" ? "Render cancelled." : "Render completed.";
+      const terminalMessage = renderResultSummary(tracked);
       activeRenderJobId = null;
       setRenderControlsBusy(false);
       if (!["done"].includes(tracked.status)) showToast(terminalMessage);
@@ -3946,5 +4001,5 @@ if (typeof document !== "undefined") {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { parseSplitOffsetSeconds, parseSplitList };
+  module.exports = { parseSplitOffsetSeconds, parseSplitList, renderResultSummary, jobReportText };
 }
