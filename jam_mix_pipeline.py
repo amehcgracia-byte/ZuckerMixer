@@ -18,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 import time
@@ -563,6 +564,11 @@ def resolve_ffmpeg() -> str | None:
     global FFMPEG_PATH
     if FFMPEG_PATH and Path(FFMPEG_PATH).exists():
         return FFMPEG_PATH
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    for bundled in sorted(bundle_root.glob("ffmpeg*.exe")) + sorted(bundle_root.glob("ffmpeg*-*")):
+        if bundled.is_file():
+            FFMPEG_PATH = str(bundled)
+            return FFMPEG_PATH
     path = shutil.which("ffmpeg")
     if path:
         FFMPEG_PATH = path

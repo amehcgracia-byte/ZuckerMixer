@@ -270,6 +270,7 @@ fi
 
 if [[ "$SKIP_APP_BUILD" -eq 0 ]]; then
   rm -rf "$ROOT/build/pyinstaller" "$ROOT/dist"
+  "$BUILD_PY" "$ROOT/prepare_build.py"
   "$BUILD_PYINSTALLER" --noconfirm --clean --workpath "$ROOT/build/pyinstaller" --distpath "$ROOT/dist" "$ROOT/zucker_mixer.spec" || die "PyInstaller build failed"
 
   if [[ ! -d "$APP_BUNDLE" ]]; then

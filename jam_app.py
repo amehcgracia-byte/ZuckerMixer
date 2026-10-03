@@ -3204,41 +3204,33 @@ def _run_child_job(job_path: Path) -> int:
         return 0
 
     state = load_render_state()
-    # Last safety gate: validate every selected cut against the same cached,
-    # offset-aware timeline used by detection. A rejection blocks only that
-    # song; it never aborts the batch or creates a fake output.
+    # Audit warnings are diagnostic. Render the exact selected windows for
+    # every requested song; never silently rewrite cuts or omit a song.
     selected_segments = [state["segments"][segment_id - 1] for segment_id in songs]
     selected_numbers = [visible_index_for_segment(segment_id, state) for segment_id in songs]
-    final_timelines = pipeline.load_cached_timelines_or_die(state["stems"], "Final cut gate")
-    final_cut_audit = pipeline.validate_final_render_boundaries(
-        state["stems"], selected_segments, selected_numbers, final_timelines
-    )
+    try:
+        final_timelines = pipeline.load_cached_timelines_or_die(state["stems"], "Final cut audit")
+        final_cut_audit = pipeline.validate_final_render_boundaries(
+            state["stems"], selected_segments, selected_numbers, final_timelines
+        )
+    except Exception as exc:
+        final_cut_audit = [{"song": number, "safe": False, "needs_review": True,
+                            "reason": f"Boundary audit unavailable: {type(exc).__name__}: {exc}"}
+                           for number in selected_numbers]
     pipeline.DETECTION_STRATEGY["final_render_boundary_audit"] = final_cut_audit
-    review_rows = [row for row in final_cut_audit if row.get("needs_review")]
+    review_rows = [row for row in final_cut_audit if row.get("needs_review") or not row.get("safe")]
     accepted_rows = [row for row in final_cut_audit if row.get("safe")]
     corrected_segments = list(selected_segments)
-    for index, row in enumerate(final_cut_audit):
-        accepted = row.get("accepted_cut_seconds")
-        if not row.get("safe") or accepted is None:
-            continue
-        accepted = float(accepted)
-        if abs(accepted - corrected_segments[index].end) <= 1e-9:
-            continue
-        corrected_segments[index] = replace(corrected_segments[index], end=accepted, nominal_end=accepted, core_end=accepted)
-        if index + 1 < len(corrected_segments):
-            corrected_segments[index + 1] = replace(corrected_segments[index + 1], start=accepted, core_start=accepted)
-        row["applied_cut_seconds"] = accepted
-    approved_positions = {index for index, row in enumerate(final_cut_audit) if row.get("safe")}
-    append_log(job_id, f"Final cut gate: {len(accepted_rows)} approved, {len(review_rows)} needs review")
+    append_log(job_id, f"Final cut audit: {len(accepted_rows)} clear, {len(review_rows)} warnings; rendering all {len(songs)} selected songs unchanged")
     for row in review_rows:
-        append_log(job_id, f"Needs review: song {row.get('song')} — {row.get('reason')}; stems={row.get('active_instruments')}")
+        append_log(job_id, f"Rendering with warning: song {row.get('song')} — {row.get('reason')}")
     out_dir().mkdir(parents=True, exist_ok=True)
     diagnostic_job_dir = render_diagnostics_dir(job_id)
     append_log(job_id, "RENDER DIAGNOSTICS directory=" + str(diagnostic_job_dir))
     rows = []
     batch_errors: list[dict[str, Any]] = []
     for pos, (original_position, segment_id) in enumerate(
-        ((index, song_id) for index, song_id in enumerate(songs) if index in approved_positions), 1
+        enumerate(songs), 1
     ):
         child_job_id = f"{job_id}-song-{pos:02d}"
         render_index = visible_index_for_segment(segment_id, state)
@@ -3397,46 +3389,6 @@ def _run_child_job(job_path: Path) -> int:
             }
         )
         return 1
-    if review_rows:
-        summary = {
-            "requested": len(songs),
-            "started": len(rows),
-            "completed": len(rows),
-            "failed": 0,
-            "needs_review": len(review_rows),
-            "safe_songs": len(accepted_rows),
-            "review_songs": [row.get("song") for row in review_rows],
-            "songs": compact_batch_rows(rows),
-            "errors": [],
-        }
-        summary_path = diagnostic_job_dir / f"ZuckerMixer_batch_{job_id}_summary.json"
-        save_json_atomic(summary_path, {
-            "job_id": job_id,
-            "status": "pending_review",
-            "batch_summary": summary,
-            "final_cut_audit": final_cut_audit,
-            "commit": BUILD_METADATA.get("commit"),
-        })
-        app_progress({
-            "status": "pending_review",
-            "current": None,
-            "progress": 100,
-            "song_progress": 100,
-            "current_stage": "pending_review",
-            "stage_detail": "Rendered approved songs; pending review: " + ", ".join(str(row.get("song")) for row in review_rows),
-            "heartbeat": time.time(),
-            "done_count": sum(not row.get("error") for row in rows),
-            "total_count": len(songs),
-            "safe_count": len(accepted_rows),
-            "needs_review_count": len(review_rows),
-            "needs_review_songs": [row.get("song") for row in review_rows],
-            "needs_review_details": [
-                {"song": row.get("song"), "reason": row.get("reason"), "stems": row.get("active_instruments", [])}
-                for row in review_rows
-            ],
-            "batch_summary": summary,
-        })
-        return 0
     if len(rows) != len(songs):
         error_text = f"Render completed without all requested outputs ({len(rows)}/{len(songs)})."
         lifecycle_log("render_failed", job_id, error=error_text, stage="artifact_validation")
@@ -3452,13 +3404,7 @@ def _run_child_job(job_path: Path) -> int:
         })
         return 1
     lifecycle_log("render_completed", job_id, songs=len(rows), stage="artifact_validation")
-    batch_summary = {
-        "requested": len(songs),
-        "started": len(songs),
-        "completed": len(rows),
-        "failed": 0,
-        "songs": compact_batch_rows(rows),
-    }
+    batch_summary = render_batch_summary(len(songs), rows, batch_errors, review_rows)
     summary_path = diagnostic_job_dir / f"ZuckerMixer_batch_{job_id}_summary.json"
     save_json_atomic(summary_path, {"job_id": job_id, "status": "done", "batch_summary": batch_summary, "commit": BUILD_METADATA.get("commit")})
     app_progress(

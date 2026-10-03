@@ -90,6 +90,10 @@ if "--self-check" in sys.argv:
         import faster_whisper  # noqa: F401
     except Exception as exc:
         raise SystemExit(f"ZuckerMixer Whisper self-check failed: {type(exc).__name__}: {exc}")
+    pipeline.ensure_matchering_available()
+    if pipeline.matchering_api is None:
+        raise SystemExit(f"Matchering self-check failed: {pipeline.MATCHERING_IMPORT_ERROR}")
+    print("ZuckerMixer Matchering import self-check: OK", flush=True)
     print("ZuckerMixer frozen import self-check: OK", flush=True)
     print("ZuckerMixer bundled Whisper import self-check: OK", flush=True)
     raise SystemExit(0)
@@ -177,7 +181,7 @@ def main() -> None:
         if not pipeline.resolve_ffmpeg():
             window.create_confirmation_dialog(
                 "ffmpeg is missing",
-                "ZuckerMixer needs ffmpeg to create MP3 files.\n\nInstall it in Terminal with:\n\nbrew install ffmpeg",
+                ("ZuckerMixer needs ffmpeg to create MP3 files.\n\nInstall it in Terminal with:\n\nbrew install ffmpeg" if sys.platform == "darwin" else "FFmpeg is missing from the Windows package. Download the complete Windows ZIP and extract it before opening ZuckerMixer.exe."),
             )
 
     def on_closing() -> bool:
