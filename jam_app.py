@@ -10,7 +10,10 @@ import mimetypes
 import os
 import queue
 import re
-import resource
+try:
+    import resource
+except ImportError:  # Windows has no POSIX resource module.
+    resource = None
 import shutil
 import subprocess
 import sys
@@ -1602,7 +1605,7 @@ def request_cancel() -> None:
         # helper it spawned stop together. Escalate after two seconds: the UI
         # must never wait for a multi-minute DSP checkpoint.
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            signal_owned_process_group(proc)
             lifecycle_log("child_group_sigterm", job_id, child_pid=proc.pid)
         except ProcessLookupError:
             pass
@@ -1616,7 +1619,7 @@ def request_cancel() -> None:
         def escalate(target: subprocess.Popen[str] = proc, target_job_id: str = job_id) -> None:
             if target.poll() is None:
                 try:
-                    os.killpg(target.pid, signal.SIGKILL)
+                    signal_owned_process_group(target, force=True)
                     lifecycle_log("child_group_sigkill", target_job_id, child_pid=target.pid)
                 except ProcessLookupError:
                     pass
@@ -4225,7 +4228,7 @@ def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | N
             owned_child = child_processes.get(str(job.get("id")))
             if owned_child is not None and owned_child.poll() is None:
                 try:
-                    os.killpg(owned_child.pid, signal.SIGTERM)
+                    signal_owned_process_group(owned_child)
                 except ProcessLookupError:
                     pass
             finished_at = time.time()
@@ -4803,6 +4806,15 @@ def start_server(port: int | None = None) -> tuple[str, Any]:
     server_ref = server
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return f"http://{HOST}:{actual_port}", server
+
+
+def signal_owned_process_group(proc: subprocess.Popen, force: bool = False) -> None:
+    """Stop only an owned worker and its helpers on either desktop platform."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    else:
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
 
 
 def stop_server() -> None:
