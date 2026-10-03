@@ -22,6 +22,12 @@ class MasteringPreflightTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'reference file not found'):
                 p.validate_mastering_reference('/missing/reference.wav')
 
+    def test_status_loads_backend_before_reporting_unavailable(self):
+        with patch.object(p,'ensure_matchering_available') as load, patch.object(p,'matchering_api',object()):
+            result=jam_app.reference_mastering_status({'matchering_reference':'ref.wav'})
+            load.assert_called_once()
+            self.assertTrue(result['available'])
+
     def test_failed_attempts_are_counted_once_and_review_is_reported(self):
         rows=[{'index':1,'error':'bad'},{'index':2,'file':'ok.mp3'},{'index':3,'error':'bad'}]
         errors=[{'song':1,'error':'bad'},{'song':3,'error':'bad'}]

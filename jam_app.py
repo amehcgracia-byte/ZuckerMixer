@@ -305,6 +305,13 @@ def load_build_metadata() -> dict[str, str]:
 BUILD_METADATA = load_build_metadata()
 
 
+def reference_mastering_status(settings: dict[str, Any]) -> dict[str, Any]:
+    reference = settings.get("matchering_reference", "")
+    if reference:
+        pipeline.ensure_matchering_available()
+    return {"available": pipeline.matchering_api is not None, "import_error": pipeline.MATCHERING_IMPORT_ERROR, "reference": reference}
+
+
 def runtime_build_metadata() -> dict[str, str]:
     """Identify the exact frozen resources serving the current WebView."""
     payload = dict(BUILD_METADATA)
@@ -2130,11 +2137,7 @@ def public_state() -> dict[str, Any]:
         "detection_calibration": state.get("detection_calibration", {}),
         "slot_audit": slot_audit,
         "source_integrity": source_integrity,
-        "matchering": {
-            "available": pipeline.matchering_api is not None,
-            "import_error": pipeline.MATCHERING_IMPORT_ERROR,
-            "reference": settings.get("matchering_reference", ""),
-        },
+        "matchering": reference_mastering_status(settings),
         "build": runtime_build_metadata(),
     }
 
