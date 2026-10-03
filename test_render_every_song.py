@@ -5,9 +5,10 @@ import jam_app as app
 import jam_mix_pipeline as p
 
 @pytest.mark.parametrize('audit_fails',[False,True])
-def test_batch_attempts_warned_first_song_and_keeps_exact_windows(tmp_path,audit_fails):
-    segments=[p.Segment(0,20),p.Segment(20,40)]
-    job=tmp_path/'job.json';job.write_text('{"id":"all-songs-proof","kind":"render","songs":[1,2]}')
+@pytest.mark.parametrize('song_count',[2,27])
+def test_batch_attempts_warned_first_song_and_keeps_exact_windows(tmp_path,audit_fails,song_count):
+    segments=[p.Segment(i*20,(i+1)*20) for i in range(song_count)]
+    job=tmp_path/'job.json';job.write_text(__import__('json').dumps({'id':'all-songs-proof','kind':'render','songs':list(range(1,song_count+1))}))
     progress=[];attempts=[]
     def render(stems,segment,index,out,**kw):
         attempts.append((index,segment.start,segment.end))
@@ -25,10 +26,10 @@ def test_batch_attempts_warned_first_song_and_keeps_exact_windows(tmp_path,audit
         stack.enter_context(patch.object(p,'validate_final_render_boundaries',side_effect=RuntimeError('audit failed') if audit_fails else None,return_value=audit))
         stack.enter_context(patch.object(p,'render_segment',side_effect=render))
         assert app._run_child_job(job)==1
-    assert attempts==[(1,0,20),(2,20,40)]
-    assert progress[-1]['batch_summary']['started']==2
+    assert attempts==[(i+1,i*20,(i+1)*20) for i in range(song_count)]
+    assert progress[-1]['batch_summary']['started']==song_count
     assert progress[-1]['batch_summary']['failed']==1
-    assert progress[-1]['batch_summary']['completed']==1
+    assert progress[-1]['batch_summary']['completed']==song_count-1
 
 
 def test_worker_uses_persisted_editor_cuts_without_reapplying_legacy_selections():
