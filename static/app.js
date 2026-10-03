@@ -1272,10 +1272,10 @@ function fineTuneHtml(song) {
           </label>
           <div data-quick-controls="${song.id}">
           <div class="preview-label"><strong>Full song · approximate</strong> <span class="warn">Dynamics and mastering are approximated.</span></div>
-          <button data-preview-toggle="${song.id}" class="accent" disabled>Loading preview...</button>
+          <button data-preview-toggle="${song.id}" class="accent">Mix Preview</button>
           <input data-preview-seek="${song.id}" type="range" min="0" max="0" step="0.1" value="0" disabled>
           <span data-preview-time="${song.id}">00:00:00 / 00:00:00</span>
-          <span class="muted" data-preview-cache="${song.id}">Preview stems not loaded</span>
+          <span class="muted" data-preview-cache="${song.id}">Audio loads when you press Mix Preview</span>
           <span class="warn" data-preview-warning="${song.id}" hidden></span>
           </div>
           <div data-real-controls="${song.id}" hidden>
@@ -1313,13 +1313,12 @@ function wireFineTune(root, songIndex) {
     if (details.open) {
       await closeOtherFineTunePanels(details, songIndex);
       await loadActiveStemFaders(root, songIndex);
-      loadFullStemPreview(root, songIndex);
     } else {
       await stopPreviewMix(songIndex);
     }
   });
   if (details.open) {
-    loadActiveStemFaders(root, songIndex).then(() => loadFullStemPreview(root, songIndex));
+    loadActiveStemFaders(root, songIndex);
   }
   wireFineTuneControls(root, songIndex);
 }
@@ -2468,7 +2467,8 @@ async function loadFullStemPreview(root, songIndex) {
   }
   const existingMix = previewMixFor(songIndex);
   if (existingMix?.loaded || existingMix?.loading) {
-    if (status && existingMix.loading) status.textContent = "Loading tracks...";
+    if (existingMix.loaded) updatePreviewTransport(root, songIndex);
+    else if (status) status.textContent = "Loading tracks...";
     return existingMix;
   }
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
