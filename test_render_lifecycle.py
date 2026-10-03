@@ -92,12 +92,12 @@ class RenderLifecycleTest(unittest.TestCase):
         self.assertIn("async function ensureRenderPlans(songIds)", frontend)
         self.assertNotIn("await ensureRenderPlans(requestedSongs)", frontend)
         self.assertIn('await postOverrides("before-render")', frontend)
-        self.assertIn('"lightweight_render": True', backend)
+        self.assertNotIn('"lightweight_render": True', backend)
 
     def test_worker_uses_frozen_persisted_plan_when_ui_snapshot_lacks_auto_stems(self):
         backend = (ROOT / "jam_app.py").read_text(encoding="utf-8")
-        self.assertIn("authoritative_payload = normalize_overrides", backend)
-        self.assertIn("prepared_mix = load_mix_plan(segment_id, state_snapshot=state)", backend)
+        self.assertIn("selected_payload = disk_payload if use_saved_mixes", backend)
+        self.assertIn("prepared_mix = canonical_mix_params_for_song(segment_id, state_snapshot=state", backend)
 
     def test_partial_failure_exposes_batch_error_and_worker_identity(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")

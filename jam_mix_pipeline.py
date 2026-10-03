@@ -159,17 +159,11 @@ STEM_ACTIVITY_ROLE_OVERRIDES = {
 }
 MAX_TRACK_MAKEUP_GAIN_DB = 30.0
 MAX_DRUM_MAKEUP_GAIN_DB = 36.0
-# Automatic mixing establishes relative balance only. It may attenuate a
-# stem, but it must never boost a source without an explicit user value.
+# Automatic corrections are per song. Quiet guitar and kit recovery is bounded;
+# inactive inputs never receive the recovery or set the musical reference.
 AUTO_MIX_MAX_BOOST_DB = 0.0
-# Auto-Mix may make a small, explicit correction only for roles where a quiet
-# capture would otherwise disappear. All other roles can only be attenuated
-# automatically. These limits are per song, never session-global.
-AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0, "flute": 2.0, "horn": 1.5, "sax": 1.5}
-# Deliberate first-pass guitar trim: guitars were repeatedly masking vocals
-# in the user's real sessions. This is applied before per-song caps and is
-# included in the analysis signature so old plans cannot survive unnoticed.
-AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -4.5}
+AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0, "flute": 2.0, "horn": 1.5, "sax": 1.5, "guitar": 4.0, "kick": 3.0, "snare": 3.0, "hh": 3.0, "overhead": 3.0, "drums": 3.0}
+AUTO_MIX_ROLE_TRIMS_DB = {}
 # Versioned role profiles keep EQ, dynamics, hierarchy and effects auditable.
 # These are starting points only; the per-song analysis below can trim them
 # within bounded limits, and explicit user overrides remain authoritative.
@@ -190,7 +184,7 @@ ROLE_COMPRESSOR_PROFILES = {
     "sax": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 120.0},
     "flute": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 120.0},
 }
-AUTO_MIX_PROFILE_VERSION = 8
+AUTO_MIX_PROFILE_VERSION = 9
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -6105,6 +6099,54 @@ def per_song_auto_mix_gain_db(
     return float(np.clip(requested, AUTO_MIX_MAX_ATTENUATION_DB, upper))
 
 
+def per_song_rhythm_harmonic_gains(
+    roles: dict[str, str], levels: dict[str, float], envelopes: dict[str, np.ndarray] | None = None,
+) -> dict[str, object]:
+    """Balance this song's kit as a group against its audible musical parts.
+
+    Quiet/unused inputs do not set the reference or receive automatic lifts.
+    These are automatic gains only; confirmed user controls are applied later.
+    """
+    drum_offsets = {"kick": -1.0, "snare": -2.0, "hh": -8.0, "overhead": -6.0, "drums": -4.0}
+    melodic_roles = {"guitar", "keys", "keys_l", "keys_r", "bass", "horn", "sax", "flute", "synth"}
+    def audible(name: str) -> bool:
+        level = float(levels.get(name, -120.0))
+        if not np.isfinite(level) or level <= -70.0:
+            return False
+        if envelopes is None:
+            return True
+        env = np.asarray(envelopes.get(name, []), dtype=float)
+        return np.count_nonzero(np.isfinite(env) & (env > db_to_amp(-70.0))) >= 4
+    musical_groups: dict[str, list[float]] = {}
+    for name, role in roles.items():
+        if role in melodic_roles and audible(name):
+            group = "keys" if role in {"keys", "keys_l", "keys_r"} else role
+            musical_groups.setdefault(group, []).append(float(levels[name]))
+    reference_values = [float(np.median(values)) for values in musical_groups.values()]
+    if not reference_values:
+        reference_values = [float(levels[name]) for name, role in roles.items() if role == "vocal" and audible(name)]
+    reference = float(np.median(reference_values)) if reference_values else None
+    gains: dict[str, float] = {}
+    for name, role in roles.items():
+        if role not in drum_offsets and role != "guitar":
+            continue
+        if not audible(name):
+            gains[name] = 0.0
+            continue
+        if reference is None:
+            continue
+        target = reference + drum_offsets.get(role, -0.5)
+        gains[name] = float(np.clip(target - float(levels[name]), -24.0 if role in drum_offsets else -12.0, AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(role, 0.0)))
+    drum_names = [name for name, role in roles.items() if role in drum_offsets and audible(name) and name in gains]
+    drum_level = group_active_level_db(drum_names, {name: float(levels[name]) + gains[name] for name in drum_names})
+    kit_trim = -max(0.0, float(drum_level) - (reference - 1.0)) if drum_level is not None and reference is not None else 0.0
+    for name in drum_names:
+        gains[name] += kit_trim
+    return {"gains_db": gains, "reference_db": reference, "kit_level_before_bus_db": drum_level,
+            "kit_trim_db": kit_trim, "kit_level_after_bus_db": None if drum_level is None else drum_level + kit_trim,
+            "method": "independent per-song active musical reference, bounded quiet-part recovery, combined kit power ceiling"}
+
+
 def vocal_pair_key(name: str) -> str:
     """Return a stable logical pair key without changing channel panning."""
     low = re.sub(r"\.[^.]+$", "", str(name or "")).lower()
@@ -6240,7 +6282,10 @@ def per_song_role_balance_corrections(
     for role, names in role_groups.items():
         level = role_levels[role]
         overlap = group_overlap(names)
-        if vocal_level is None or level is None or overlap < 0.25:
+        if role == "bass":
+            correction = 0.0
+            reason = "bass follows kick balance, independently of vocal masking"
+        elif vocal_level is None or level is None or overlap < 0.25:
             correction = 0.0
             reason = "no reliable vocal overlap evidence"
         else:
@@ -7630,6 +7675,7 @@ def analyze_song_mix_controls(
     active_levels_db = active_levels_db or dict(rms_values_db)
     balance = vocal_harmonic_balance(effective_roles, active_levels_db, segment_envelopes)
     role_balance = per_song_role_balance_corrections(effective_roles, active_levels_db, segment_envelopes)
+    rhythm_harmonic_balance = per_song_rhythm_harmonic_gains(effective_roles, active_levels_db, segment_envelopes)
     effect_profile = per_song_effect_profile(
         effective_roles,
         active_levels_db,
@@ -7661,6 +7707,7 @@ def analyze_song_mix_controls(
         "bpm_confidence": bpm_confidence,
         "mic_content": mic_content,
         "effective_roles": effective_roles,
+        "rhythm_harmonic_balance": rhythm_harmonic_balance,
         "rhythm": rhythm,
         "harmonic": harmonic,
         "vocal_priority": priority,
@@ -7671,6 +7718,7 @@ def analyze_song_mix_controls(
         "effect_profile": effect_profile,
         "automatic_mix_profile": {
             "version": AUTO_MIX_PROFILE_VERSION,
+            "rhythm_harmonic_balance": rhythm_harmonic_balance,
             "mic_pair_balance": role_balance.get("vocal_pair_diagnostics", {}),
             "content_adaptive_mic_eq": True,
             "content_adaptive_mic_role": True,
@@ -7708,6 +7756,18 @@ def spectral_centroid(x: np.ndarray, sr: int) -> float:
     f, _, z = signal.stft(x, fs=sr, nperseg=2048, noverlap=1024)
     mag = np.abs(z)
     return float(np.sum(f[:, None] * mag) / (np.sum(mag) + 1e-9))
+
+
+def analysis_window_offset(cache: dict, segment: Segment, song_id: int, preview_window: dict | None = None) -> float:
+    selection = cache.get("selection", {})
+    start, end = float(selection.get("start_sec", -1)), float(selection.get("end_sec", -1))
+    if int(cache.get("song_id", -1)) != int(song_id):
+        raise RuntimeError("Analysis snapshot belongs to another song.")
+    if abs(start - segment.start) <= 1e-6 and abs(end - segment.end) <= 1e-6:
+        return 0.0
+    if isinstance(preview_window, dict) and start <= segment.start < segment.end <= end and abs(float(preview_window.get("start_sec", -1)) - segment.start) <= 1e-6 and abs(float(preview_window.get("end_sec", -1)) - segment.end) <= 1e-6:
+        return segment.start - start
+    raise RuntimeError("Analyze required: analysis snapshot does not match the selected song window.")
 
 
 def render_segment(
@@ -7750,61 +7810,19 @@ def render_segment(
             }
         )
 
-    lightweight_render = bool(isinstance(prepared_plan, dict) and prepared_plan.get("lightweight_render"))
-    if lightweight_render:
-        # Fast render fallback: use current controls and conservative defaults.
-        # It never scans source audio, runs Whisper, computes thresholds, or
-        # rebuilds Auto-Mix. The full analysis remains an explicit Analyze step.
-        names = [stem.path.name for stem in stems]
-        analysis_cache = {
-            "version": 2,
-            "song_id": int(index),
-            "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
-            "rms_values_db": {name: -30.0 for name in names},
-            "energies": {name: 1.0 for name in names},
-            "has_audio": {name: True for name in names},
-            "dynamic_spread_db": {name: 0.0 for name in names},
-            "segment_envelopes": {name: np.array([], dtype=np.float32) for name in names},
-            "segment_peaks_db": {name: -6.0 for name in names},
-            "role_norms_db": {},
-            "mix_controls": {
-                "effective_roles": {name: stem.role for name, stem in zip(names, stems)},
-                "rhythm": {},
-                "harmonic": {},
-                "vocal_priority": {},
-                "vocal_group_gain": {},
-                "vocal_pair_keys": {},
-                "mic_content": {},
-                "balance": {},
-                "bpm": 0.0,
-            },
-            "noise_diagnostics": {},
-            "flattening": {},
-            "drum_bpm": (0.0, 0.0),
-        }
-        print(f"RENDER ANALYSIS CACHE: lightweight settings snapshot for song {index}", flush=True)
-    else:
-        if not isinstance(prepared_plan, dict):
-            raise RuntimeError("Render did not receive a usable settings snapshot.")
-        cache_path_value = prepared_plan.get("analysis_cache_path")
-        cache_signature = prepared_plan.get("analysis_cache_signature")
-        if not cache_path_value or not cache_signature:
-            raise RuntimeError("Render analysis snapshot is incomplete.")
-        cache_path = Path(str(cache_path_value))
-        try:
-            with cache_path.open("rb") as cache_file:
-                analysis_cache = load_analysis_cache(cache_path)
-        except Exception as exc:
-            raise RuntimeError(f"Render analysis snapshot is unavailable: {exc}") from exc
-        if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
-            raise RuntimeError("Render analysis snapshot version is unsupported.")
-    cached_selection = analysis_cache.get("selection", {})
-    if (
-        int(analysis_cache.get("song_id", index)) != int(index)
-        or abs(float(cached_selection.get("start_sec", -1.0)) - float(segment.start)) > 1e-6
-        or abs(float(cached_selection.get("end_sec", -1.0)) - float(segment.end)) > 1e-6
-    ):
-        raise RuntimeError("Analyze required: analysis snapshot does not match the selected song window.")
+    if not isinstance(prepared_plan, dict):
+        raise RuntimeError("Render requires an independent per-song analysis snapshot.")
+    cache_path_value = prepared_plan.get("analysis_cache_path")
+    cache_signature = prepared_plan.get("analysis_cache_signature")
+    if not cache_path_value or not cache_signature:
+        raise RuntimeError("Render analysis snapshot is incomplete.")
+    try:
+        analysis_cache = load_analysis_cache(Path(str(cache_path_value)))
+    except Exception as exc:
+        raise RuntimeError(f"Render analysis snapshot is unavailable: {exc}") from exc
+    if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
+        raise RuntimeError("Render analysis snapshot version is unsupported.")
+    analysis_offset_seconds = analysis_window_offset(analysis_cache, segment, index, prepared_plan.get("preview_window"))
     rms_values_db = analysis_cache.get("rms_values_db", {})
     energies = analysis_cache.get("energies", {})
     has_audio = analysis_cache.get("has_audio", {})
@@ -8042,6 +8060,7 @@ def render_segment(
             AUTO_MIX_MAX_ATTENUATION_DB,
             AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
         ))
+        computed_makeup_gain_db = float(mix_controls.get("rhythm_harmonic_balance", {}).get("gains_db", {}).get(stem.path.name, computed_makeup_gain_db))
         if not override_bool(overrides.get("manual_makeup_gain_db"), False):
             computed_makeup_gain_db = automatic_drum_peak_guard_gain_db(
                 mix_role, computed_makeup_gain_db, segment_peaks_db.get(stem.path.name, -120.0)
@@ -8371,7 +8390,7 @@ def render_segment(
                                 neginf=0.0,
                             )
                             flatten_curve = np.clip(flatten_curve, 0.0, 4.0)
-                            curve_positions = np.arange(len(chunk), dtype=np.float64) / max(1, stem.samplerate) + chunk_start / max(1, stem.samplerate)
+                            curve_positions = np.arange(len(chunk), dtype=np.float64) / max(1, stem.samplerate) + chunk_start / max(1, stem.samplerate) + analysis_offset_seconds
                             curve = np.interp(curve_positions, np.arange(len(flatten_curve), dtype=np.float64) * DETECTION_FRAME_SECONDS, flatten_curve, left=float(flatten_curve[0]), right=float(flatten_curve[-1]))
                             if chunk.ndim == 2:
                                 chunk = (np.asarray(chunk, dtype=np.float64) * curve[:, None]).astype(np.float32)
@@ -8411,7 +8430,7 @@ def render_segment(
                         if fx_enabled and bool(settings.get("gate_enabled", False)) and processing_role != "vocal":
                             gate = settings.get("section_gate")
                             if isinstance(gate, np.ndarray):
-                                gain = section_gate_for_chunk(gate, stem.samplerate, chunk_start, len(y))
+                                gain = section_gate_for_chunk(gate, stem.samplerate, chunk_start + int(round(analysis_offset_seconds * stem.samplerate)), len(y))
                                 if y.ndim == 2:
                                     y *= gain[:, None]
                                 else:

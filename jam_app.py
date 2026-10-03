@@ -406,7 +406,7 @@ def active_stems_for_segment(stems: list[pipeline.Stem], segment: pipeline.Segme
     return [stem.path.name for stem in stems]
 
 
-MIX_PLAN_VERSION = 12
+MIX_PLAN_VERSION = 13
 
 
 def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
@@ -555,21 +555,21 @@ def song_analysis_snapshot(state: dict, segment: pipeline.Segment, segment_id: i
         return result
 
 
-def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
-    state = ensure_pipeline_state()
+def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | None = None, overrides_snapshot: dict | None = None) -> dict[str, Any]:
+    state = state_snapshot if isinstance(state_snapshot, dict) else ensure_pipeline_state()
     if segment_id < 1 or segment_id > len(state["segments"]):
         raise IndexError("song not found")
     if state.get("active_stems_detection_version") != ACTIVE_STEM_DETECTION_VERSION:
         state["active_stems_by_song"] = {}
         state["active_stems_detection_version"] = ACTIVE_STEM_DETECTION_VERSION
-    current_plan = load_mix_plan(segment_id, state_snapshot=state)
+    current_plan = load_mix_plan(segment_id, state_snapshot=state, overrides_snapshot=overrides_snapshot)
     if isinstance(current_plan, dict):
         state.setdefault("active_stems_by_song", {})[str(segment_id)] = current_plan["active_stems"]
         return current_plan
     cache = state.setdefault("active_stems_by_song", {})
     key = str(segment_id)
     active_files: set[str] = set()
-    overrides = normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}}))
+    overrides = normalize_overrides(overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}}))
     songs_payload = overrides.setdefault("songs", {})
     stale_song_ids = []
     for raw_id in list(songs_payload):
@@ -584,7 +584,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         print(f"STALE OVERRIDES DROPPED: source={pipeline.SOURCE_DIR} song_ids={stale_song_ids}", flush=True)
         append_log("system", f"Ignored stale per-song overrides after re-detection: {', '.join(stale_song_ids)}")
         overrides["_write_trace"] = override_write_trace(overrides)
-        save_json(OVERRIDES_PATH, overrides)
+        if overrides_snapshot is None:
+            save_json(OVERRIDES_PATH, overrides)
     song_overrides = songs_payload.setdefault(str(segment_id), {})
     changed = False
     stems_overrides = song_overrides.get("stems", {}) if isinstance(song_overrides, dict) else {}
@@ -673,6 +674,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             pipeline.AUTO_MIX_MAX_ATTENUATION_DB,
             pipeline.AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, pipeline.AUTO_MIX_MAX_BOOST_DB),
         ))
+        computed_gain_db = float(mix_controls.get("rhythm_harmonic_balance", {}).get("gains_db", {}).get(stem.path.name, computed_gain_db))
+        computed_gain_db = pipeline.automatic_drum_peak_guard_gain_db(mix_role, computed_gain_db, segment_peaks.get(stem.path.name, -120.0))
         lead_bonus = 1.5 if energies.get(stem.path.name, 0.0) > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
         if "makeup_gain_db" not in stem_ov and "gain_db" in stem_ov and fader_trusted:
             stem_ov["makeup_gain_db"] = user_gain_db
@@ -774,7 +777,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "computed_gain_db": computed_gain_db,
             "active_level_db": active_level,
             "accompaniment_reference_db": accompaniment_reference_db,
-            "automatic_gain_reason": "per-song active-envelope balance",
+            "automatic_gain_reason": "per-song kit and guitar balance" if stem.path.name in mix_controls.get("rhythm_harmonic_balance", {}).get("gains_db", {}) else "per-song active-envelope balance",
             "automatic_fader_db": computed_gain_db,
             "automatic_gain_before_vocal_mic_lift_db": computed_gain_before_lift_db,
             "automatic_vocal_mic_lift_db": pipeline.AUTOMATIC_VOCAL_MIC_LIFT_DB if mix_role == "vocal" else 0.0,
@@ -837,7 +840,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     if "master_db" not in song_overrides:
         song_overrides["master_db"] = 0.0
         changed = True
-    if changed:
+    if changed and overrides_snapshot is None:
         overrides["_write_trace"] = override_write_trace(overrides)
         save_json(OVERRIDES_PATH, overrides)
     plan = {
@@ -855,10 +858,11 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "automatic_mix_profile": automatic_mix_profile,
             "effect_profile": effect_profile,
             "guitar_original_level_db": role_balance.get("guitar_original_level_db"),
-            "guitar_reduction_db": role_balance.get("guitar_reduction_db", 0.0),
-            "guitar_reduction_reason": role_balance.get("guitar_reduction_reason", "no reliable vocal overlap evidence"),
+            "rhythm_harmonic_balance": mix_controls.get("rhythm_harmonic_balance", {}),
+            "guitar_reduction_db": min((float(value) for name, value in mix_controls.get("rhythm_harmonic_balance", {}).get("gains_db", {}).items() if effective_roles.get(name) == "guitar"), default=float(role_balance.get("guitar_reduction_db", 0.0))),
+            "guitar_reduction_reason": "individual song balance against musical reference" if mix_controls.get("rhythm_harmonic_balance") else role_balance.get("guitar_reduction_reason", "no reliable vocal overlap evidence"),
         },
-        "auto_mix_method": "per-song content-aware mic pair balance plus active-envelope vocal/harmonic overlap",
+        "auto_mix_method": "independent song analysis, combined kit power balance and guitar recovery; confirmed controls applied last",
         "stems": stem_params,
     }
     plan_signature = mix_plan_signature(segment_id, segment, song_overrides)
@@ -2773,21 +2777,22 @@ def apply_overrides_for_song(
     state_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = state_snapshot if isinstance(state_snapshot, dict) else load_render_state()
-    prepared_mix = load_mix_plan(segment_id, overrides_snapshot=overrides_snapshot, state_snapshot=state)
-    authoritative_payload = None
-    if prepared_mix is None and isinstance(overrides_snapshot, dict):
-        # A batch snapshot may omit automatic stem fields for a song that was
-        # never open in the UI. Do not recalculate anything in Render: fall
-        # back only to the frozen plan and persisted overrides validated by
-        # Analyze. A stale persisted plan still fails below.
-        authoritative_payload = normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}}))
-        prepared_mix = load_mix_plan(segment_id, state_snapshot=state)
+    disk_payload = overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}})
+    selected_payload = disk_payload if use_saved_mixes else {"songs": {}}
+    prepared_mix = load_mix_plan(segment_id, overrides_snapshot=selected_payload, state_snapshot=state)
     if not isinstance(prepared_mix, dict):
-        # Render uses the current controls immediately when an optional heavy
-        # Analyze snapshot is absent or stale. Analyze remains explicit and is
-        # never started implicitly from a Render click.
-        prepared_mix = {"lightweight_render": True, "song": int(segment_id)}
-    disk_payload = authoritative_payload or (overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}}))
+        app_progress({"current_stage": "analyzing", "stage_detail": f"Preparing independent mix for song {segment_id}", "heartbeat": time.time()})
+        analysis_finished = threading.Event()
+        def analysis_heartbeat() -> None:
+            while not analysis_finished.wait(2.0):
+                app_progress({"heartbeat": time.time()})
+        heartbeat_thread = threading.Thread(target=analysis_heartbeat, daemon=True, name="song-analysis-heartbeat")
+        heartbeat_thread.start()
+        try:
+            prepared_mix = canonical_mix_params_for_song(segment_id, state_snapshot=state, overrides_snapshot=selected_payload)
+        finally:
+            analysis_finished.set()
+            heartbeat_thread.join(timeout=0.2)
     write_trace = disk_payload.get("_write_trace", {}) if isinstance(disk_payload, dict) else {}
     overrides = normalize_overrides(disk_payload)
     source_song = overrides.get("songs", {}).get(str(segment_id), {}) if use_saved_mixes else {}
@@ -2804,7 +2809,17 @@ def apply_overrides_for_song(
     verify_trace: dict[str, Any] = {}
     write_song_trace = write_trace.get(str(segment_id), {}) if isinstance(write_trace, dict) else {}
     changed = []
-    stems = source_song.get("stems", {}) if isinstance(source_song, dict) else {}
+    stems = source_song.setdefault("stems", {}) if isinstance(source_song, dict) else {}
+    for stem_name, prepared_stem in prepared_mix.get("stems", {}).items():
+        settings = stems.setdefault(stem_name, {})
+        for key in ("pan", "eq_low_cut_hz", "eq_mid_gain_db", "eq_air_gain_db", "space_enabled", "echo_enabled", "gate_enabled", "fx_enabled", "reverb_send_db", "delay_send_db"):
+            settings.setdefault(key, prepared_stem.get(key))
+        if not bool(settings.get("effects_user_confirmed", False)):
+            for effect in ("space_enabled", "echo_enabled"):
+                if effect in prepared_stem:
+                    settings[effect] = prepared_stem[effect]
+        settings["fader_db"] = prepared_stem.get("user_fader_db", 0.0)
+        settings["gain_db"] = prepared_stem.get("user_gain_db", 0.0)
     if isinstance(stems, dict):
         for stem_name, settings in stems.items():
             if not isinstance(settings, dict):
@@ -2914,7 +2929,7 @@ def normalize_overrides(payload: Any) -> dict[str, Any]:
                             clean_stem[key] = float(stem_payload[key])
                         except (TypeError, ValueError):
                             continue
-                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "effects_user_confirmed", "manual_makeup_gain_db"):
+                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "effects_user_confirmed", "manual_makeup_gain_db", "user_confirmed", "user_fader_confirmed"):
                     if isinstance(stem_payload.get(key), bool):
                         clean_stem[key] = stem_payload[key]
                 if clean_stem:
@@ -3116,6 +3131,7 @@ def _run_child_job(job_path: Path) -> int:
             "heartbeat": time.time(),
         })
         prepared_plan = apply_overrides_for_song(song_id, song_id, state_snapshot=state)
+        prepared_plan = {**prepared_plan, "preview_window": {"start_sec": preview_segment.start, "end_sec": preview_segment.end}}
         render_started = time.perf_counter()
         pipeline.render_segment(
             state["stems"],
@@ -4028,7 +4044,7 @@ def api_mix_plan_status(segment_id: int) -> Response:
     """Report whether the frozen per-song DSP plan is usable for Render.
 
     This is deliberately read-only: Render may ask whether preparation is
-    required, but it must never start Analyze implicitly in the worker.
+    required. A worker prepares a missing per-song analysis before mixing.
     """
     try:
         state = load_render_state()
