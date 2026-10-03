@@ -1345,7 +1345,7 @@ async function loadActiveStemFaders(root, songIndex) {
       const reason = balance.guitar_reduction_reason || "no reliable vocal overlap evidence";
       const summary = root.querySelector(`[data-auto-mix-balance="${songIndex}"]`);
       if (summary && Number.isFinite(Number(guitar))) {
-        summary.textContent = `Auto-Mix guitars: original ${Number(original).toFixed(1)} dB · reduction ${Number(guitar).toFixed(1)} dB · ${reason}`;
+        summary.textContent = `Auto-Mix guitars: original ${Number(original).toFixed(1)} dB · balance ${signedDb(guitar)} · ${reason}`;
       }
     }
     renderFaders(root, songIndex);
