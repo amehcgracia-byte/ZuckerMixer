@@ -63,7 +63,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,
+    console=os.environ.get("ZUCKER_BUILD_CONSOLE") == "1",
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

@@ -5,6 +5,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      artifact_run:
+        description: Existing successful build run to attach to the draft release
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -12,6 +17,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test-suite:
+    if: inputs.artifact_run == ''
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
@@ -79,3 +85,27 @@ jobs:
           cd release
           sha256sum *.dmg *.zip > SHA256SUMS.txt
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "ZuckerMixer $GITHUB_REF_NAME" --notes-file ../CHANGELOG.md ./*
+
+  attach-draft:
+    if: github.event_name == 'workflow_dispatch' && inputs.artifact_run != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.artifact_run }}
+          github-token: ${{ github.token }}
+          path: release
+          merge-multiple: true
+      - name: Attach verified packages, source and checksums to existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(cat VERSION | tr -d '[:space:]')"
+          git archive --format=zip --prefix=ZuckerMixer/ -o "release/ZuckerMixer-$VERSION-source.zip" HEAD
+          cd release
+          sha256sum *.dmg *.zip > SHA256SUMS.txt
+          gh release upload "v$VERSION" --repo "$GITHUB_REPOSITORY" --clobber ./*
