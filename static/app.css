@@ -1018,3 +1018,13 @@ body.loading-mode #loadingStatus { display: none !important; }
 .progress-box.success { border-color: #4bba75; }
 .progress-box.success #currentWork { color: #70dc95; }
 .progress-box.warning #currentWork { color: #efbd70; }
+
+/* Shared dismiss controls remain visible above the content. */
+dialog { position: fixed; padding-top: 42px; }
+.dialog-close { position: absolute; right: 10px; top: 8px; z-index: 100; font-size: 24px; line-height: 1; min-width: 34px; padding: 6px; }
+.message-dialog { max-width: min(560px, 88vw); background: var(--card2); color: var(--cream); border: 1px solid var(--line); border-radius: 14px; }
+.message-dialog::backdrop { background: #0009; }
+#mixChoiceDialog > .dialog-close { width: 34px; background: var(--card2); color: var(--cream); }
+.message-dialog p { white-space: pre-wrap; }
+.toast.show { display: flex; align-items: start; gap: 12px; }
+.toast button { margin-left: auto; font-size: 20px; line-height: 1; padding: 2px 6px; }

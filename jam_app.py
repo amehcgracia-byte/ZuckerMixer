@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 import soundfile as sf
-from flask import Flask, Response, jsonify, render_template, request, send_file
+from flask import Flask, Response, g, jsonify, render_template, request, send_file
 from werkzeug.serving import make_server
 
 import jam_mix_pipeline as pipeline
@@ -305,11 +305,48 @@ def load_build_metadata() -> dict[str, str]:
 BUILD_METADATA = load_build_metadata()
 
 
+reference_backend_thread: threading.Thread | None = None
+reference_backend_lock = threading.Lock()
+
+
 def reference_mastering_status(settings: dict[str, Any]) -> dict[str, Any]:
+    global reference_backend_thread
     reference = settings.get("matchering_reference", "")
-    if reference:
-        pipeline.ensure_matchering_available()
-    return {"available": pipeline.matchering_api is not None, "import_error": pipeline.MATCHERING_IMPORT_ERROR, "reference": reference}
+    if reference and pipeline.matchering_api is None and not pipeline.MATCHERING_IMPORT_ERROR:
+        with reference_backend_lock:
+            if reference_backend_thread is None:
+                reference_backend_thread = threading.Thread(target=pipeline.ensure_matchering_available, daemon=True, name="reference-backend-load")
+                reference_backend_thread.start()
+    loading = bool(reference_backend_thread and reference_backend_thread.is_alive())
+    return {"available": pipeline.matchering_api is not None, "loading": loading, "import_error": pipeline.MATCHERING_IMPORT_ERROR, "reference": reference}
+
+
+request_timings: dict[str, list[float]] = {}
+request_timings_lock = threading.Lock()
+
+
+@app.before_request
+def start_request_timer() -> None:
+    g.request_started = time.perf_counter()
+
+
+@app.after_request
+def finish_request_timer(response: Response) -> Response:
+    duration = (time.perf_counter() - g.request_started) * 1000
+    response.headers["Server-Timing"] = f"app;dur={duration:.2f}"
+    if request.path.startswith("/api/"):
+        key = request.url_rule.rule if request.url_rule else request.path
+        with request_timings_lock:
+            values = request_timings.setdefault(key, [])
+            values.append(round(duration, 2))
+            del values[:-100]
+    return response
+
+
+@app.get("/api/performance")
+def api_performance() -> Response:
+    with request_timings_lock:
+        return jsonify({key: {"requests": len(values), "last_ms": values[-1], "mean_ms": round(sum(values) / len(values), 2), "max_ms": max(values)} for key, values in request_timings.items() if values})
 
 
 def runtime_build_metadata() -> dict[str, str]:
@@ -379,7 +416,9 @@ def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_override
         "start_sec": round(float(segment.start), 6),
         "end_sec": round(float(segment.end), 6),
         "overrides": song_overrides,
-        "dsp_revision": BUILD_METADATA.get("source_revision", "development"),
+        "dsp_revision": MIX_PLAN_VERSION,
+        "source_identity": detection_state_signature(),
+        "source_config": load_source_config(),
         "auto_mix_profile": getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -483,6 +522,39 @@ def persisted_fader_values(stem_ov: dict[str, Any]) -> tuple[float, float, bool]
     return (raw if trusted else 0.0, raw if not trusted else 0.0, trusted)
 
 
+analysis_snapshot_lock = threading.RLock()
+
+
+def song_analysis_snapshot(state: dict, segment: pipeline.Segment, segment_id: int) -> dict:
+    signature = mix_plan_signature(segment_id, segment, {})
+    path = ACTIVE_SOURCE_STATE_ROOT / f"song_analysis_{segment_id}_{signature}.npz"
+    with analysis_snapshot_lock:
+        if path.is_file():
+            try:
+                cached = pipeline.load_analysis_cache(path)
+            except (OSError, ValueError, RuntimeError):
+                cached = None
+            if isinstance(cached, dict) and cached.get("input_signature") == signature:
+                return cached
+        sr = state["stems"][0].samplerate
+        rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr)
+        role_norms_db = pipeline.role_norms_from_detection_cache(state["stems"])
+        mix_controls = pipeline.analyze_song_mix_controls(state["stems"], segment, sr, rms_values_db, role_norms_db, active_levels_db={name: pipeline.active_level_db(rms_values_db.get(name, -120.0), env) for name, env in segment_envelopes.items()}, segment_envelopes=segment_envelopes)
+        result = {
+            "version": 2, "song_id": int(segment_id), "input_signature": signature,
+            "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
+            "rms_values_db": rms_values_db, "energies": energies, "has_audio": has_audio,
+            "dynamic_spread_db": dynamic_spread_db, "segment_envelopes": segment_envelopes,
+            "segment_peaks_db": segment_peaks, "role_norms_db": role_norms_db, "mix_controls": mix_controls,
+            "mix_profile_version": getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1),
+            "noise_diagnostics": pipeline.classify_noise_stems(state["stems"], segment, sr),
+            "flattening": pipeline.build_per_song_flattening(segment_envelopes),
+            "drum_bpm": pipeline.estimate_segment_drum_bpm(state["stems"], segment, sr),
+        }
+        pipeline.save_analysis_cache(path, result)
+        return result
+
+
 def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     state = ensure_pipeline_state()
     if segment_id < 1 or segment_id > len(state["segments"]):
@@ -490,6 +562,10 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     if state.get("active_stems_detection_version") != ACTIVE_STEM_DETECTION_VERSION:
         state["active_stems_by_song"] = {}
         state["active_stems_detection_version"] = ACTIVE_STEM_DETECTION_VERSION
+    current_plan = load_mix_plan(segment_id, state_snapshot=state)
+    if isinstance(current_plan, dict):
+        state.setdefault("active_stems_by_song", {})[str(segment_id)] = current_plan["active_stems"]
+        return current_plan
     cache = state.setdefault("active_stems_by_song", {})
     key = str(segment_id)
     active_files: set[str] = set()
@@ -519,20 +595,15 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     segment = state["segments"][segment_id - 1]
     musician_labels = dict(segment.musician_labels)
     sr = state["stems"][0].samplerate
-    rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr)
-    role_norms_db = pipeline.role_norms_from_detection_cache(state["stems"])
-    mix_controls = pipeline.analyze_song_mix_controls(
-        state["stems"],
-        segment,
-        sr,
-        rms_values_db,
-        role_norms_db,
-        active_levels_db={
-            name: pipeline.active_level_db(rms_values_db.get(name, -120.0), segment_envelopes.get(name))
-            for name in segment_envelopes
-        },
-        segment_envelopes=segment_envelopes,
-    )
+    analysis_cache = song_analysis_snapshot(state, segment, segment_id)
+    rms_values_db = analysis_cache["rms_values_db"]
+    energies = analysis_cache["energies"]
+    has_audio = analysis_cache["has_audio"]
+    dynamic_spread_db = analysis_cache["dynamic_spread_db"]
+    segment_envelopes = analysis_cache["segment_envelopes"]
+    segment_peaks = analysis_cache["segment_peaks_db"]
+    role_norms_db = analysis_cache["role_norms_db"]
+    mix_controls = analysis_cache["mix_controls"]
     effective_roles = mix_controls["effective_roles"]
     rhythm_controls = mix_controls["rhythm"]
     vocal_priority = mix_controls["vocal_priority"]
@@ -568,23 +639,6 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     # The expensive Analyze-only products are persisted as one immutable
     # per-song snapshot. Render consumes this snapshot and never recomputes
     # thresholds, Whisper, activity, or Auto-Mix from the source files.
-    analysis_cache = {
-        "version": 2,
-        "song_id": int(segment_id),
-        "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
-        "rms_values_db": rms_values_db,
-        "energies": energies,
-        "has_audio": has_audio,
-        "dynamic_spread_db": dynamic_spread_db,
-        "segment_envelopes": segment_envelopes,
-        "segment_peaks_db": segment_peaks,
-        "role_norms_db": role_norms_db,
-        "mix_controls": mix_controls,
-        "mix_profile_version": getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1),
-        "noise_diagnostics": pipeline.classify_noise_stems(state["stems"], segment, sr),
-        "flattening": pipeline.build_per_song_flattening(segment_envelopes),
-        "drum_bpm": pipeline.estimate_segment_drum_bpm(state["stems"], segment, sr),
-    }
     initialized_makeup_names: set[str] = set()
     solo_files = {
         stem.path.name
@@ -808,8 +862,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "stems": stem_params,
     }
     plan_signature = mix_plan_signature(segment_id, segment, song_overrides)
-    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"mix_analysis_{segment_id}_{plan_signature}.npz"
-    pipeline.save_analysis_cache(cache_path, analysis_cache)
+    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"song_analysis_{segment_id}_{analysis_cache['input_signature']}.npz"
     plan["analysis_cache_path"] = str(cache_path)
     plan["analysis_cache_signature"] = plan_signature
     plan["analysis_cache_version"] = 2
@@ -1264,24 +1317,37 @@ def slot_waveform(start_sec: float, end_sec: float, points: int = 1400) -> dict[
     end_sec = max(start_sec, float(end_sec))
     duration = end_sec - start_sec
     envelope = np.zeros(points, dtype=np.float32)
-    # Read only the selected source range. This cache is presentation-only and
-    # never participates in detection or DSP.
-    for stem in stems:
-        try:
-            with sf.SoundFile(str(stem.path)) as audio_file:
-                sr = float(audio_file.samplerate)
-                local_start = max(0, int(round((start_sec - float(stem.offset_seconds)) * sr)))
-                local_end = min(int(audio_file.frames), max(local_start, int(round((end_sec - float(stem.offset_seconds)) * sr))))
-                if local_end <= local_start:
-                    continue
-                audio_file.seek(local_start)
-                block = audio_file.read(local_end - local_start, dtype="float32", always_2d=True)
-                mono = np.max(np.abs(block), axis=1) if len(block) else np.zeros(0, dtype=np.float32)
-                for index, chunk in enumerate(np.array_split(mono, points)):
-                    if len(chunk):
-                        envelope[index] = max(envelope[index], float(np.max(chunk)))
-        except (OSError, RuntimeError, ValueError):
-            continue
+    activity = pipeline.load_detection_cache(stems)
+    if activity:
+        frame_seconds = pipeline.DETECTION_FRAME_SECONDS
+        sampled_bins = np.zeros(points, dtype=bool)
+        for stem in stems:
+            values = activity.get(stem.path.name, np.array([], dtype=np.float32))
+            positions = float(stem.offset_seconds) + (np.arange(len(values)) + 0.5) * frame_seconds
+            mask = (positions >= start_sec) & (positions <= end_sec)
+            bins = np.clip(((positions[mask] - start_sec) / max(duration, 1e-9) * points).astype(int), 0, points - 1)
+            np.maximum.at(envelope, bins, values[mask])
+            sampled_bins[bins] = True
+        # Retain true silent bins while interpolating presentation gaps.
+        occupied = np.flatnonzero(sampled_bins)
+        if len(occupied):
+            envelope = np.interp(np.arange(points), occupied, envelope[occupied], left=0, right=0).astype(np.float32)
+    else:
+        # Bounded visual sampling on a cache miss, without allocating a whole song.
+        for stem in stems:
+            try:
+                with sf.SoundFile(str(stem.path)) as audio_file:
+                    for index in range(points):
+                        seconds = start_sec + (index + 0.5) / points * duration - float(stem.offset_seconds)
+                        frame = int(seconds * audio_file.samplerate)
+                        if not 0 <= frame < audio_file.frames:
+                            continue
+                        audio_file.seek(frame)
+                        block = audio_file.read(256, dtype="float32", always_2d=True)
+                        if block.size:
+                            envelope[index] = max(envelope[index], float(np.max(np.abs(block))))
+            except (OSError, RuntimeError, ValueError):
+                continue
     peak = float(np.max(envelope)) if len(envelope) else 0.0
     values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
     result = {"window_start_sec": start_sec, "window_end_sec": end_sec, "duration_sec": duration, "peaks": values, "cached": False}
@@ -1301,27 +1367,8 @@ def full_session_waveform(points: int = 1800) -> dict[str, Any]:
         return {**existing, "cached": True}
     state = ensure_pipeline_state()
     end_sec = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in state["stems"]), default=0.0)
-    envelope = np.zeros(points, dtype=np.float32)
-    # The global editor's visual envelope is presentation-only. Use the
-    # shortest available original stem as a representative timeline so
-    # opening the editor never scans tens of gigabytes from every channel.
-    # Detection and rendering still use every stem.
-    visual_stems = sorted(state["stems"], key=lambda item: float(item.timeline_duration))[:1]
-    for stem in visual_stems:
-        try:
-            with sf.SoundFile(str(stem.path)) as audio_file:
-                total = max(1, int(audio_file.frames))
-                for index in range(points):
-                    frame = min(total - 1, int(index / max(1, points - 1) * total))
-                    audio_file.seek(frame)
-                    block = audio_file.read(min(512, total - frame), dtype="float32", always_2d=True)
-                    if len(block):
-                        envelope[index] = max(envelope[index], float(np.max(np.abs(block))))
-        except (OSError, RuntimeError, ValueError):
-            continue
-    peak = float(np.max(envelope)) if len(envelope) else 0.0
-    values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
-    result = {"window_start_sec": 0.0, "window_end_sec": end_sec, "duration_sec": end_sec, "peaks": values, "cached": False}
+    result = slot_waveform(0.0, end_sec, points)
+    cache = load_json(WAVEFORM_CACHE_PATH, {})
     cache["global"] = result
     save_json_atomic(WAVEFORM_CACHE_PATH, cache)
     return result
@@ -2150,29 +2197,31 @@ def current_jobs() -> list[dict[str, Any]]:
         live_job_ids = {str(job.get("id", "")) for job in source}
     for job in source:
         status = read_job_status_for_job(job)
-        print(
-            "JOB_STATUS_API_READ "
-            + json.dumps(
-                {
-                    "source": "memory-job",
-                    "job_id": job.get("id"),
-                    "memory": job_status_debug_payload(job),
-                    "status_file": job_status_debug_payload(status),
-                    "status_path": job.get("status_path") or str(job_status_path(str(job.get("id", "")))),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
+        if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+            print(
+                "JOB_STATUS_API_READ "
+                + json.dumps(
+                    {
+                        "source": "memory-job",
+                        "job_id": job.get("id"),
+                        "memory": job_status_debug_payload(job),
+                        "status_file": job_status_debug_payload(status),
+                        "status_path": job.get("status_path") or str(job_status_path(str(job.get("id", "")))),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         if status:
             job.update(status)
         reconciled = reconcile_completed_job_from_disk(job)
         if reconciled:
-            print(
-                "JOB_STATUS_RECONCILE "
-                + json.dumps({"job_id": job.get("id"), "before": job_status_debug_payload(job), "reconciled": reconciled}, sort_keys=True),
-                flush=True,
-            )
+            if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+                print(
+                    "JOB_STATUS_RECONCILE "
+                    + json.dumps({"job_id": job.get("id"), "before": job_status_debug_payload(job), "reconciled": reconciled}, sort_keys=True),
+                    flush=True,
+                )
             job.update(reconciled)
             write_job_status(job)
         seen.add(str(job.get("id", "")))
@@ -2185,19 +2234,20 @@ def current_jobs() -> list[dict[str, Any]]:
         job_id = str(status.get("id", ""))
         if not job_id or job_id in seen:
             continue
-        print(
-            "JOB_STATUS_API_READ "
-            + json.dumps(
-                {
-                    "source": "status-file-only",
-                    "job_id": job_id,
-                    "status_file": job_status_debug_payload(status),
-                    "status_path": str(path),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
+        if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+            print(
+                "JOB_STATUS_API_READ "
+                + json.dumps(
+                    {
+                        "source": "status-file-only",
+                        "job_id": job_id,
+                        "status_file": job_status_debug_payload(status),
+                        "status_path": str(path),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         if status.get("status") in {"queued", "running", "stopping"} and job_id not in live_job_ids:
             last_seen = float(status.get("heartbeat") or status.get("updated_at") or path.stat().st_mtime)
             if time.time() - last_seen > ORPHANED_ACTIVE_JOB_SECONDS:
@@ -2213,21 +2263,23 @@ def current_jobs() -> list[dict[str, Any]]:
                 save_json_atomic(path, status)
         reconciled = reconcile_completed_job_from_disk(status)
         if reconciled:
-            print(
-                "JOB_STATUS_RECONCILE "
-                + json.dumps({"job_id": job_id, "before": job_status_debug_payload(status), "reconciled": reconciled}, sort_keys=True),
-                flush=True,
-            )
+            if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+                print(
+                    "JOB_STATUS_RECONCILE "
+                    + json.dumps({"job_id": job_id, "before": job_status_debug_payload(status), "reconciled": reconciled}, sort_keys=True),
+                    flush=True,
+                )
             status.update(reconciled)
             save_json_atomic(path, status)
         merged.append(status)
         seen.add(job_id)
     merged.sort(key=lambda item: float(item.get("created") or item.get("updated_at") or 0.0))
-    print(
-        "JOB_STATUS_API_RETURN "
-        + json.dumps([job_status_debug_payload(item) for item in merged[-30:]], sort_keys=True),
-        flush=True,
-    )
+    if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+        print(
+            "JOB_STATUS_API_RETURN "
+            + json.dumps([job_status_debug_payload(item) for item in merged[-30:]], sort_keys=True),
+            flush=True,
+        )
     return merged[-30:]
 
 

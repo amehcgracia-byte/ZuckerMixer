@@ -32,6 +32,71 @@ const previewVocalExpander = {
 
 const $ = (sel) => document.querySelector(sel);
 
+function makeDialogDismissible(dialog, dismiss = () => dialog.close("cancel")) {
+  if (dialog.dataset.dismissible) return;
+  dialog.dataset.dismissible = "true";
+  const close = dialog.querySelector("[data-dialog-close]") || document.createElement("button");
+  if (!close.isConnected) {
+    close.type = "button";
+    close.className = "dialog-close";
+    close.textContent = "×";
+    close.setAttribute("aria-label", "Close");
+    close.dataset.dialogClose = "true";
+    dialog.appendChild(close);
+  }
+  close.addEventListener("click", () => dismiss());
+  dialog.addEventListener("click", (event) => {
+    const rect = dialog.getBoundingClientRect();
+    if (event.target === dialog && (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom)) dismiss();
+  });
+  dialog.addEventListener("cancel", (event) => { event.preventDefault(); dismiss(); });
+}
+
+function showConfirm(message, confirmLabel = "Continue") {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "message-dialog";
+    const text = document.createElement("p");
+    text.textContent = message;
+    const confirm = document.createElement("button");
+    confirm.type = "button"; confirm.textContent = confirmLabel;
+    const cancel = document.createElement("button");
+    cancel.type = "button"; cancel.textContent = "Cancel";
+    const finish = (accepted) => { dialog.close(); dialog.remove(); resolve(accepted); };
+    confirm.onclick = () => finish(true);
+    cancel.onclick = () => finish(false);
+    dialog.append(text, confirm, cancel);
+    document.body.appendChild(dialog);
+    makeDialogDismissible(dialog, () => finish(false));
+    dialog.showModal();
+    cancel.focus();
+  });
+}
+
+function setupDismissControls() {
+  $("#closeLoadingOverlay").addEventListener("click", dismissLoadingOverlay);
+  $("#loadingOverlay").addEventListener("click", (event) => { if (!event.target.closest(".loading-stage-visual")) dismissLoadingOverlay(); });
+  document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !document.querySelector("dialog[open]")) dismissLoadingOverlay(); });
+  document.addEventListener("click", (event) => { const toast = $("#toast"); if (toast?.classList.contains("show") && !toast.contains(event.target)) toast.classList.remove("show"); });
+}
+
+function dismissLoadingOverlay() {
+  suppressLoadingOverlay = true;
+  renderLoadingOverlay();
+  document.querySelector("#loadingStageVideo")?.pause();
+}
+
+let stateFetchPromise = null;
+function fetchStateSnapshot() {
+  if (!stateFetchPromise) {
+    stateFetchPromise = fetch("/api/state").then(async (response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    }).finally(() => { stateFetchPromise = null; });
+  }
+  return stateFetchPromise;
+}
+
 function esc(text) {
   return String(text ?? "").replace(/[&<>"']/g, (ch) => ({
     "&": "&amp;",
@@ -595,9 +660,7 @@ function persistPreviewChange(songIndex, reason) {
 async function loadState() {
   let res;
   try {
-    res = await fetch("/api/state");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const next = await res.json();
+    const next = await fetchStateSnapshot();
     appState = {
       songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [],
       source_folder: "Not available", ...next,
@@ -631,14 +694,11 @@ async function loadState() {
   renderSongs();
   renderResults();
   fetch("/api/redetect/second-pass").then((response) => response.json()).then((candidate) => { if (candidate?.status === "pending_confirmation" || candidate?.status === "incomplete") showSecondPassCandidate(candidate); }).catch(() => {});
-  pollJobs().catch((err) => console.warn("[state jobs refresh failed]", err));
+
 }
 
 function visibleSongs() {
   return (Array.isArray(appState?.songs) ? appState.songs : []).filter((song) => !song.skipped);
-}
-function visibleSongs() {
-  return appState.songs.filter((song) => !song.skipped);
 }
 
 function renderableSongs() {
@@ -773,7 +833,7 @@ function renderCutTools() {
     referenceNode.value = appState?.settings?.matchering_reference || "";
   }
   const matchering = appState?.matchering;
-  if (matchering && !matchering.available && matchering.reference) {
+  if (matchering && !matchering.loading && !matchering.available && matchering.reference) {
     const warning = document.createElement("div");
     warning.className = "scan-warning";
     warning.textContent = `Matchering reference is set but unavailable: ${matchering.import_error || "dependency error"}. Renders will stop until this is fixed.`;
@@ -828,6 +888,7 @@ function renderCutTools() {
   if (signature === transitionSignature || isEditingText()) return;
   transitionSignature = signature;
   const list = $("#transitionList");
+  if (!list) return;
   list.innerHTML = "";
   appState.transitions.forEach((transition) => {
     const row = document.createElement("div");
@@ -926,13 +987,15 @@ function ensureCutSelector() {
       <div class="cut-selector-header"><div><h2>Edit Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><div class="cut-slot-nav"><button type="button" id="cutPrevious" class="ghost">Previous</button><span id="cutSlotPosition">Slot 1 of 1</span><select id="cutSlotList" aria-label="All slots"></select><button type="button" id="cutNext" class="ghost">Next</button><button type="button" id="cutClose" class="ghost" aria-label="Close">×</button></div></div>
       <div class="cut-wave-wrap"><canvas id="cutWaveform" aria-label="Selected slot waveform"></canvas><div id="cutPlayheadLine" class="cut-playhead-line" aria-hidden="true"></div><div id="cutMarkers" class="cut-markers"></div><div id="cutSelection" class="cut-selection"><button type="button" class="cut-handle left" aria-label="Move start"></button><button type="button" class="cut-center" aria-label="Move selection"></button><button type="button" class="cut-handle right" aria-label="Move end"></button></div></div>
       <div class="cut-zoom-controls" hidden><label>Zoom <input id="cutZoom" type="range" min="1" max="20" step="0.1" value="1"></label><button type="button" id="cutFit" class="ghost">Fit selected slot</button><button type="button" id="cutZoomSelection" class="ghost">Zoom to selection</button><label>Scroll <input id="cutPan" type="range" min="0" max="1000" step="1" value="0"></label></div>
-      <div class="cut-editor-tools"><select id="cutEditMode" hidden><option value="select">Select</option><option value="cut">Cut</option><option value="paste">Paste</option><option value="delete">Delete</option></select><button type="button" id="cutBack5" class="ghost">−5s</button><button type="button" id="cutPlay" class="ghost">Play</button><button type="button" id="cutPause" class="ghost">Pause</button><button type="button" id="cutStop" class="ghost">Stop</button><button type="button" id="cutForward5" class="ghost">+5s</button><label>Speed <select id="cutSpeed"><option>0.5</option><option>0.75</option><option selected>1</option><option>1.25</option><option>1.5</option><option>2</option></select></label><audio id="cutAudio" controls preload="metadata"></audio><span id="cutPlayheadReadout" class="muted">Playhead —</span><span id="cutModeReadout" class="pill">Active tool: Select</span><span id="cutActionLog" class="cut-action-log" role="status">Waiting for an editor action</span></div>
+      <div class="cut-editor-tools"><select id="cutEditMode" hidden><option value="select">Select</option><option value="cut">Cut</option><option value="paste">Paste</option><option value="delete">Delete</option></select><button type="button" id="cutBack5" class="ghost">−5s</button><button type="button" id="cutPlay" class="ghost">Play</button><button type="button" id="cutPause" class="ghost">Pause</button><button type="button" id="cutStop" class="ghost">Stop</button><button type="button" id="cutForward5" class="ghost">+5s</button><label>Speed <select id="cutSpeed"><option>0.5</option><option>0.75</option><option selected>1</option><option>1.25</option><option>1.5</option><option>2</option></select></label><audio id="cutAudio" controls preload="none"></audio><span id="cutPlayheadReadout" class="muted">Playhead —</span><span id="cutModeReadout" class="pill">Active tool: Select</span><span id="cutActionLog" class="cut-action-log" role="status">Waiting for an editor action</span></div>
       <div class="cut-readout"><label>Start <input id="cutStart" type="number" step="0.1"></label><label>End <input id="cutEnd" type="number" step="0.1"></label><strong>Duration <span id="cutDuration">—</span></strong><span id="cutValidation" class="cut-validation"></span></div>
       <div id="cutEvidence" class="cut-evidence"></div>
       <div class="cut-selector-actions"><button id="cutApply" type="button" class="accent">Save Changes</button></div>
     </form><div id="cutContextMenu" class="cut-context-menu" hidden><div class="cut-context-heading">Editing mode</div><button data-context-mode="select">Select</button><button data-context-mode="cut">Cut</button><button data-context-mode="paste">Paste</button><button data-context-mode="delete">Delete</button><div class="cut-context-divider"></div><button data-context-action="add">Add cut here</button><button data-context-action="delete">Delete cut here</button><button data-context-action="copy">Copy cut</button><button data-context-action="paste">Paste cut</button><button data-context-action="play">Play from here</button></div>`;
   document.body.appendChild(dialog);
-  dialog.querySelector("#cutClose").addEventListener("click", () => closeCutSelector());
+  dialog.querySelector("#cutClose").dataset.dialogClose = "true";
+  makeDialogDismissible(dialog, closeCutSelector);
+  dialog.addEventListener("close", () => { cutSelector?.audio?.pause(); releaseCutPointerCaptures(cutSelector); clearCutLoading(); });
   dialog.tabIndex = -1;
   cutSelector = { dialog, canvas: dialog.querySelector("#cutWaveform"), selection: dialog.querySelector("#cutSelection"), start: dialog.querySelector("#cutStart"), end: dialog.querySelector("#cutEnd"), zoom: dialog.querySelector("#cutZoom"), pan: dialog.querySelector("#cutPan"), mode: dialog.querySelector("#cutEditMode"), speed: dialog.querySelector("#cutSpeed"), audio: dialog.querySelector("#cutAudio"), playheadLine: null, pendingAudioTime: null, selectedBoundary: null, clipboard: null, capturedPointers: new Map() };
   wireCutSelector(cutSelector);
@@ -941,6 +1004,7 @@ function ensureCutSelector() {
 
 async function openCutSelector(songId) {
   const ui = ensureCutSelector();
+  suppressLoadingOverlay = false;
   setCutLoading("Loading cut editor", `Loading selected slot ${songId}`, 8);
   const response = await fetch(`/api/cuts/${songId}`);
   const data = await response.json();
@@ -968,7 +1032,7 @@ async function openCutSelector(songId) {
   const slotList = ui.dialog.querySelector("#cutSlotList"); slotList.innerHTML = ui.allSlots.map((id, index) => `<option value="${id}">Slot ${index + 1} of ${ui.allSlots.length}</option>`).join(""); slotList.value = String(songId);
   ui.dialog.querySelector("#cutPrevious").disabled = slotIndex <= 0; ui.dialog.querySelector("#cutNext").disabled = slotIndex >= ui.allSlots.length - 1;
   ui.dialog.querySelector("#cutEvidence").innerHTML = data.markers.filter((marker) => marker.song_id === songId).map((marker) => `<span class="cut-evidence-item ${marker.status}">${cutTime(marker.start_sec)}–${cutTime(marker.end_sec)} · ${esc(marker.boundary_source || "automatic proposal")} · ${marker.confidence ? `${Math.round(marker.confidence * 100)}%` : "no confidence"}</span>`).join("");
-  const audio = ui.dialog.querySelector("#cutAudio"); if (audio) { setCutLoading("Loading audio preview", `Preparing playback for slot ${songId}`, 55); audio.src = `/api/cuts/audio/${songId}`; audio.playbackRate = Number(ui.speed?.value || 1); audio.load(); audio.oncanplay = () => setCutLoading("Ready", `Playback ready for slot ${songId}`, 100); audio.onerror = () => setCutLoading("Playback error", "The selected source audio could not be loaded.", 100); }
+  const audio = ui.dialog.querySelector("#cutAudio"); if (audio) { audio.preload = "none"; audio.src = `/api/cuts/audio/${songId}`; audio.playbackRate = Number(ui.speed?.value || 1); audio.oncanplay = () => setCutLoading("Ready", `Playback ready for slot ${songId}`, 100); audio.onerror = () => setCutLoading("Playback error", "The selected source audio could not be loaded.", 100); }
   setCutLoading("Rendering waveform", `Rendering complete-session waveform for slot ${songId}`, 70);
   drawCutEditor();
   ui.dialog.showModal();
@@ -1002,7 +1066,7 @@ function reportCutAction(ui, action, details = {}) {
 }
 function clearCutLoading() { loadingOverlayCut = null; renderLoadingOverlay(); const box = $("#loadingStatus"); if (box && !document.querySelector("#cutSelectorDialog[open]")) box.hidden = true; }
 function cutIsDirty() { const ui = cutSelector; return Boolean(ui && !ui.savedClean && (Math.abs(ui.startValue - ui.originalStart) > 0.05 || Math.abs(ui.endValue - ui.originalEnd) > 0.05)); }
-function closeCutSelector() { if (!cutIsDirty() || window.confirm("Discard unsaved cut changes?")) { cutSelector.dialog.close("cancel"); clearCutLoading(); } }
+async function closeCutSelector() { if (!cutIsDirty() || await showConfirm("Discard unsaved cut changes?")) { cutSelector.dialog.close("cancel"); clearCutLoading(); } }
 async function editAllCuts() {
   const slots = (appState.songs || []).filter((song) => Number.isFinite(Number(song.id))).map((song) => Number(song.id));
   if (!slots.length) return showToast("No slots available for Edit All.");
@@ -1189,10 +1253,10 @@ function wireCutSelector(ui) {
   contextMenu.querySelectorAll("[data-context-action]").forEach((button) => button.addEventListener("click", () => { const action = button.dataset.contextAction; const before = ui.allSlots?.length || 0; closeContextMenu("context menu closed"); if (action === "copy") { ui.clipboard = { at: ui.selectedBoundary ?? ui.playhead, duration: ui.endValue - ui.startValue }; reportCutAction(ui, "copy", { before, time: ui.playhead, pointer: "contextmenu", finished: true }); } else if (action === "paste") { if (ui.clipboard) editorOperation("add", { at_sec: ui.playhead, pointer: "contextmenu-paste" }); else reportCutAction(ui, "paste rejected", { before, time: ui.playhead, pointer: "contextmenu", reason: "No copied cut or selection", error: true }); } else if (action === "play") ui.dialog.querySelector("#cutPlay").click(); else editorOperation(action === "delete" ? "delete" : "add", { pointer: "contextmenu" }); }));
   ui.dialog.addEventListener("click", (event) => { if (contextMenu.isConnected && !event.target.closest("#cutContextMenu")) closeContextMenu(); });
   ui.dialog.addEventListener("keydown", (event) => { const command = event.metaKey || event.ctrlKey; if (event.code === "Space") { event.preventDefault(); ui.audio?.paused ? ui.dialog.querySelector("#cutPlay").click() : ui.dialog.querySelector("#cutPause").click(); } else if (command && event.key.toLowerCase() === "z") { event.preventDefault(); editorOperation(event.shiftKey ? "redo" : "undo", { pointer: "keyboard" }); } else if (command && event.key.toLowerCase() === "c") { event.preventDefault(); ui.clipboard = { at: ui.selectedBoundary ?? ui.playhead, duration: ui.endValue - ui.startValue }; reportCutAction(ui, "copy", { pointer: "keyboard", finished: true }); } else if (command && event.key.toLowerCase() === "v") { event.preventDefault(); if (ui.clipboard) editorOperation("add", { at_sec: ui.playhead, pointer: "keyboard" }); } else if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); editorOperation("delete", { pointer: "keyboard" }); } else if (event.key.toLowerCase() === "c") setMode("cut"); else if (event.key.toLowerCase() === "s") setMode("select"); else if (event.key.toLowerCase() === "p") setMode("paste"); else if (event.key.toLowerCase() === "d") setMode("delete"); else if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const amount = event.shiftKey ? 30 : 5; movePlayheadTo(ui, ui.playhead + (event.key === "ArrowLeft" ? -amount : amount)); } });
-  const navigate = async (offset) => { if (cutIsDirty() && !window.confirm("Discard unsaved cut changes before changing slots?")) return; const index = ui.allSlots.indexOf(Number(ui.songId)); const next = ui.allSlots[index + offset]; if (next) await openCutSelector(next); };
+  const navigate = async (offset) => { if (cutIsDirty() && !await showConfirm("Discard unsaved cut changes before changing slots?")) return; const index = ui.allSlots.indexOf(Number(ui.songId)); const next = ui.allSlots[index + offset]; if (next) await openCutSelector(next); };
   ui.dialog.querySelector("#cutPrevious").addEventListener("click", () => navigate(-1));
   ui.dialog.querySelector("#cutNext").addEventListener("click", () => navigate(1));
-  ui.dialog.querySelector("#cutSlotList").addEventListener("change", (event) => { if (cutIsDirty() && !window.confirm("Discard unsaved cut changes before changing slots?")) { event.target.value = String(ui.songId); return; } openCutSelector(Number(event.target.value)); });
+  ui.dialog.querySelector("#cutSlotList").addEventListener("change", async (event) => { if (cutIsDirty() && !await showConfirm("Discard unsaved cut changes before changing slots?")) { event.target.value = String(ui.songId); return; } openCutSelector(Number(event.target.value)); });
   ui.dialog.querySelector("#cutApply").addEventListener("click", async () => { setCutLoading("Saving changes", `Saving manual override for slot ${ui.songId}`, 60); let response; let result = {}; if (Math.abs(ui.startValue - ui.originalStart) > 0.05 || Math.abs(ui.endValue - ui.originalEnd) > 0.05) { if (Math.abs(ui.startValue - ui.originalStart) > 0.05) { response = await fetch("/api/editor-cut-operation", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation: "move", old_sec: ui.originalStart, new_sec: ui.startValue }) }); result = await response.json().catch(() => ({})); if (!response.ok) return showToast(result.error || "Could not move the start cut."); } if (Math.abs(ui.endValue - ui.originalEnd) > 0.05) { response = await fetch("/api/editor-cut-operation", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation: "move", old_sec: ui.originalEnd, new_sec: ui.endValue }) }); result = await response.json().catch(() => ({})); if (!response.ok) return showToast(result.error || "Could not move the end cut."); } } else { response = await fetch(`/api/segment-selection/${ui.songId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_sec: ui.startValue, end_sec: ui.endValue }) }); result = await response.json().catch(() => ({})); if (!response.ok) { setCutLoading("Error", result.error || "Could not save selection."); return showToast(result.error || "Could not save selection."); } } ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue; ui.savedClean = true; setCutLoading("Finished", `Manual override saved; ${appState.songs.length} slots preserved`, 100); ui.dialog.close("saved"); clearCutLoading(); await refreshState({ renderLarge: false }); if (ui.editAllQueue?.length) { const next = ui.editAllQueue.shift(); await openCutSelector(next); } else setTimeout(clearCutLoading, 700); showToast(`Saved cut ${cutTime(ui.startValue)}–${cutTime(ui.endValue)}.`); });
 }
 
@@ -2785,9 +2849,7 @@ async function saveSettings(partial) {
 
 async function refreshState(options = {}) {
   const renderLarge = options.renderLarge !== false;
-  const res = await fetch("/api/state");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const rawNext = await res.json();
+  const rawNext = await fetchStateSnapshot();
   const next = { songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [], ...rawNext };
   if (!Array.isArray(next.songs)) next.songs = [];
   if (next.detection_job && ["queued", "running", "stopping"].includes(next.detection_job.status)) setLoadingOverlayJob(next.detection_job);
@@ -2819,7 +2881,7 @@ async function refreshState(options = {}) {
   renderResults();
   // The state payload is intentionally large and can lag the worker. Always
   // finish with the authoritative, lightweight job snapshot.
-  pollJobs().catch((err) => console.warn("[state jobs refresh failed]", err));
+
 }
 
 function updateSelectedButton() {
@@ -2954,6 +3016,7 @@ async function copyJobReport(job, button) {
       close.onclick = () => { dialog.close(); dialog.remove(); };
       dialog.append(field, close);
       document.body.appendChild(dialog);
+      makeDialogDismissible(dialog, () => { dialog.close(); dialog.remove(); });
       dialog.showModal();
       field.select();
       return;
@@ -3147,22 +3210,20 @@ function showSecondPassCandidate(candidate) {
 
 function chooseMixSource() {
   const dialog = $("#mixChoiceDialog");
-  if (!dialog) return Promise.resolve(false);
+  if (!dialog) return Promise.resolve(null);
+  makeDialogDismissible(dialog);
   return new Promise((resolve) => {
-    const finish = (value) => {
-      dialog.close();
-      resolve(value);
-    };
-    $("#useAutomaticMixes").onclick = () => finish(false);
-    $("#useSavedMixes").onclick = () => finish(true);
-    dialog.addEventListener("cancel", () => resolve(null), { once: true });
+    let settled = false;
+    const finish = (value) => { if (settled) return; settled = true; resolve(value); };
+    $("#useAutomaticMixes").onclick = () => { finish(false); dialog.close(); };
+    $("#useSavedMixes").onclick = () => { finish(true); dialog.close(); };
+    dialog.addEventListener("close", () => finish(null), { once: true });
     dialog.showModal();
-    $("#useAutomaticMixes").focus();
   });
 }
 
 async function resetSongToAutomatic(songId) {
-  if (!confirm(`Clear saved overrides for Song ${songId} and use the current automatic mix?`)) return;
+  if (!await showConfirm(`Clear saved overrides for Song ${songId} and use the current automatic mix?`)) return;
   const response = await fetch(`/api/reset-automatic/${songId}`, { method: "POST" });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) return showToast(data.error || "Could not reset this song.");
@@ -3346,7 +3407,9 @@ function renderLoadingOverlay() {
   const busy = Boolean(state) && !suppressLoadingOverlay;
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
-  if (!busy) return;
+  const video = $("#loadingStageVideo");
+  if (!busy) { video?.pause(); return; }
+  if (video?.paused) video.play().catch(() => {});
   const stage = String(state.current_stage || state.stage || "").toLowerCase();
   const isRenderTask = ["render", "mix"].includes(String(state.kind || "").toLowerCase());
   const title = state.kind === "cut" ? (state.label || "Loading editor") :
@@ -3516,6 +3579,7 @@ function renderLoadingOverlay() {
 }
 
 function setLoadingOverlayJob(job) {
+  if (job && String(job.id) !== String(loadingOverlayJob?.id)) suppressLoadingOverlay = false;
   loadingOverlayJob = job || null;
   renderLoadingOverlay();
 }
@@ -3669,7 +3733,7 @@ function hideLoadingOverlayImmediately() {
 }
 
 async function cancelActiveWork() {
-  if (!window.confirm("Are you sure you want to cancel all active work?")) return;
+  if (!await showConfirm("Are you sure you want to cancel all active work?")) return;
   const buttons = [$("#cancelLoadingWork"), $("#cancelJob")].filter(Boolean);
   buttons.forEach((button) => {
     button.disabled = true;
@@ -3742,7 +3806,13 @@ async function cancelActiveWork() {
     }
   })();
 }
-async function pollJobs() {
+let jobsPollPromise = null;
+function pollJobs() {
+  if (!jobsPollPromise) jobsPollPromise = pollJobsOnce().finally(() => { jobsPollPromise = null; });
+  return jobsPollPromise;
+}
+
+async function pollJobsOnce() {
   const res = await fetch("/api/jobs");
   const jobs = await res.json();
   console.log("[jobs poll]", jobs.map((job) => ({
@@ -3818,31 +3888,39 @@ async function reviewRedetectCandidate(job) {
   const candidate = await response.json().catch(() => ({}));
   if (!candidate.available) return;
   const warning = candidate.warning ? `\nWARNING: ${candidate.warning}` : "";
-  const approve = window.confirm(`Re-detect finished on the complete original session.\n\nCurrent slots: ${candidate.old_count}\nCandidate slots: ${candidate.new_count}\nOriginal stems: ${candidate.source_stem_count || "?"}\nSource duration: ${cutTime(candidate.source_duration_sec || 0)}${warning}\n\nReplace the current list only if this comparison is correct?\nCancel keeps all current and manual cuts.`);
-  const endpoint = approve ? "/api/redetect/commit" : "/api/redetect/discard";
+  const approve = await showConfirm(`Re-detect finished on the complete original session.\n\nCurrent slots: ${candidate.old_count}\nCandidate slots: ${candidate.new_count}\nOriginal stems: ${candidate.source_stem_count || "?"}\nSource duration: ${cutTime(candidate.source_duration_sec || 0)}${warning}\n\nReplace the current list only if this comparison is correct?\nCancel keeps all current and manual cuts.`);
+  if (!approve) { showToast("Comparison closed; current cuts and the detection proposal are preserved."); return; }
+  const endpoint = "/api/redetect/commit";
   const result = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.id }) }).then((r) => r.json().catch(() => ({})));
-  if (!approve) { showToast("Re-detect cancelled; current slots and manual cuts preserved."); return; }
   if (!result.ok) return showToast(result.error || "Could not replace the current slot list.");
   await refreshState({ renderLarge: true });
   showToast(`Re-detect confirmed: ${result.count} slots loaded.`);
 }
 
+let toastTimer = null;
 function showToast(text) {
   const toast = $("#toast");
-  toast.textContent = text;
+  clearTimeout(toastTimer);
+  toast.replaceChildren();
+  const message = document.createElement("span"); message.textContent = text;
+  const close = document.createElement("button"); close.type = "button"; close.textContent = "×"; close.setAttribute("aria-label", "Close message");
+  close.onclick = () => toast.classList.remove("show");
+  toast.append(message, close);
   toast.classList.add("show");
-  setTimeout(() => toast.classList.remove("show"), 6000);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 6000);
 }
 
 async function pollingLoop() {
   if (document.visibilityState === "visible") {
+    try {
     await pollLogs();
-    const jobs = await pollJobs();
+    const jobs = appState?.jobs || [];
     const pendingRedetect = [...(jobs || [])].reverse().find((job) => job.kind === "redetect" && job.status === "pending_confirmation" && job.source_folder === appState?.source_folder);
     if (pendingRedetect) await reviewRedetectCandidate(pendingRedetect);
     const active = (jobs || []).some((job) => ["queued", "running", "stopping"].includes(job.status));
     await refreshState({ renderLarge: !active });
-    setTimeout(pollingLoop, active ? 3000 : 5000);
+    setTimeout(pollingLoop, active ? 5000 : 15000);
+    } catch (error) { console.warn("[state poll failed]", error); setTimeout(pollingLoop, 5000); }
   } else {
     setTimeout(pollingLoop, 6000);
   }
@@ -3852,17 +3930,18 @@ function setupLoadingMedia() {
   const video = $("#loadingStageVideo");
   const fallback = $("#loadingStageFallback");
   if (!video || !fallback) return;
-  const showFallback = () => { video.hidden = true; fallback.hidden = false; };
+  const showFallback = () => { video.hidden = true; if (!fallback.src) fallback.src = fallback.dataset.src; fallback.hidden = false; };
   const showVideo = () => { video.hidden = false; fallback.hidden = true; };
   video.addEventListener("loadeddata", showVideo);
   video.addEventListener("canplay", showVideo);
   video.addEventListener("error", showFallback);
-  video.play().then(showVideo).catch(showFallback);
+
   if (video.readyState >= 2) showVideo();
 }
 
 if (typeof document !== "undefined") {
   setupLoadingMedia();
+  setupDismissControls();
   $("#mixSelected").addEventListener("click", () => mixSongs([...checkedSongs], true, true).catch((error) => showToast(`Render failed: ${error.message || error}`)));
   $("#mixAll").addEventListener("click", () => mixEverything());
   $("#editAllCuts").addEventListener("click", () => editAllCuts().catch((error) => { setCutLoading("Error", error.message || String(error)); showToast(error.message || String(error)); }));
@@ -3891,7 +3970,7 @@ if (typeof document !== "undefined") {
     showToast("Matchering reference saved. New renders will use it.");
   });
   $("#redetectSongs").addEventListener("click", async () => {
-    if (!window.confirm("Re-detect the complete original session? Current slots remain until you confirm the comparison.")) return;
+    if (!await showConfirm("Re-detect the complete original session? Current slots remain until you confirm the comparison.")) return;
     setCutLoading("Re-detecting songs", "Preparing full original session", 2);
     const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: false }) });
     if (!response.ok) {
@@ -3995,11 +4074,15 @@ if (typeof document !== "undefined") {
   // request. This keeps the analysis indicator live even while /api/state is
   // busy scanning and transcribing the source folder.
   pollJobs().catch((err) => console.warn("[initial jobs poll failed]", err));
-  setInterval(() => pollJobs().catch((err) => console.warn("[jobs poll failed]", err)), 1000);
+  const jobLoop = async () => {
+    try { await pollJobs(); } catch (error) { console.warn("[jobs poll failed]", error); }
+    setTimeout(jobLoop, document.visibilityState === "visible" ? 1500 : 6000);
+  };
+  setTimeout(jobLoop, 1500);
   loadState();
   setTimeout(pollingLoop, 2000);
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { parseSplitOffsetSeconds, parseSplitList, renderResultSummary, jobReportText };
+  module.exports = { parseSplitOffsetSeconds, parseSplitList, renderResultSummary, jobReportText, makeDialogDismissible, showConfirm, chooseMixSource, fetchStateSnapshot, setupDismissControls };
 }

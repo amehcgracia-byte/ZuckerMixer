@@ -25,7 +25,7 @@ class MasteringPreflightTest(unittest.TestCase):
     def test_status_loads_backend_before_reporting_unavailable(self):
         with patch.object(p,'ensure_matchering_available') as load, patch.object(p,'matchering_api',object()):
             result=jam_app.reference_mastering_status({'matchering_reference':'ref.wav'})
-            load.assert_called_once()
+            load.assert_not_called()
             self.assertTrue(result['available'])
 
     def test_failed_attempts_are_counted_once_and_review_is_reported(self):
