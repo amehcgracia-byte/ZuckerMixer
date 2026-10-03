@@ -2416,6 +2416,20 @@ def compact_batch_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{key: row.get(key) for key in keys if key in row} for row in rows]
 
 
+def render_batch_summary(requested: int, rows: list[dict], errors: list[dict], reviews: list[dict]) -> dict:
+    completed = [row for row in rows if not row.get("error")]
+    return {
+        "requested": requested,
+        "started": len(rows),
+        "completed": len(completed),
+        "failed": len(errors),
+        "needs_review": len(reviews),
+        "review_songs": [row.get("song") for row in reviews],
+        "songs": compact_batch_rows(completed),
+        "errors": errors,
+    }
+
+
 def enqueue(
     kind: str,
     songs: list[int],
@@ -2798,11 +2812,7 @@ def apply_overrides_for_song(
     pipeline.MASTERING_INTENSITY = str(song.get("mastering_intensity", "natural")).lower() if isinstance(song, dict) else "natural"
     reference = str(load_settings().get("matchering_reference") or "").strip()
     pipeline.MATCHERING_REFERENCE = Path(reference).expanduser() if reference else None
-    if pipeline.MATCHERING_REFERENCE is not None and pipeline.matchering_api is None:
-        app_progress({
-            "warning": "Matchering reference is configured but unavailable; render will fail rather than silently use fallback.",
-            "heartbeat": time.time(),
-        })
+    pipeline.validate_mastering_reference(pipeline.MATCHERING_REFERENCE)
     return prepared_mix
 
 
@@ -3028,6 +3038,8 @@ def _run_child_job(job_path: Path) -> int:
     # the already-registered WAV metadata and persisted plan.
     pipeline.WHISPER_ALLOWED = bool(payload.get("allow_whisper", False))
     kind = payload.get("kind")
+    if kind in {"mix", "render", "real-preview"}:
+        pipeline.validate_mastering_reference(load_settings().get("matchering_reference"))
     songs = [int(x) for x in payload.get("songs", [])]
     job_id = str(payload.get("id", "child"))
     lifecycle_log("child_started", job_id, argv=sys.argv, job_path=str(job_path), status_path=str(child_status_path))
@@ -3263,7 +3275,7 @@ def _run_child_job(job_path: Path) -> int:
                 "batch_summary": {
                     "requested": len(songs),
                     "started": pos,
-                    "completed": pos,
+                    "completed": sum(not row.get("error") for row in rows),
                     "failed": len(batch_errors),
                     "needs_review": len(review_rows),
                     "safe_songs": len(accepted_rows),
@@ -3292,14 +3304,7 @@ def _run_child_job(job_path: Path) -> int:
         partial_summary = {
             "job_id": job_id,
             "status": "partial_failed",
-            "batch_summary": {
-                "requested": len(songs),
-                "started": len(rows) + len(batch_errors),
-                "completed": len(successful_rows),
-                "failed": len(batch_errors),
-                "songs": compact_batch_rows(successful_rows),
-                "errors": batch_errors,
-            },
+            "batch_summary": render_batch_summary(len(songs), rows, batch_errors, review_rows),
             "commit": BUILD_METADATA.get("commit"),
         }
         summary_path = diagnostic_job_dir / f"ZuckerMixer_batch_{job_id}_summary.json"
@@ -3315,15 +3320,9 @@ def _run_child_job(job_path: Path) -> int:
                 "error": failure_text,
                 "batch_errors": batch_errors,
                 "heartbeat": time.time(),
-                "done_count": len(rows),
+                "done_count": sum(not row.get("error") for row in rows),
                 "total_count": len(songs),
-                "batch_summary": {
-                    "requested": len(songs),
-                    "started": len(rows) + len(batch_errors),
-                    "completed": len(successful_rows),
-                    "failed": len(batch_errors),
-                    "songs": compact_batch_rows(successful_rows),
-                },
+                "batch_summary": render_batch_summary(len(songs), rows, batch_errors, review_rows),
             }
         )
         return 1
@@ -3355,7 +3354,7 @@ def _run_child_job(job_path: Path) -> int:
             "current_stage": "pending_review",
             "stage_detail": "Rendered approved songs; pending review: " + ", ".join(str(row.get("song")) for row in review_rows),
             "heartbeat": time.time(),
-            "done_count": len(rows),
+            "done_count": sum(not row.get("error") for row in rows),
             "total_count": len(songs),
             "safe_count": len(accepted_rows),
             "needs_review_count": len(review_rows),
@@ -3377,7 +3376,7 @@ def _run_child_job(job_path: Path) -> int:
             "stage_detail": error_text,
             "error": error_text,
             "heartbeat": time.time(),
-            "done_count": len(rows),
+            "done_count": sum(not row.get("error") for row in rows),
             "total_count": len(songs),
         })
         return 1

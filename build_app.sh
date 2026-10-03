@@ -151,7 +151,7 @@ EOF
   # distribution. Pin the last compatible CPython 3.12 binary pair so a clean
   # build does not require a separately installed LLVM toolchain.
   if ! "$BUILD_PIP" install --upgrade "numba==0.60.0" "llvmlite==0.43.0" matchering; then
-    echo "WARNING: Matchering dependencies are unavailable; reference mastering will be disabled in this build." >&2
+    die "Matchering dependencies are required for the desktop build."
   fi
   "$BUILD_PYINSTALLER" --version >/dev/null || die "PyInstaller did not install correctly in .buildenv"
 

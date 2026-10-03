@@ -52,6 +52,24 @@ def ensure_matchering_available() -> None:
         MATCHERING_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
+def validate_mastering_reference(reference: str | Path | None) -> None:
+    """Fail before mixing when a configured reference cannot be used."""
+    if not reference:
+        return
+    ensure_matchering_available()
+    if matchering_api is None:
+        raise RuntimeError("Reference mastering is unavailable: " + MATCHERING_IMPORT_ERROR)
+    path = Path(reference).expanduser()
+    if not path.is_file():
+        raise RuntimeError(f"Mastering reference file not found: {path}")
+    try:
+        info = sf.info(str(path))
+        if info.frames <= 0:
+            raise ValueError("empty audio")
+    except Exception as exc:
+        raise RuntimeError(f"Cannot read mastering reference: {path}: {exc}") from exc
+
+
 # ------------------------- configurable defaults -------------------------
 
 SOURCE_DIR = Path.home() / "Music" / "JamStems"
@@ -7703,6 +7721,7 @@ def render_segment(
     artifact_dir: Path | None = None,
     retain_diagnostic_audio: bool = True,
 ) -> dict[str, object]:
+    validate_mastering_reference(MATCHERING_REFERENCE)
     render_t0 = time.perf_counter()
     song_overrides = current_song_overrides(index)
     override_trace = {str(name): dict(value) for name, value in current_override_verify_trace(index).items() if isinstance(value, dict)}
