@@ -484,9 +484,8 @@ def load_render_state() -> dict[str, Any]:
     if not isinstance(snapshot, dict):
         raise RuntimeError("Analyze required: no current detection snapshot exists for this source.")
     segments = list(snapshot.get("segments", []))
-    # Manual Select Cuts is authoritative and is applied to the persisted
-    # detection state without invoking Whisper, thresholds, or stem scans.
-    snapshot["segments"] = apply_saved_segment_selections(segments)
+    # Select Cuts already persists the exact editor segments in this snapshot.
+    # Reapplying older ordinal-only selections can move newer confirmed cuts.
     return snapshot
 
 

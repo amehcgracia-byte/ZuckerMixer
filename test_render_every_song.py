@@ -29,3 +29,10 @@ def test_batch_attempts_warned_first_song_and_keeps_exact_windows(tmp_path,audit
     assert progress[-1]['batch_summary']['started']==2
     assert progress[-1]['batch_summary']['failed']==1
     assert progress[-1]['batch_summary']['completed']==1
+
+
+def test_worker_uses_persisted_editor_cuts_without_reapplying_legacy_selections():
+    snapshot={"segments":[p.Segment(286,935)]}
+    with patch.object(app,'load_settings',return_value={}),patch.object(app,'configure_source_folder'),patch.object(app,'detection_state_signature'),patch.object(app,'load_detection_snapshot',return_value=snapshot),patch.object(app,'apply_saved_segment_selections') as legacy:
+        assert app.load_render_state()['segments'][0].start==286
+        legacy.assert_not_called()
