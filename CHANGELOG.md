@@ -1,3 +1,10 @@
+## 2.1.67
+
+- Replace the Play Preview microphone compressor with a real downward expander. Preserve loud vocals and attenuate quiet microphone floor, with independent state per channel.
+- Enable vocal expansion whenever vocal FX is enabled, matching the export path instead of bypassing it behind the unrelated section-gate toggle.
+- Measure the summed stereo preview signal instead of averaging across tracks; silent channels no longer increase normalization gain.
+- Add silence, quiet-noise, loud-voice, channel-independence and summed-level checks to desktop CI.
+
 ## 2.1.66
 
 - Treat low raw noise floors before the large final mastering lift; preview and export share noise treatment. Correct spectral profile scaling so musical content is preserved.

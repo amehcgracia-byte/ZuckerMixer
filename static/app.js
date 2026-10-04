@@ -485,7 +485,7 @@ function effectiveMixDump(songIndex, reason = "preview") {
         delay_send_db: numeric(ov.delay_send_db, 0),
         delay_total_db: delayBaseDb == null ? null : numeric(delayBaseDb) + numeric(ov.delay_send_db, 0),
         delay_linear_gain: delayBaseDb == null || !fxEnabled ? 0 : dbToGain(numeric(delayBaseDb) + numeric(ov.delay_send_db, 0)),
-        track_processing: fxEnabled ? (stem.role === "vocal" ? "per-stem expander: DynamicsCompressorNode" : "no per-stem compressor in preview") : "raw_dry_bypass",
+        track_processing: fxEnabled ? (stem.role === "vocal" ? "per-stem downward expander: AudioWorkletNode" : "no per-stem compressor in preview") : "raw_dry_bypass",
         track_processing_params: stem.role === "vocal" ? {
           threshold_db: previewVocalExpander.thresholdDb,
           ratio: previewVocalExpander.ratio,
@@ -1815,7 +1815,7 @@ function reconnectPreviewStemFx(mix, songIndex, stem, enabled) {
   try { preGain.disconnect(); } catch (_err) {}
   eqNodes.forEach((node) => { try { node.disconnect(); } catch (_err) {} });
   if (expander) { try { expander.disconnect(); } catch (_err) {} }
-  const gateEnabled = enabled && previewEffectEnabled(songIndex, stem, "gate_enabled");
+  const gateEnabled = enabled && (stem.role === "vocal" || previewEffectEnabled(songIndex, stem, "gate_enabled"));
   const chain = enabled ? [...eqNodes, ...(expander && gateEnabled ? [expander] : []), fader] : [fader];
   let from = preGain;
   chain.forEach((to) => { from.connect(to); to.__receivesFromNode = from; from = to; });
@@ -1889,7 +1889,7 @@ function logPreviewGraphIntegrity(songIndex, reason) {
       if (!panner) errors.push("missing panner node");
       if (fader && fader.__receivesFromNode == null) errors.push("fader has no tracked input node");
       if (stem.role === "vocal" && !mix.vocalExpanders?.[stem.file]) errors.push("missing vocal expander node");
-      if (stem.role === "vocal" && previewFxEnabled(songIndex, stem) && previewEffectEnabled(songIndex, stem, "gate_enabled") && fader && fader.__receivesFromNode !== mix.vocalExpanders?.[stem.file]) errors.push("vocal fader is not fed by expander");
+      if (stem.role === "vocal" && previewFxEnabled(songIndex, stem) && fader && fader.__receivesFromNode !== mix.vocalExpanders?.[stem.file]) errors.push("vocal fader is not fed by expander");
       if (fader && fader.__feedsNode !== panner) errors.push("fader does not feed this stem's panner");
       if (panner && !panner.__inSignalPath) errors.push("panner not marked in signal path");
       return errors.length ? {
@@ -2324,32 +2324,40 @@ function updatePreviewBusGains(songIndex, key = "all") {
   logPreviewGraphIntegrity(songIndex, `bus:${key}`);
 }
 
-// The Python master measures integrated loudness after summing and then gains
-// the result to TARGET_LUFS. The browser cannot use pyloudnorm, so estimate
-// the same summed RMS from the decoded buffers after the exact per-stem gains;
-// for music this tracks LUFS closely enough to keep preview/export within the
-// product's 1 LU parity tolerance. The output limiter handles inter-sample
-// peaks introduced by the browser graph.
+// Estimate the summed stereo signal. Averaging powers across stems underestimates
+// the mix by 10*log10(track count), so simply loading more tracks boosts hiss.
+// EQ, dynamics and effects still make this an RMS estimate rather than LUFS.
 function estimatePreviewRmsDb(mix) {
   if (!mix?.loaded || !mix.buffers?.length) return NaN;
-  let sumSquares = 0;
-  let sampleCount = 0;
+  const length = Math.max(...mix.buffers.map(({buffer}) => buffer.length));
+  const stride = Math.max(1, Math.ceil(length / 120000));
+  const count = Math.ceil(length / stride);
+  const left = new Float64Array(count);
+  const right = new Float64Array(count);
   mix.buffers.forEach(({ stem, buffer }) => {
     const pre = Number(mix.preGains?.[stem.file]?.gain?.value ?? 1);
     const fader = Number(mix.faderGains?.[stem.file]?.gain?.value ?? 1);
-    const gain = pre * fader;
-    const stride = Math.max(1, Math.floor(buffer.length / 120000));
-    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      for (let i = 0; i < data.length; i += stride) {
-        const value = data[i] * gain;
-        sumSquares += value * value;
-        sampleCount += 1;
+    const vocal = stem.role === "vocal" ? Number(mix.vocalGain?.gain?.value ?? 1) : 1;
+    const gain = pre * fader * vocal;
+    const pan = Math.max(-1, Math.min(1, Number(mix.panners?.[stem.file]?.pan?.value ?? 0)));
+    const a = buffer.getChannelData(0);
+    const b = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
+    const angle = b ? (pan <= 0 ? pan + 1 : pan) * Math.PI / 2 : (pan + 1) * Math.PI / 4;
+    const c = Math.cos(angle), s = Math.sin(angle);
+    for (let i = 0, n = 0; i < a.length; i += stride, n++) {
+      const x = a[i] * gain;
+      if (!b) {
+        left[n] += x * c; right[n] += x * s;
+      } else {
+        const y = b[i] * gain;
+        left[n] += pan <= 0 ? x + y * c : x * c;
+        right[n] += pan <= 0 ? y * s : y + x * s;
       }
     }
   });
-  if (!sampleCount || !sumSquares) return -120;
-  return 10 * Math.log10(sumSquares / sampleCount);
+  let sumSquares = 0;
+  for (let i = 0; i < count; i++) sumSquares += left[i] ** 2 + right[i] ** 2;
+  return sumSquares > 0 ? 10 * Math.log10(sumSquares / (count * 2)) : NaN;
 }
 
 function previewTimeText(seconds) {
@@ -2431,17 +2439,14 @@ function createPreviewEqChain(ctx, songIndex, stem) {
 }
 
 function createPreviewVocalExpander(ctx, stem) {
-  if (stem.role !== "vocal" || !ctx.createDynamicsCompressor) return null;
-  const node = ctx.createDynamicsCompressor();
-  node.threshold.value = previewVocalExpander.thresholdDb;
-  node.knee.value = previewVocalExpander.kneeDb;
-  node.ratio.value = previewVocalExpander.ratio;
-  node.attack.value = previewVocalExpander.attackSeconds;
-  node.release.value = previewVocalExpander.releaseSeconds;
+  if (stem.role !== "vocal") return null;
+  const node = new AudioWorkletNode(ctx, "zucker-vocal-expander", {
+    processorOptions: previewVocalExpander,
+  });
   node.__stemFile = stem.file;
   node.__inSignalPath = true;
   node.__processing = {
-    type: "per-stem expander: DynamicsCompressorNode",
+    type: "per-stem downward expander: AudioWorkletNode",
     threshold_db: previewVocalExpander.thresholdDb,
     ratio: previewVocalExpander.ratio,
     attack_seconds: previewVocalExpander.attackSeconds,
@@ -2522,6 +2527,9 @@ async function loadFullStemPreview(root, songIndex) {
   const previewStems = appState.stems.filter((stem) => activeFiles.has(stem.file));
   let decoded = [];
   try {
+    if (previewStems.some((stem) => stem.role === "vocal")) {
+      await ctx.audioWorklet.addModule("/static/vocal-expander.js");
+    }
     decoded = await Promise.all(previewStems.map(async (stem) => {
       const res = await fetch(`/stem-full/${songIndex}/${stem.index}`);
       if (!res.ok || res.status === 204) return null;
