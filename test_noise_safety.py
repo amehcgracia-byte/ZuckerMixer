@@ -99,3 +99,13 @@ def test_bass_floor_gate_preserves_notes_near_noise_boundary():
     gate,_=p.build_section_gate(env,-100)
     assert np.all(gate[30:80] == 1)
     assert gate[10] == 0
+
+
+def test_track_dynamics_preserve_output_across_render_blocks():
+    sr=48000;t=np.arange(sr*4)/sr
+    audio=(.002*np.sin(2*np.pi*220*t)*(t>1)).astype(np.float32)
+    for role in ['bass','vocal','snare']:
+        whole=p.process_track_streaming(audio,sr,role,5,{},role)
+        state={}
+        chunked=np.concatenate([p.process_track_streaming(part,sr,role,5,state,role) for part in np.array_split(audio,9)])
+        np.testing.assert_allclose(chunked,whole,atol=2e-7,rtol=1e-4)

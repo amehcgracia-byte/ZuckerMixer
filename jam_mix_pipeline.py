@@ -237,7 +237,7 @@ LOGIC_FRAGMENT_RE = re.compile(r"^.+#\d{2,}$", re.IGNORECASE)
 # per-block overhead that makes long full-session verification renders
 # unnecessarily slow.  Peak/RMS safety is still measured and applied per
 # block, so this does not change the clipping contract.
-RENDER_CHUNK_SECONDS = 300.0
+RENDER_CHUNK_SECONDS = 30.0
 DETECTION_CACHE = Path(".jam_detection_envelopes.npz")
 DETECTION_CACHE_ROOT: Path | None = None
 LEGACY_DETECTION_CACHE: Path | None = None
