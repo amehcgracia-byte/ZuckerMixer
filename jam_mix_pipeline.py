@@ -136,7 +136,7 @@ NOISE_ANALYSIS_MAX_SECONDS = 300.0
 NOISE_BROADBAND_FLATNESS_THRESHOLD = 0.38
 NOISE_SUSTAINED_FRACTION_THRESHOLD = 0.70
 NOISE_EMPTY_RMS_THRESHOLD_DBFS = -43.0
-NOISE_FLOOR_MIN_DBFS = -72.0
+NOISE_FLOOR_MIN_DBFS = -110.0
 NOISE_REDUCTION_STRENGTH = 0.85
 NOISE_REDUCTION_FLOOR = 0.22
 HUM_PEAK_RATIO_THRESHOLD = 7.0
@@ -185,7 +185,7 @@ ROLE_COMPRESSOR_PROFILES = {
     "sax": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 120.0},
     "flute": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 120.0},
 }
-AUTO_MIX_PROFILE_VERSION = 10
+AUTO_MIX_PROFILE_VERSION = 11
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -5832,13 +5832,17 @@ def spectral_subtract_noise(
     hop = 512
     f, _, z = signal.stft(x.astype(np.float32), fs=sr, nperseg=n_fft, noverlap=n_fft - hop, boundary="zeros")
     profile_freqs = np.linspace(0.0, profile_sr / 2.0, len(noise_profile))
-    profile = np.interp(f, profile_freqs, np.asarray(noise_profile, dtype=np.float64), left=float(noise_profile[0]), right=float(noise_profile[-1]))
-    profile /= max(float(np.median(profile[1:])), 1e-12)
-    noise_amp = db_to_amp(noise_floor_dbfs)
-    noise_mag = noise_amp * profile * math.sqrt(n_fft)
+    usable = (profile_freqs >= 80) & (profile_freqs <= profile_sr * 0.40)
+    tail = float(np.median(np.asarray(noise_profile)[usable]))
+    profile = np.interp(f, profile_freqs, np.asarray(noise_profile, dtype=np.float64),
+                        left=float(noise_profile[0]), right=tail)
+    # scipy STFT uses spectrum scaling (DFT / sum(window)). The stored
+    # profile is an unscaled FFT; multiplying by sqrt(N) suppresses music.
+    # Resampling lowers white-noise power in proportion to its bandwidth.
+    noise_mag = profile * math.sqrt(sr / profile_sr) / float(np.sum(np.hanning(n_fft)))
     power = np.abs(z) ** 2
     noise_power = noise_mag[:, None] ** 2
-    gain = 1.0 - NOISE_REDUCTION_STRENGTH * noise_power / np.maximum(power, 1e-12)
+    gain = 1.0 - NOISE_REDUCTION_STRENGTH * noise_power / np.maximum(power, 1e-24)
     gain = np.clip(gain, NOISE_REDUCTION_FLOOR, 1.0)
     y = signal.istft(z * gain, fs=sr, nperseg=n_fft, noverlap=n_fft - hop, input_onesided=True, boundary=True)[1]
     y = np.asarray(y[: len(x)], dtype=np.float32)

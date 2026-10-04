@@ -1,5 +1,6 @@
 ## 2.1.66
 
+- Treat low raw noise floors before the large final mastering lift; preview and export share noise treatment. Correct spectral profile scaling so musical content is preserved.
 - Preserve quiet-source precision in Play Preview: float WAV staging, normalized encoding with source-level restoration, and a fresh cache format.
 - Includes shared noise-only input safety, wrapping Fine Tune channels and the Play Preview label from 2.1.65.
 

@@ -50,3 +50,23 @@ def test_noise_scan_covers_late_entry():
 def test_preview_and_render_share_empty_input_safety():
     analysis={'rms_values_db':{'hiss':-30,'empty':-93,'quiet_music':-60},'dynamic_spread_db':{'hiss':1,'empty':9,'quiet_music':20},'segment_peaks_db':{'empty':-90,'quiet_music':-40},'noise_diagnostics':{'hiss':{'case':'B'}}}
     assert p.empty_noise_stem_names(analysis)=={'hiss','empty'}
+
+
+def test_low_recording_noise_is_detected_before_mastering_lift():
+    rng=np.random.default_rng(5)
+    t=np.arange(p.RHYTHM_ANALYSIS_SR*8)/p.RHYTHM_ANALYSIS_SR
+    audio=(rng.normal(0,1e-5,len(t))+0.003*np.sin(2*np.pi*440*t)*(np.sin(2*np.pi*t)>0)).astype(np.float32)
+    assert classify(audio)['case']=='A'
+
+
+def test_noise_reduction_preserves_tone_and_reduces_noise_floor():
+    rng=np.random.default_rng(8);sr=p.RHYTHM_ANALYSIS_SR
+    noise=rng.normal(0,1e-5,sr*8).astype(np.float32)
+    t=np.arange(len(noise))/sr;tone=(0.003*np.sin(2*np.pi*440*t)).astype(np.float32)
+    info=classify(noise)
+    cleaned,_=p.spectral_subtract_noise(noise,sr,info['noise_profile'],sr,info['noise_floor_dbfs'])
+    rms=lambda x:float(np.sqrt(np.mean(x*x)))
+    assert p.amp_to_db(rms(cleaned)/rms(noise)) < -4
+    with_tone,_=p.spectral_subtract_noise(noise+tone,sr,info['noise_profile'],sr,info['noise_floor_dbfs'])
+    amplitude=float(np.dot(with_tone,tone)/np.dot(tone,tone))
+    assert abs(p.amp_to_db(amplitude)) < 0.5

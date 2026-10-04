@@ -4755,11 +4755,13 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
     if not np.isfinite(encoding_gain_db):
         encoding_gain_db = 0.0
     encoding_gain = pipeline.db_to_amp(encoding_gain_db)
-    path = PREVIEW_DIR / f"song_{segment_id:03d}_full_v2_stem_{stem_index:02d}_{start_ms}_{end_ms}_{encoding_gain_db:.2f}_{safe_stem}.mp3"
+    path = PREVIEW_DIR / f"song_{segment_id:03d}_full_v3_stem_{stem_index:02d}_{start_ms}_{end_ms}_{encoding_gain_db:.2f}_{safe_stem}.mp3"
     if not path.exists():
         chunk_frames = int(round(30.0 * sr))
         with tempfile.TemporaryDirectory(prefix=f"zucker_preview_{segment_id:03d}_{stem_index:02d}_") as tmp:
             wav_path = Path(tmp) / "stem.wav"
+            noise_info = analysis.get("noise_diagnostics", {}).get(stem.path.name, {})
+            noise_state = {}
             with sf.SoundFile(str(wav_path), "w", samplerate=sr, channels=channels, subtype="FLOAT") as writer:
                 for chunk_start in range(0, target_frames, chunk_frames):
                     nframes = min(chunk_frames, target_frames - chunk_start)
@@ -4770,6 +4772,15 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
                         chunk = np.mean(chunk, axis=1).astype(np.float32)
                     elif channels == 2 and chunk.ndim == 1:
                         chunk = np.column_stack((chunk, chunk)).astype(np.float32)
+                    if noise_info.get("case") in {"A", "hum"}:
+                        if chunk.ndim == 2:
+                            chunk = np.column_stack([
+                                pipeline.apply_noise_watchdog_streaming(chunk[:, channel], sr, noise_info,
+                                    noise_state, f"preview:{stem.path.name}:{channel}")[0]
+                                for channel in range(chunk.shape[1])])
+                        else:
+                            chunk, _ = pipeline.apply_noise_watchdog_streaming(
+                                chunk, sr, noise_info, noise_state, f"preview:{stem.path.name}")
                     writer.write(np.clip(np.nan_to_num(chunk[:nframes]) * encoding_gain, -1.0, 1.0))
             cmd = [
                 ffmpeg,
