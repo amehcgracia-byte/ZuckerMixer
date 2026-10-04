@@ -5620,15 +5620,31 @@ def apply_chunk_fades(chunk: np.ndarray, sr: int, chunk_start_frame: int, total_
     return y.astype(np.float32)
 
 
-def build_section_gate(envelope: np.ndarray) -> tuple[np.ndarray, list[tuple[float, float]]]:
+def resolved_instrument_gate(overrides: dict, role: str, noise: dict) -> bool:
+    # Old editors initialized False without a user choice. New explicit
+    # clicks carry a marker; preserve those choices and legacy enabled gates.
+    if override_bool(overrides.get("gate_user_confirmed"), False) or override_bool(overrides.get("gate_enabled"), False):
+        return override_bool(overrides.get("gate_enabled"), False)
+    return role == "bass" and str(noise.get("case", "none")) == "A"
+
+
+def section_gate_noise_floor(role: str, noise: dict, envelope: np.ndarray) -> float | None:
+    if role != "bass" or noise.get("case") != "A" or not len(envelope):
+        return None
+    return min(amp_to_db(float(np.percentile(envelope, 10))), float(noise.get("noise_floor_dbfs", -120.0)) + 6.0)
+
+
+def build_section_gate(envelope: np.ndarray, noise_floor_dbfs: float | None = None) -> tuple[np.ndarray, list[tuple[float, float]]]:
     if len(envelope) < int(INSTRUMENT_SECTION_GATE_MIN_SECONDS):
         return np.ones(len(envelope), dtype=np.float32), []
-    active = envelope[envelope > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)]
+    active = envelope[envelope > 1e-12]
     if len(active) == 0:
         return np.zeros(len(envelope), dtype=np.float32), [(0.0, len(envelope) * DETECTION_FRAME_SECONDS)]
     playing_level = max(float(np.percentile(active, 75)), 1e-9)
     rel_db = 20.0 * np.log10(np.maximum(envelope, 1e-12) / playing_level)
     quiet = rel_db < -INSTRUMENT_SECTION_GATE_DROP_DB
+    if noise_floor_dbfs is not None:
+        quiet = envelope < db_to_amp(noise_floor_dbfs + 8.0)
     min_bins = max(1, int(round(INSTRUMENT_SECTION_GATE_MIN_SECONDS / DETECTION_FRAME_SECONDS)))
     gate = np.ones(len(envelope), dtype=np.float32)
     muted: list[tuple[float, float]] = []
@@ -5647,7 +5663,20 @@ def build_section_gate(envelope: np.ndarray) -> tuple[np.ndarray, list[tuple[flo
     if fade_bins > 1 and len(gate):
         kernel = np.ones(fade_bins, dtype=np.float32) / fade_bins
         gate = np.convolve(gate, kernel, mode="same").astype(np.float32)
+    # Never attenuate an analysis frame containing the player. Fade on
+    # the noise side of the boundary so the first note keeps its attack.
+    gate[~quiet] = 1.0
     return np.clip(gate, 0.0, 1.0), muted
+
+
+def section_gate_points(envelope: np.ndarray, noise_floor_dbfs: float | None = None) -> list[list[float]]:
+    """Compact the render gate into exact linear automation for preview."""
+    gate, _ = build_section_gate(envelope, noise_floor_dbfs)
+    if not len(gate):
+        return []
+    changes = np.flatnonzero(np.abs(np.diff(gate, n=2)) > 1e-6) + 1
+    indices = np.unique(np.concatenate(([0], changes, [len(gate) - 1])))
+    return [[float(i * DETECTION_FRAME_SECONDS), float(gate[i])] for i in indices]
 
 
 def section_gate_for_chunk(gate: np.ndarray, sr: int, chunk_start_frame: int, nframes: int) -> np.ndarray:
@@ -5669,6 +5698,8 @@ def biquad_filter(x: np.ndarray, sr: int, kind: str, freq: float, q: float = 0.7
 def make_sos(sr: int, kind: str, freq: float, q: float = 0.707, gain_db: float = 0.0) -> np.ndarray:
     if kind == "highpass":
         return signal.butter(2, freq, btype="highpass", fs=sr, output="sos")
+    elif kind == "lowpass":
+        return signal.butter(2, freq, btype="lowpass", fs=sr, output="sos")
     elif kind == "lowshelf":
         return shelf_sos(sr, freq, q, gain_db, high=False)
     elif kind == "highshelf":
@@ -5828,6 +5859,18 @@ def spectral_subtract_noise(
     """
     if len(x) < 2048 or len(noise_profile) < 4:
         return x.astype(np.float32), 0.0
+    if len(x) > sr * 60:
+        block = int(math.ceil(sr * 30 / 512)) * 512
+        margin = 2048
+        output = np.empty_like(x, dtype=np.float32)
+        reductions = 0.0
+        for start in range(0, len(x), block):
+            end = min(start + block, len(x))
+            lo, hi = max(0, start - margin), min(len(x), end + margin)
+            filtered, reduction = spectral_subtract_noise(x[lo:hi], sr, noise_profile, profile_sr, noise_floor_dbfs)
+            output[start:end] = filtered[start-lo:end-lo]
+            reductions += reduction * (end-start)
+        return output, reductions / len(x)
     n_fft = 2048
     hop = 512
     f, _, z = signal.stft(x.astype(np.float32), fs=sr, nperseg=n_fft, noverlap=n_fft - hop, boundary="zeros")
@@ -6838,7 +6881,7 @@ def effective_mix_snapshot(
         delay_total = row.get("delay_total_db")
         role = str(row.get("effective_role") or row.get("role", ""))
         fx_enabled = override_bool(stem_override(song_overrides, name).get("fx_enabled"), True)
-        gate_enabled = override_bool(stem_override(song_overrides, name).get("gate_enabled"), False)
+        gate_enabled = override_bool(row.get("gate_enabled"), False)
         space_enabled = override_bool(row.get("space_enabled"), False)
         echo_enabled = override_bool(row.get("echo_enabled"), False)
         stems_payload[name] = {
@@ -8136,7 +8179,7 @@ def render_segment(
             "delay_scene_offset_db": delay_scene_offset_db,
             "effect_scene": effect_profile.get("scene") if isinstance(effect_profile, dict) else None,
             "fx_enabled": bool(overrides.get("fx_enabled", True)),
-            "gate_enabled": override_bool(overrides.get("gate_enabled"), False),
+            "gate_enabled": resolved_instrument_gate(overrides, mix_role, noise_diagnostics.get(stem.path.name, {})),
             "space_enabled": resolved_effect_settings(overrides, mix_role, effect_profile)["space_enabled"],
             "echo_enabled": resolved_effect_settings(overrides, mix_role, effect_profile)["echo_enabled"],
             "activity_decision": activity_reason,
@@ -8148,7 +8191,8 @@ def render_segment(
         }
         muted_regions: list[tuple[float, float]] = []
         if stem.role != "vocal":
-            gate, muted_regions = build_section_gate(segment_envelopes.get(stem.path.name, np.array([], dtype=np.float32)))
+            gate_envelope = segment_envelopes.get(stem.path.name, np.array([], dtype=np.float32))
+            gate, muted_regions = build_section_gate(gate_envelope, section_gate_noise_floor(mix_role, noise_diagnostics.get(stem.path.name, {}), gate_envelope))
             track_settings[stem.path.name]["section_gate"] = gate
         stem_report.append(
             {
@@ -8193,6 +8237,7 @@ def render_segment(
                 "override_gain_db": fader_gain_db,
                 "override_mute": override_bool(overrides.get("mute"), False),
                 "fx_enabled": track_settings[stem.path.name]["fx_enabled"],
+                "gate_enabled": track_settings[stem.path.name]["gate_enabled"],
                 "space_enabled": track_settings[stem.path.name]["space_enabled"],
                 "echo_enabled": track_settings[stem.path.name]["echo_enabled"],
                 "pan": enforced_pan(mix_role, stem.name, overrides.get("pan")),

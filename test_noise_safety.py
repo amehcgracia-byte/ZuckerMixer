@@ -70,3 +70,32 @@ def test_noise_reduction_preserves_tone_and_reduces_noise_floor():
     with_tone,_=p.spectral_subtract_noise(noise+tone,sr,info['noise_profile'],sr,info['noise_floor_dbfs'])
     amplitude=float(np.dot(with_tone,tone)/np.dot(tone,tone))
     assert abs(p.amp_to_db(amplitude)) < 0.5
+
+
+def test_section_gate_preserves_quiet_player_and_closes_long_pause():
+    playing=p.db_to_amp(-75);floor=p.db_to_amp(-105)
+    env=np.full(120,playing,dtype=np.float32)
+    env[40:80]=floor
+    gate,regions=p.build_section_gate(env)
+    assert gate[20] > .99
+    assert gate[60] < .01
+    points=np.asarray(p.section_gate_points(env))
+    restored=np.interp(np.arange(len(env))*p.DETECTION_FRAME_SECONDS,points[:,0],points[:,1])
+    np.testing.assert_allclose(restored,gate,atol=1e-6)
+    assert regions
+
+
+def test_bass_noise_gate_default_and_explicit_choice():
+    assert p.resolved_instrument_gate({'gate_enabled':False},'bass',{'case':'A'})
+    assert not p.resolved_instrument_gate({'gate_enabled':False,'gate_user_confirmed':True},'bass',{'case':'A'})
+    assert not p.resolved_instrument_gate({},'bass',{'case':'none'})
+    assert not p.resolved_instrument_gate({},'guitar',{'case':'A'})
+
+
+def test_bass_floor_gate_preserves_notes_near_noise_boundary():
+    env=np.full(100,p.db_to_amp(-100),dtype=np.float32)
+    env[30:60]=p.db_to_amp(-82)
+    env[60:80]=p.db_to_amp(-55)
+    gate,_=p.build_section_gate(env,-100)
+    assert np.all(gate[30:80] == 1)
+    assert gate[10] == 0

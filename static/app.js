@@ -1551,6 +1551,7 @@ function renderFaders(root, songIndex) {
       button.addEventListener("click", async () => {
         const key = button.dataset.effect;
         ov[key] = !(ov[key] === true);
+        if (key === "gate_enabled") { ov.gate_user_confirmed = true; setLinkedOverride(songIndex, linked, "gate_user_confirmed", true); }
         if (key === "space_enabled" || key === "echo_enabled") {
           ov.effects_user_confirmed = true;
           setLinkedOverride(songIndex, linked, "effects_user_confirmed", true);
@@ -1764,6 +1765,7 @@ function disconnectPreviewGraph(mix, reason = "teardown") {
   Object.values(mix.preGains || {}).forEach(disconnectPreviewNode);
   Object.values(mix.faderGains || {}).forEach(disconnectPreviewNode);
   Object.values(mix.vocalExpanders || {}).forEach(disconnectPreviewNode);
+  Object.values(mix.instrumentGates || {}).forEach(disconnectPreviewNode);
   Object.values(mix.gains || {}).forEach(disconnectPreviewNode);
   Object.values(mix.panners || {}).forEach(disconnectPreviewNode);
   Object.values(mix.reverbSends || {}).forEach(disconnectPreviewNode);
@@ -1790,6 +1792,7 @@ function disconnectPreviewGraph(mix, reason = "teardown") {
   mix.preGains = {};
   mix.faderGains = {};
   mix.vocalExpanders = {};
+  mix.instrumentGates = {};
   mix.gains = {};
   mix.panners = {};
   mix.reverbSends = {};
@@ -1806,17 +1809,45 @@ function previewEffectEnabled(songIndex, stem, key) {
   return currentStemOverrides(songIndex, stem.file)[key] === true;
 }
 
+function schedulePreviewSectionGate(mix, songIndex, stem, offset, when) {
+  const node = mix?.instrumentGates?.[stem.file];
+  if (!node) return;
+  const points = previewStemParams(songIndex, stem)?.gate_points || [];
+  const param = node.gain;
+  param.cancelScheduledValues(when);
+  if (!previewFxEnabled(songIndex, stem) || !previewEffectEnabled(songIndex, stem, "gate_enabled") || !points.length) {
+    param.setValueAtTime(1, when);
+    return;
+  }
+  let value = Number(points[0][1]);
+  for (let i = 1; i < points.length; i++) {
+    const [t, gain] = points[i];
+    const [before, previous] = points[i - 1];
+    if (offset <= t) {
+      value = previous + (gain - previous) * Math.max(0, offset - before) / Math.max(1e-9, t - before);
+      break;
+    }
+    value = gain;
+  }
+  param.setValueAtTime(value, when);
+  points.forEach(([t, gain]) => {
+    if (t > offset) param.linearRampToValueAtTime(gain, when + t - offset);
+  });
+}
+
 function reconnectPreviewStemFx(mix, songIndex, stem, enabled) {
   const preGain = mix?.preGains?.[stem.file];
   const fader = faderGainNode(mix, stem.file);
   const eqNodes = Object.values(mix?.eqNodes?.[stem.file] || {}).filter((node) => node && typeof node.connect === "function");
   const expander = mix?.vocalExpanders?.[stem.file];
+  const instrumentGate = mix?.instrumentGates?.[stem.file];
   if (!preGain || !fader) return;
   try { preGain.disconnect(); } catch (_err) {}
   eqNodes.forEach((node) => { try { node.disconnect(); } catch (_err) {} });
   if (expander) { try { expander.disconnect(); } catch (_err) {} }
+  if (instrumentGate) { try { instrumentGate.disconnect(); } catch (_err) {} }
   const gateEnabled = enabled && (stem.role === "vocal" || previewEffectEnabled(songIndex, stem, "gate_enabled"));
-  const chain = enabled ? [...eqNodes, ...(expander && gateEnabled ? [expander] : []), fader] : [fader];
+  const chain = enabled ? [...eqNodes, ...(expander && gateEnabled ? [expander] : []), ...(instrumentGate && gateEnabled ? [instrumentGate] : []), fader] : [fader];
   let from = preGain;
   chain.forEach((to) => { from.connect(to); to.__receivesFromNode = from; from = to; });
   fader.__fedByEqChain = Boolean(enabled && eqNodes.length);
@@ -1827,6 +1858,7 @@ function reconnectPreviewStemFx(mix, songIndex, stem, enabled) {
   if (reverb) reverb.gain.value = enabled && previewEffectEnabled(songIndex, stem, "space_enabled") ? previewSendGain(songIndex, stem, "reverb_send_db") : 0;
   if (delay) delay.gain.value = enabled && previewEffectEnabled(songIndex, stem, "echo_enabled") ? previewSendGain(songIndex, stem, "delay_send_db") : 0;
   preGain.__fxEnabled = enabled;
+  if (instrumentGate) schedulePreviewSectionGate(mix, songIndex, stem, currentPreviewOffset(mix), mix.ctx.currentTime);
 }
 
 function logPreviewGraphIntegrity(songIndex, reason) {
@@ -2502,6 +2534,7 @@ async function loadFullStemPreview(root, songIndex) {
     preGains: {},
     faderGains: {},
     vocalExpanders: {},
+    instrumentGates: {},
     gains: {},
     panners: {},
     reverbSends: {},
@@ -2616,6 +2649,7 @@ async function loadFullStemPreview(root, songIndex) {
     }, { __inSignalPath: true });
     mix.preGains[stem.file] = preGain;
     if (vocalExpander) mix.vocalExpanders[stem.file] = vocalExpander;
+    if (stem.role !== "vocal") mix.instrumentGates[stem.file] = ctx.createGain();
     mix.faderGains[stem.file] = gain;
     mix.gains[stem.file] = gain;
     mix.panners[stem.file] = panner;
@@ -2647,6 +2681,7 @@ async function loadFullStemPreview(root, songIndex) {
 function startPreviewSources(mix, songIndex, offset) {
   stopPreviewSources(mix);
   const when = mix.ctx.currentTime + 0.03;
+  mix.buffers.forEach(({ stem }) => schedulePreviewSectionGate(mix, songIndex, stem, offset, when));
   mix.sources = mix.buffers.map(({ stem, buffer }) => {
     const source = mix.ctx.createBufferSource();
     source.buffer = buffer;

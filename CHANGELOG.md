@@ -1,3 +1,11 @@
+## 2.1.68
+
+- Automatically gate a bass input with a detected noise floor during long non-playing passages, while preserving musical frames and explicit Gate choices.
+- Connect instrument Gate to Play Preview, including seek timing and FX bypass, using the same gate curve as export.
+- Derive gate activity from each song rather than an absolute input level, so softly recorded instruments remain audible.
+- Bound spectral-filter memory in long renders and retain existing analysis caches.
+- Invalidate old preview audio caches and test Gate timing, quiet players, and explicit choices.
+
 ## 2.1.67
 
 - Replace the Play Preview microphone compressor with a real downward expander. Preserve loud vocals and attenuate quiet microphone floor, with independent state per channel.

@@ -706,8 +706,9 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
         if "solo" not in stem_ov:
             stem_ov["solo"] = False
             changed = True
-        if "gate_enabled" not in stem_ov:
-            stem_ov["gate_enabled"] = False
+        resolved_gate = pipeline.resolved_instrument_gate(stem_ov, mix_role, analysis_cache.get("noise_diagnostics", {}).get(stem.path.name, {}))
+        if stem_ov.get("gate_enabled") != resolved_gate:
+            stem_ov["gate_enabled"] = resolved_gate
             changed = True
         # Automatic effects are content-aware by song. Once the user toggles
         # an effect in the editor, the explicit marker keeps that choice.
@@ -794,6 +795,7 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
             "solo": solo,
             "fx_enabled": bool(stem_ov.get("fx_enabled", True)),
             "gate_enabled": bool(stem_ov.get("gate_enabled", False)),
+            "gate_points": pipeline.section_gate_points(segment_envelopes.get(stem.path.name, np.array([], dtype=np.float32)), pipeline.section_gate_noise_floor(mix_role, analysis_cache.get("noise_diagnostics", {}).get(stem.path.name, {}), segment_envelopes.get(stem.path.name, np.array([], dtype=np.float32)))) if mix_role != "vocal" else [],
             "space_enabled": bool(stem_ov.get("space_enabled", False)),
             "echo_enabled": bool(stem_ov.get("echo_enabled", False)),
             "effects_user_confirmed": bool(stem_ov.get("effects_user_confirmed", False)),
@@ -2954,7 +2956,7 @@ def normalize_overrides(payload: Any) -> dict[str, Any]:
                             clean_stem[key] = float(stem_payload[key])
                         except (TypeError, ValueError):
                             continue
-                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "effects_user_confirmed", "manual_makeup_gain_db", "user_confirmed", "user_fader_confirmed"):
+                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "effects_user_confirmed", "gate_user_confirmed", "manual_makeup_gain_db", "user_confirmed", "user_fader_confirmed"):
                     if isinstance(stem_payload.get(key), bool):
                         clean_stem[key] = stem_payload[key]
                 if clean_stem:
@@ -4755,7 +4757,7 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
     if not np.isfinite(encoding_gain_db):
         encoding_gain_db = 0.0
     encoding_gain = pipeline.db_to_amp(encoding_gain_db)
-    path = PREVIEW_DIR / f"song_{segment_id:03d}_full_v3_stem_{stem_index:02d}_{start_ms}_{end_ms}_{encoding_gain_db:.2f}_{safe_stem}.mp3"
+    path = PREVIEW_DIR / f"song_{segment_id:03d}_full_v4_stem_{stem_index:02d}_{start_ms}_{end_ms}_{encoding_gain_db:.2f}_{safe_stem}.mp3"
     if not path.exists():
         chunk_frames = int(round(30.0 * sr))
         with tempfile.TemporaryDirectory(prefix=f"zucker_preview_{segment_id:03d}_{stem_index:02d}_") as tmp:

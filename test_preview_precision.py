@@ -27,4 +27,4 @@ def test_quiet_preview_preserves_source_level_without_pcm16_hiss(tmp_path,monkey
     rms=lambda x:float(np.sqrt(np.mean(x*x)))
     assert abs(p.amp_to_db(rms(restored))-p.amp_to_db(rms(original)))<1
     assert p.amp_to_db(rms(restored-original)) < -105
-    assert '_full_v3_' in next((tmp_path/'preview').glob('*.mp3')).name
+    assert '_full_v4_' in next((tmp_path/'preview').glob('*.mp3')).name
