@@ -1385,6 +1385,10 @@ function renderFaders(root, songIndex) {
       });
     }
     if (params) {
+      if (!ov.gate_user_confirmed && typeof params.gate_enabled === "boolean") {
+        ov.gate_enabled = params.gate_enabled;
+        livePreviewStemOverrides(songIndex, stem.file).gate_enabled = params.gate_enabled;
+      }
       ov.gain_db ??= Number(params.gain_db || 0);
       ov.fader_db ??= Number(params.fader_db || 0);
       ov.pan ??= Number(params.pan || 0);
@@ -2902,6 +2906,18 @@ async function saveSettings(partial) {
   await refreshState();
 }
 
+function preservePreviewMixParams(next, previous) {
+  if (!previous || next.source_folder !== previous.source_folder) return;
+  const oldSongs = new Map((previous.songs || []).map(song => [String(song.id), song]));
+  (next.songs || []).forEach(song => {
+    const old = oldSongs.get(String(song.id));
+    if (!old?.mix_params || song.mix_params) return;
+    if (["start", "end", "render_end", "revision"].every(key => song[key] === old[key])) {
+      song.mix_params = old.mix_params;
+    }
+  });
+}
+
 async function refreshState(options = {}) {
   const renderLarge = options.renderLarge !== false;
   const rawNext = await fetchStateSnapshot();
@@ -2920,6 +2936,7 @@ async function refreshState(options = {}) {
       }
     });
   }
+  preservePreviewMixParams(next, appState);
   appState = next;
   refreshSlotSummary();
     renderBuildInfo();

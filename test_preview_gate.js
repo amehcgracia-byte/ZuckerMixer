@@ -12,3 +12,13 @@ events.length=0;enabled=false;
 context.schedulePreviewSectionGate(mix,2,{file:'kit'},7,200);
 assert.deepEqual(events,[['cancel',200],['set',1,200]],'turning Gate off must cancel closing ramps and restore unity');
 console.log('Instrument Gate preserves seek timing and cancels automation when disabled.');
+
+vm.runInContext(source.slice(source.indexOf('function preservePreviewMixParams('),source.indexOf('async function refreshState(')),context);
+const previous={source_folder:'source',songs:[{id:2,start:10,end:50,revision:3,mix_params:{stems:{bass:{gate_enabled:true,gate_points:[[0,0],[4,1]]}}}}]};
+const next={source_folder:'source',songs:[{id:2,start:10,end:50,revision:3}]};
+context.preservePreviewMixParams(next,previous);
+assert.equal(next.songs[0].mix_params,previous.songs[0].mix_params,'job polling must retain gate automation');
+const changed={source_folder:'source',songs:[{id:2,start:11,end:50,revision:3}]};
+context.preservePreviewMixParams(changed,previous);assert.equal(changed.songs[0].mix_params,undefined,'changing a cut invalidates gate timing');
+const other={source_folder:'other',songs:[{id:2,start:10,end:50,revision:3}]};
+context.preservePreviewMixParams(other,previous);assert.equal(other.songs[0].mix_params,undefined,'changing source invalidates the plan');
