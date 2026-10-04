@@ -93,6 +93,11 @@ if "--self-check" in sys.argv:
     pipeline.ensure_matchering_available()
     if pipeline.matchering_api is None:
         raise SystemExit(f"Matchering self-check failed: {pipeline.MATCHERING_IMPORT_ERROR}")
+    with pipeline.bounded_reference_eq():
+        probe = pipeline.bound_reference_eq_fir(pipeline.np.zeros(2048), 44100, "side")
+        if pipeline.np.any(probe):
+            raise SystemExit("Reference EQ safety self-check failed")
+    print("ZuckerMixer bounded reference EQ self-check: OK", flush=True)
     print("ZuckerMixer Matchering import self-check: OK", flush=True)
     print("ZuckerMixer frozen import self-check: OK", flush=True)
     print("ZuckerMixer bundled Whisper import self-check: OK", flush=True)
