@@ -1,3 +1,9 @@
+## 2.1.65
+
+- Silence stationary broadband noise inputs even when their level is high.
+- Measure noise away from resampling roll-off and sample across the song to preserve later instrument entries.
+- Invalidate prior automatic mix analysis so the new safety decision is applied.
+
 # Changes
 
 ## 2.1.64

@@ -1028,3 +1028,14 @@ dialog { position: fixed; padding-top: 42px; }
 .message-dialog p { white-space: pre-wrap; }
 .toast.show { display: flex; align-items: start; gap: 12px; }
 .toast button { margin-left: auto; font-size: 20px; line-height: 1; padding: 2px 6px; }
+
+/* Fine Tune channels use the full card width and wrap without shrinking. */
+.fine-body { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+.faders { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 148px), 1fr)); overflow-x: hidden; width: 100%; }
+.strip { min-width: 0; max-width: 100%; }
+.strip > *, .strip button { min-width: 0; max-width: 100%; }
+.strip button { white-space: normal; overflow-wrap: anywhere; }
+.strip .stem-effects { flex-wrap: wrap; }
+.simple-sliders { position: static; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
+.preview-transport { grid-template-columns: auto minmax(0, 1fr) auto; }
+@media (max-width: 720px) { .preview-transport { grid-template-columns: minmax(0, 1fr); } }

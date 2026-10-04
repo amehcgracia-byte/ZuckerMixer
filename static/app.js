@@ -1272,10 +1272,10 @@ function fineTuneHtml(song) {
           </label>
           <div data-quick-controls="${song.id}">
           <div class="preview-label"><strong>Full song · approximate</strong> <span class="warn">Dynamics and mastering are approximated.</span></div>
-          <button data-preview-toggle="${song.id}" class="accent">Mix Preview</button>
+          <button data-preview-toggle="${song.id}" class="accent">Play Preview</button>
           <input data-preview-seek="${song.id}" type="range" min="0" max="0" step="0.1" value="0" disabled>
           <span data-preview-time="${song.id}">00:00:00 / 00:00:00</span>
-          <span class="muted" data-preview-cache="${song.id}">Audio loads when you press Mix Preview</span>
+          <span class="muted" data-preview-cache="${song.id}">Audio loads when you press Play Preview</span>
           <span class="warn" data-preview-warning="${song.id}" hidden></span>
           </div>
           <div data-real-controls="${song.id}" hidden>
@@ -2619,7 +2619,7 @@ async function loadFullStemPreview(root, songIndex) {
   if (status) status.textContent = mix.buffers.length ? previewCacheText(mix.cacheBytes) : "No active preview audio found for this song.";
   if (playButton) {
     playButton.disabled = !mix.buffers.length;
-    playButton.textContent = mix.buffers.length ? "Mix Preview" : "Preview unavailable";
+    playButton.textContent = mix.buffers.length ? "Play Preview" : "Preview unavailable";
   }
   return mix;
 }
@@ -2724,7 +2724,7 @@ function updatePreviewTransport(root, songIndex) {
   if (!mix) return;
   if (play) play.disabled = !mix.loaded || !mix.buffers.length;
   const offset = currentPreviewOffset(mix);
-  if (play) play.textContent = mix.playing ? "Pause Preview" : "Mix Preview";
+  if (play) play.textContent = mix.playing ? "Pause Preview" : "Play Preview";
   if (seek && document.activeElement !== seek) seek.value = String(offset);
   if (time) time.textContent = `${previewTimeText(offset)} / ${previewTimeText(mix.duration || 0)}`;
   if (mix.timer) clearTimeout(mix.timer);

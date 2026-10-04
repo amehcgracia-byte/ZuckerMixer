@@ -622,9 +622,9 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
     effect_echo_roles = effect_profile.get("role_echo_enabled", {}) if isinstance(effect_profile, dict) else {}
     effect_role_offsets = effect_profile.get("role_offsets_db", {}) if isinstance(effect_profile, dict) else {}
     loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
-    # All successfully decoded stems enter every song plan. Explicit mute and
-    # solo overrides are applied later; low energy must not hide a track.
-    active_names = {stem.path.name for stem in state["stems"]}
+    # Preview and export must exclude the same empty/noisy inputs.
+    excluded_noise = pipeline.empty_noise_stem_names(analysis_cache)
+    active_names = {stem.path.name for stem in state["stems"] if stem.path.name not in excluded_noise}
     active_files = set(active_names)
     cache[key] = sorted(active_files)
     active_energies = [energies[name] for name in active_names]

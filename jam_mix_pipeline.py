@@ -185,7 +185,7 @@ ROLE_COMPRESSOR_PROFILES = {
     "sax": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 120.0},
     "flute": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 120.0},
 }
-AUTO_MIX_PROFILE_VERSION = 9
+AUTO_MIX_PROFILE_VERSION = 10
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -5463,6 +5463,24 @@ def segment_stem_activity_decision(
     return False, "; ".join(reasons)
 
 
+def empty_noise_stem_names(analysis: dict[str, object]) -> set[str]:
+    """One safety decision shared by preview and export, before any gain."""
+    excluded = set()
+    diagnostics = analysis.get("noise_diagnostics", {})
+    rms = analysis.get("rms_values_db", {})
+    spreads = analysis.get("dynamic_spread_db", {})
+    peaks = analysis.get("segment_peaks_db", {})
+    for name, value in rms.items():
+        info = diagnostics.get(name, {})
+        if (info.get("case") == "B"
+            or (float(info.get("rms_dbfs", 0)) <= EMPTY_STEM_RMS_DBFS
+                and float(info.get("level_spread_db", 99)) <= EMPTY_STEM_SPREAD_DB)
+            or (float(value) <= -50 and float(spreads.get(name, 99)) <= 6)
+            or (float(value) <= -85 and float(peaks.get(name, 0)) <= -75)):
+            excluded.add(name)
+    return excluded
+
+
 def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[str, dict[str, object]]:
     """Classify sustained broadband noise, empty noisy inputs, and mains hum.
 
@@ -5472,7 +5490,12 @@ def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[s
     """
     result: dict[str, dict[str, object]] = {}
     for stem in stems:
-        audio = _analysis_mono(stem, segment, max_seconds=NOISE_ANALYSIS_MAX_SECONDS)
+        # Cover the song, including instruments that enter after its opening.
+        window_seconds = min(segment.duration, NOISE_ANALYSIS_MAX_SECONDS / 3)
+        starts = np.linspace(segment.start, max(segment.start, segment.end - window_seconds), 3)
+        parts = [_analysis_mono(stem, Segment(float(start), float(start + window_seconds)),
+                               max_seconds=window_seconds) for start in np.unique(starts)]
+        audio = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
         if len(audio) < RHYTHM_ANALYSIS_SR * 2:
             result[stem.path.name] = {"flagged": False, "is_noise": False, "case": "none", "reason": "insufficient audio"}
             continue
@@ -5497,7 +5520,12 @@ def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[s
         noise_mag = np.median(magnitude[quiet], axis=0) if np.any(quiet) else np.median(magnitude, axis=0)
         noise_power = noise_mag * noise_mag
         noise_floor_db = amp_to_db(float(np.sqrt(np.mean(noise_mag * noise_mag) / max(1.0, frame))))
-        noise_flatness = float(np.exp(np.mean(np.log(noise_power))) / max(np.mean(noise_power), 1e-12))
+        # Exclude DC and resampling roll-off: otherwise filtered white hiss
+        # looks tonal merely because the Nyquist bins were attenuated.
+        spectral_freqs = np.fft.rfftfreq(frame, 1.0 / RHYTHM_ANALYSIS_SR)
+        usable_band = (spectral_freqs >= 80) & (spectral_freqs <= RHYTHM_ANALYSIS_SR * 0.40)
+        usable_noise_power = noise_power[usable_band]
+        noise_flatness = float(np.exp(np.mean(np.log(usable_noise_power))) / max(np.mean(usable_noise_power), 1e-12))
         sustained_fraction = float(np.mean(frame_db >= quiet_cut - 3.0))
 
         freqs = np.fft.rfftfreq(frame, 1.0 / RHYTHM_ANALYSIS_SR)
@@ -5519,7 +5547,10 @@ def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[s
         sustained = bool(sustained_fraction >= NOISE_SUSTAINED_FRACTION_THRESHOLD)
         avg_rms = amp_to_db(float(np.sqrt(np.mean(frame_rms * frame_rms) + 1e-12)))
         peak_to_floor_db = float(np.percentile(frame_db, 90) - noise_floor_db)
-        empty_noise = bool(flat_broadband and sustained and avg_rms <= NOISE_EMPTY_RMS_THRESHOLD_DBFS and peak_to_floor_db < 12.0)
+        level_spread_db = float(np.percentile(frame_db, 95) - np.percentile(frame_db, 5))
+        stationary_noise = level_spread_db <= 3.0
+        empty_noise = bool(flat_broadband and sustained and peak_to_floor_db < 12.0
+                           and (stationary_noise or avg_rms <= NOISE_EMPTY_RMS_THRESHOLD_DBFS))
         broadband_overlay = bool(flat_broadband and sustained and noise_floor_db >= NOISE_FLOOR_MIN_DBFS and peak_to_floor_db >= 12.0 and not is_hum)
         if is_hum:
             case = "hum"
@@ -5546,7 +5577,7 @@ def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[s
             "rms_dbfs": float(avg_rms),
             "noise_floor_dbfs": float(noise_floor_db),
             "noise_floor_reduction_target_db": -10.0 if case == "A" else -0.0,
-            "level_spread_db": float(np.percentile(frame_db, 95) - np.percentile(frame_db, 5)),
+            "level_spread_db": level_spread_db,
             "spectral_flatness": float(np.mean(flatness)),
             "noise_floor_flatness": noise_flatness,
             "sustained_fraction": sustained_fraction,
@@ -7844,27 +7875,7 @@ def render_segment(
         raise RuntimeError("Analyze required: Auto-Mix analysis snapshot is incomplete.")
     if not isinstance(noise_diagnostics, dict):
         noise_diagnostics = {}
-    noise_names = [name for name, info in noise_diagnostics.items() if info.get("case") == "B"]
-    quiet_empty_names = [
-        name for name, info in noise_diagnostics.items()
-        if isinstance(info, dict)
-        and float(info.get("rms_dbfs", -120.0) or -120.0) <= EMPTY_STEM_RMS_DBFS
-        and float(info.get("level_spread_db", 0.0) or 0.0) <= EMPTY_STEM_SPREAD_DB
-    ]
-    # A beatbox/drum stem can contain a real part in one slot and only its
-    # microphone noise in the next. A low, flat envelope is an empty source,
-    # not a reason to apply makeup gain and raise hiss.
-    stem_roles = {stem.path.name: stem.role for stem in stems}
-    flat_empty_names = []
-    for name, spread in dynamic_spread_db.items():
-        try:
-            rms_value = float(rms_values_db.get(name, -120.0))
-            spread_value = float(spread or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if rms_value <= -50.0 and spread_value <= 6.0:
-            flat_empty_names.append(name)
-    noise_names = sorted(set(noise_names + quiet_empty_names + flat_empty_names))
+    noise_names = sorted(empty_noise_stem_names(analysis_cache))
     if noise_names:
         print(f"NOISE DETECTION song={index}: empty/noisy inputs muted: {', '.join(noise_names)}", flush=True)
     watchdog_names = [name for name, info in noise_diagnostics.items() if info.get("flagged")]
