@@ -1,3 +1,10 @@
+## 2.1.69
+
+- Compare vocal and instrument activity over their common duration when recordings end at different times, preventing batch failures.
+
+- Bound reference mastering EQ to avoid raising recording hiss, especially in the stereo side signal. Preserve reference cuts, phase and instrument panning; taper positive high-frequency boosts to unity.
+- Full-song listening comparison for “Much to me”: listener confirmed the snow noise disappears with bounded reference EQ after bass gating.
+
 ## 2.1.68
 
 - Automatically gate a bass input with a detected noise floor during long non-playing passages, while preserving musical frames and explicit Gate choices.

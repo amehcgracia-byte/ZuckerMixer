@@ -26,7 +26,7 @@ import hashlib
 import io
 import queue
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
@@ -51,6 +51,51 @@ def ensure_matchering_available() -> None:
         matchering_api = matchering
     except Exception as exc:
         MATCHERING_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+_REFERENCE_EQ_LOCK = threading.RLock()
+
+
+def bound_reference_eq_fir(fir: np.ndarray, sample_rate: float, channel: str) -> np.ndarray:
+    """Keep reference EQ from amplifying recording noise or inventing stereo width.
+
+    Retain the FIR phase and all cuts. Positive mid boosts taper from 12 dB
+    at 3 kHz to unity at 6 kHz; side boosts also stay below 6 dB.
+    """
+    response = np.fft.rfft(np.fft.ifftshift(fir))
+    frequencies = np.fft.rfftfreq(len(fir), 1.0 / sample_rate)
+    limit_db = np.interp(
+        frequencies, [0.0, 3000.0, 6000.0, sample_rate / 2.0],
+        [12.0, 12.0, 0.0, 0.0],
+    )
+    if channel == "side":
+        limit_db = np.minimum(limit_db, 6.0)
+    magnitude = np.abs(response)
+    attenuation = np.minimum(
+        1.0, np.power(10.0, limit_db / 20.0) / np.maximum(magnitude, 1e-12)
+    )
+    return np.fft.fftshift(np.fft.irfft(response * attenuation, n=len(fir)))
+
+
+@contextmanager
+def bounded_reference_eq():
+    # Matchering 2.0.6 calls this module alias for each mid/side FIR. Serialize
+    # the temporary hook and always restore it, including failed renders.
+    import matchering.stages as stages
+    with _REFERENCE_EQ_LOCK:
+        original = stages.get_fir
+
+        def safe_fir(target, reference, name, config):
+            return bound_reference_eq_fir(
+                original(target, reference, name, config),
+                config.internal_sample_rate, name,
+            )
+
+        stages.get_fir = safe_fir
+        try:
+            yield
+        finally:
+            stages.get_fir = original
 
 
 def validate_mastering_reference(reference: str | Path | None) -> None:
@@ -6299,8 +6344,9 @@ def vocal_harmonic_balance(
         vocal_env = group_env(vocal_names)
         harmonic_env = group_env(harmonic_names)
         if vocal_env is not None and harmonic_env is not None and len(vocal_env):
-            voice_mask = vocal_env > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
-            overlap = float(np.mean(harmonic_env[voice_mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(voice_mask) else 0.0
+            length = min(len(vocal_env), len(harmonic_env))
+            voice_mask = vocal_env[:length] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
+            overlap = float(np.mean(harmonic_env[:length][voice_mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(voice_mask) else 0.0
     gap = None if vocal_level is None or harmonic_level is None else float(vocal_level - harmonic_level)
     vocal_correction = 0.0
     if gap is not None and gap < VOCAL_PRIORITY_MARGIN_DB:
@@ -6349,8 +6395,9 @@ def per_song_role_balance_corrections(
         role_env = env_for(names)
         if vocal_env is None or role_env is None or not len(vocal_env):
             return 0.0
-        mask = vocal_env > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
-        return float(np.mean(role_env[mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(mask) else 0.0
+        length = min(len(vocal_env), len(role_env))
+        mask = vocal_env[:length] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
+        return float(np.mean(role_env[:length][mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(mask) else 0.0
 
     role_groups = {
         "guitar": [name for name, role in effective_roles.items() if role == "guitar"],
@@ -7172,11 +7219,12 @@ def master_temp_wav_streaming(premaster_path: Path, master_path: Path, sr: int) 
         print(f"  mastering backend: Matchering reference={reference}", flush=True)
         matchering_api.log(print)
         try:
-            matchering_api.process(
-                target=str(premaster_path),
-                reference=str(reference),
-                results=[matchering_api.pcm24(str(master_path))],
-            )
+            with bounded_reference_eq():
+                matchering_api.process(
+                    target=str(premaster_path),
+                    reference=str(reference),
+                    results=[matchering_api.pcm24(str(master_path))],
+                )
         except Exception as exc:
             if "Track length is exceeded in the TARGET file" not in str(exc):
                 raise
