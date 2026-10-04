@@ -4746,13 +4746,21 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
     start_ms = int(round(segment.start * 1000))
     end_ms = int(round(segment.end * 1000))
     channels = 1 if stem.channels == 1 else 2
-    bitrate = "64k" if channels == 1 else "96k"
-    path = PREVIEW_DIR / f"song_{segment_id:03d}_full_stem_{stem_index:02d}_{start_ms}_{end_ms}_{safe_stem}.mp3"
+    bitrate = "128k" if channels == 1 else "192k"
+    # Encode quiet sources near full scale, then restore their original level
+    # in the browser. PCM16 before makeup adds audible quantization hiss.
+    analysis = song_analysis_snapshot(state, segment, segment_id)
+    source_peak_db = float(analysis.get("segment_peaks_db", {}).get(stem.path.name, 0.0))
+    encoding_gain_db = float(np.clip(-6.0 - source_peak_db, 0.0, 60.0))
+    if not np.isfinite(encoding_gain_db):
+        encoding_gain_db = 0.0
+    encoding_gain = pipeline.db_to_amp(encoding_gain_db)
+    path = PREVIEW_DIR / f"song_{segment_id:03d}_full_v2_stem_{stem_index:02d}_{start_ms}_{end_ms}_{encoding_gain_db:.2f}_{safe_stem}.mp3"
     if not path.exists():
         chunk_frames = int(round(30.0 * sr))
         with tempfile.TemporaryDirectory(prefix=f"zucker_preview_{segment_id:03d}_{stem_index:02d}_") as tmp:
             wav_path = Path(tmp) / "stem.wav"
-            with sf.SoundFile(str(wav_path), "w", samplerate=sr, channels=channels, subtype="PCM_16") as writer:
+            with sf.SoundFile(str(wav_path), "w", samplerate=sr, channels=channels, subtype="FLOAT") as writer:
                 for chunk_start in range(0, target_frames, chunk_frames):
                     nframes = min(chunk_frames, target_frames - chunk_start)
                     chunk = pipeline.read_stem_chunk(stem, segment, chunk_start, nframes)
@@ -4762,7 +4770,7 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
                         chunk = np.mean(chunk, axis=1).astype(np.float32)
                     elif channels == 2 and chunk.ndim == 1:
                         chunk = np.column_stack((chunk, chunk)).astype(np.float32)
-                    writer.write(chunk[:nframes])
+                    writer.write(np.clip(np.nan_to_num(chunk[:nframes]) * encoding_gain, -1.0, 1.0))
             cmd = [
                 ffmpeg,
                 "-y",
@@ -4781,6 +4789,7 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
             subprocess.run(cmd, check=True)
     response = ranged_file_response(path, mimetype="audio/mpeg")
     response.headers["X-Preview-Cache-Bytes"] = str(path.stat().st_size)
+    response.headers["X-Preview-Source-Gain-Db"] = str(encoding_gain_db)
     return response
 
 

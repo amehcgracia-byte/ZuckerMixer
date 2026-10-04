@@ -1,0 +1,18 @@
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const begin = source.indexOf('function restorePreviewSourceLevel(');
+const end = source.indexOf('async function loadFullStemPreview(', begin);
+const context = { dbToGain: db => 10 ** (db / 20) };
+vm.createContext(context);
+vm.runInContext(source.slice(begin, end), context);
+const channels = [new Float32Array([0.1, -0.1]), new Float32Array([0.2, -0.2])];
+const buffer = {numberOfChannels: 2, getChannelData: i => channels[i]};
+context.restorePreviewSourceLevel(buffer, '60');
+assert.ok(Math.abs(channels[0][0] - 0.0001) < 1e-9);
+assert.ok(Math.abs(channels[1][0] - 0.0002) < 1e-9);
+context.restorePreviewSourceLevel(buffer, 'invalid');
+assert.ok(Math.abs(channels[0][0] - 0.0001) < 1e-9);
+assert.ok(source.includes('restorePreviewSourceLevel(buffer, res.headers.get("X-Preview-Source-Gain-Db"))'));
+console.log('Encoded preview source levels restored for every channel.');

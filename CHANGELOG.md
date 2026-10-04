@@ -1,3 +1,8 @@
+## 2.1.66
+
+- Preserve quiet-source precision in Play Preview: float WAV staging, normalized encoding with source-level restoration, and a fresh cache format.
+- Includes shared noise-only input safety, wrapping Fine Tune channels and the Play Preview label from 2.1.65.
+
 ## 2.1.65
 
 - Silence stationary broadband noise inputs even when their level is high.

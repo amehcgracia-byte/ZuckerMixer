@@ -2452,6 +2452,17 @@ function createPreviewVocalExpander(ctx, stem) {
   return node;
 }
 
+function restorePreviewSourceLevel(buffer, encodingGainDb) {
+  const gainDb = Number(encodingGainDb || 0);
+  if (!Number.isFinite(gainDb) || gainDb === 0) return buffer;
+  const gain = dbToGain(-gainDb);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    const samples = buffer.getChannelData(channel);
+    for (let i = 0; i < samples.length; i += 1) samples[i] *= gain;
+  }
+  return buffer;
+}
+
 async function loadFullStemPreview(root, songIndex) {
   const card = document.querySelector(`[data-faders="${songIndex}"]`)?.closest(".song-card");
   root = root || card || document;
@@ -2517,6 +2528,7 @@ async function loadFullStemPreview(root, songIndex) {
       const bytes = Number(res.headers.get("X-Preview-Cache-Bytes") || 0);
       const arrayBuffer = await res.arrayBuffer();
       const buffer = await ctx.decodeAudioData(arrayBuffer);
+      restorePreviewSourceLevel(buffer, res.headers.get("X-Preview-Source-Gain-Db"));
       return { stem, buffer, bytes: bytes || arrayBuffer.byteLength };
     }));
   } catch (_err) {
