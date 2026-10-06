@@ -27,6 +27,7 @@ import io
 import queue
 import threading
 from contextlib import ExitStack, contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
@@ -4954,7 +4955,7 @@ def cache_signature(stems: list[Stem]) -> str:
         stat = stem.path.stat()
         parts.append(
             f"{stem.path.name}:{stem.frames}:{stem.samplerate}:"
-            f"{stem.timeline_frames}:{stem.offset_seconds:.9f}:{int(stat.st_mtime)}"
+            f"{stem.timeline_frames}:{stem.offset_seconds:.9f}:{stat.st_size}:{stat.st_mtime_ns}"
         )
     return "|".join(parts)
 
@@ -4981,98 +4982,101 @@ def load_detection_cache(stems: list[Stem]) -> dict[str, np.ndarray]:
     return {}
 
 
+def stem_detection_cache_path(stem: Stem, session: Segment) -> Path:
+    """Keep one envelope independently, with the exact detection time grid."""
+    stat = stem.path.stat()
+    identity = [DETECTION_CACHE_ALGORITHM_VERSION, str(stem.path.resolve()),
+                stat.st_size, stat.st_mtime_ns, stem.frames, stem.samplerate,
+                stem.channels, stem.timeline_frames, stem.offset_seconds,
+                session.start, session.end]
+    digest = hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+    return detection_cache_path().parent / "stem-envelopes" / f"{digest}.npy"
+
+
+def save_stem_detection_envelope(path: Path, envelope: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique temporary names also permit independent analysis processes.
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".npy", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            np.save(handle, envelope, allow_pickle=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def build_detection_cache(stems: list[Stem]) -> None:
-    """Read each source stem once and save its complete 1-second envelope."""
+    """Reuse individual envelopes and scan missing stems with bounded workers."""
     if not stems:
         raise RuntimeError("Cannot build a detection cache without source stems.")
-    session_start = min(stem.offset_seconds for stem in stems)
-    session_end = max(stem.offset_seconds + stem.timeline_duration for stem in stems)
-    full_session = Segment(session_start, session_end)
-    total_bytes = sum(max(0, stem.path.stat().st_size) for stem in stems)
-    bytes_done = 0
-    started = time.perf_counter()
-    external_source = str(SOURCE_DIR).startswith(("/Volumes/", "/Network/", "smb://", "afp://"))
-    report_progress(
-        {
-            "current_stage": "scanning folder",
-            "stage_detail": (
-                f"external volume — scanning audio chunks; 0 of {len(stems)} stems"
-                if external_source
-                else f"scanning audio chunks; 0 of {len(stems)} stems"
-            ),
-            "progress": 20,
-            "song_progress": 20,
-            "heartbeat": time.time(),
-            "elapsed_seconds": 0.0,
-            "bytes_read": 0,
-            "bytes_total": total_bytes,
-        }
-    )
+    session = Segment(min(s.offset_seconds for s in stems),
+                      max(s.offset_seconds + s.timeline_duration for s in stems))
+    sizes = {s.path.name: max(0, s.path.stat().st_size) for s in stems}
+    total_bytes = sum(sizes.values())
+    completed_bytes = {s.path.name: 0 for s in stems}
     envelopes: dict[str, np.ndarray] = {}
-    for stem_index, stem in enumerate(stems, 1):
-        stem_size = max(0, stem.path.stat().st_size)
+    pending = []
+    started = time.perf_counter()
+    progress_lock = threading.Lock()
+    for stem in stems:
+        path = stem_detection_cache_path(stem, session)
+        try:
+            envelope = np.load(path, allow_pickle=False)
+            if envelope.ndim != 1 or not np.isfinite(envelope).all():
+                raise ValueError("Invalid stem envelope")
+            envelopes[stem.path.name] = envelope
+            completed_bytes[stem.path.name] = sizes[stem.path.name]
+        except (OSError, ValueError, EOFError):
+            pending.append((stem, path))
+    reused = len(envelopes)
+    # Four 10-second blocks remain bounded even for long multitrack sessions.
+    workers = min(4, max(1, os.cpu_count() or 1), max(1, len(pending)))
 
-        def on_progress(update: dict[str, object]) -> None:
-            nonlocal bytes_done
-            ratio = min(1.0, float(update.get("frames_read") or 0) / max(1, stem.frames))
-            bytes_read = min(stem_size, int(stem_size * ratio))
-            total_read = min(total_bytes, bytes_done + bytes_read)
+    def progress(name: str, frames: int) -> None:
+        with progress_lock:
+            size = sizes[name]
+            stem = next(s for s in stems if s.path.name == name)
+            completed_bytes[name] = max(completed_bytes[name], min(size, int(size * frames / max(1, stem.frames))))
+            total_read = sum(completed_bytes.values())
             elapsed = max(0.001, time.perf_counter() - started)
             overall = total_read / max(1, total_bytes)
-            eta = elapsed * (1.0 - overall) / overall if overall > 0 else None
-            percent = 20 + int(overall * 60)
-            detail = (
-                f"Analyzing {stem_index} of {len(stems)}: {stem.path.name} — "
-                f"{overall * 100:.1f}% ({total_read / 1048576:.0f}/{total_bytes / 1048576:.0f} MB) "
-                f"· {elapsed / 60:.1f} min elapsed"
-            )
-            if eta is not None:
-                detail += f" · about {eta / 60:.1f} min remaining"
-            report_progress(
-                {
-                    "current_stage": "scanning folder",
-                    "stage_detail": detail,
-                    "progress": percent,
-                    "song_progress": percent,
-                    "heartbeat": time.time(),
-                    "elapsed_seconds": elapsed,
-                    "eta_seconds": eta,
-                    "bytes_read": total_read,
-                    "bytes_total": total_bytes,
-                }
-            )
-
-        _rms, _energies, _has_audio, _spread, stem_envelopes, _peaks = scan_segment_activity(
-            [stem], full_session, stem.samplerate, chunk_seconds=10.0, progress_callback=on_progress
-        )
-        envelopes.update(stem_envelopes)
-        bytes_done += stem_size
-        report_progress(
-            {
+            report_progress({
                 "current_stage": "scanning folder",
-                "stage_detail": f"Finished {stem_index} of {len(stems)}: {stem.path.name}",
-                "progress": 20 + int(bytes_done / max(1, total_bytes) * 60),
-                "song_progress": 20 + int(bytes_done / max(1, total_bytes) * 60),
-                "heartbeat": time.time(),
-                "elapsed_seconds": time.perf_counter() - started,
-                "bytes_read": bytes_done,
-                "bytes_total": total_bytes,
-            }
+                "stage_detail": f"Scanning audio with {workers} workers · {reused} cached stems · {total_read / 1048576:.0f}/{total_bytes / 1048576:.0f} MB",
+                "progress": 20 + int(overall * 60),
+                "song_progress": 20 + int(overall * 60),
+                "heartbeat": time.time(), "elapsed_seconds": elapsed,
+                "bytes_read": total_read, "bytes_total": total_bytes,
+                "cached_stems": reused, "scan_workers": workers,
+            })
+
+    def scan(item: tuple[Stem, Path]) -> tuple[str, np.ndarray]:
+        stem, path = item
+        result = scan_segment_activity(
+            [stem], session, stem.samplerate, chunk_seconds=10.0,
+            progress_callback=lambda update: progress(stem.path.name, int(update.get("frames_read") or 0)),
         )
+        envelope = result[4][stem.path.name]
+        save_stem_detection_envelope(path, envelope)
+        progress(stem.path.name, stem.frames)
+        return stem.path.name, envelope
+
+    progress(stems[0].path.name, 0)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stem-scan") as executor:
+        futures = [executor.submit(scan, item) for item in pending]
+        for future in as_completed(futures):
+            name, envelope = future.result()
+            envelopes[name] = envelope
     save_detection_cache(stems, envelopes)
-    report_progress(
-        {
-            "current_stage": "loading songs",
-            "stage_detail": "Audio scan complete — loading songs from the scanned envelopes",
-            "progress": 82,
-            "song_progress": 82,
-            "heartbeat": time.time(),
-            "elapsed_seconds": time.perf_counter() - started,
-            "eta_seconds": 0.0,
-            "bytes_read": total_bytes,
-            "bytes_total": total_bytes,
-        }
-    )
+    report_progress({
+        "current_stage": "loading songs",
+        "stage_detail": f"Audio scan complete — {reused} reused, {len(pending)} scanned",
+        "progress": 82, "song_progress": 82, "heartbeat": time.time(),
+        "elapsed_seconds": time.perf_counter() - started,
+        "eta_seconds": 0.0, "bytes_read": total_bytes, "bytes_total": total_bytes,
+    })
 
 
 def save_detection_cache(stems: list[Stem], cache: dict[str, np.ndarray]) -> None:
