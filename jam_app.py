@@ -568,11 +568,11 @@ def song_analysis_snapshot(state: dict, segment: pipeline.Segment, segment_id: i
         sr = state["stems"][0].samplerate
         chunks = max(1, math.ceil(segment.duration / pipeline.RENDER_CHUNK_SECONDS))
         def scan_progress(update):
-            ratio = ((int(update["stem_index"]) - 1) + min(1, int(update["chunk_index"]) / chunks)) / max(1, len(state["stems"]))
+            ratio = min(1.0, (((int(update["chunk_index"]) - 1) * len(state["stems"])) + int(update["stem_index"])) / max(1, chunks * len(state["stems"])))
             app_progress({"current_stage": "analyzing", "song_progress": round(ratio * 15), "heartbeat": time.time(),
-                "stage_detail": f"Analyzing song {segment_id}: {update['stem']} ({update['stem_index']}/{len(state['stems'])}), block {update['chunk_index']}/{chunks}"})
+                "stage_detail": f"Analyzing this song: {update['stem']} ({update['stem_index']}/{len(state['stems'])}), block {update['chunk_index']}/{chunks}"})
         rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr, progress_callback=scan_progress)
-        app_progress({"current_stage": "analyzing", "song_progress": 15, "heartbeat": time.time(), "stage_detail": f"Song {segment_id}: preparing balance, gates and effects"})
+        app_progress({"current_stage": "analyzing", "song_progress": 15, "heartbeat": time.time(), "stage_detail": "Preparing this song’s balance, gates and effects"})
         role_norms_db = pipeline.role_norms_from_detection_cache(state["stems"])
         mix_controls = pipeline.analyze_song_mix_controls(state["stems"], segment, sr, rms_values_db, role_norms_db, active_levels_db={name: pipeline.active_level_db(rms_values_db.get(name, -120.0), env) for name, env in segment_envelopes.items()}, segment_envelopes=segment_envelopes)
         result = {
@@ -2470,6 +2470,14 @@ def job_status_debug_payload(payload: dict[str, Any] | None) -> dict[str, Any] |
 def reconcile_completed_job_from_disk(job: dict[str, Any]) -> dict[str, Any] | None:
     if job.get("kind") not in {"render", "mix"}:
         return None
+    if job.get("status") == "pending_review":
+        summary = job.get("batch_summary", {})
+        requested = int(summary.get("requested", 0) or 0)
+        rows = summary.get("songs", [])
+        complete = requested > 0 and int(summary.get("completed", 0) or 0) == requested and int(summary.get("failed", 0) or 0) == 0 and len(rows) == requested
+        if not complete or not all(Path(str(row.get("file", ""))).is_file() and Path(str(row["file"])).stat().st_size > 0 for row in rows):
+            return None
+        return {"status":"done", "current":None, "progress":100, "song_progress":100, "current_stage":"finished", "stage_detail":"All requested renders saved", "done_count":requested, "total_count":requested}
     if job.get("status") not in {"queued", "running", "stopping"}:
         return None
     songs = [int(song) for song in job.get("songs", []) if str(song).isdigit()]
@@ -2923,7 +2931,7 @@ def apply_overrides_for_song(
     selected_payload = disk_payload if use_saved_mixes else {"songs": {}}
     prepared_mix = load_mix_plan(segment_id, overrides_snapshot=selected_payload, state_snapshot=state)
     if not isinstance(prepared_mix, dict):
-        app_progress({"current_stage": "analyzing", "stage_detail": f"Preparing independent mix for song {segment_id}", "heartbeat": time.time()})
+        app_progress({"current_stage": "analyzing", "stage_detail": "Preparing the selected song’s independent mix", "heartbeat": time.time()})
         analysis_finished = threading.Event()
         def analysis_heartbeat() -> None:
             while not analysis_finished.wait(2.0):
@@ -3654,7 +3662,7 @@ def worker() -> None:
                 append_log(job["id"], "New detection is pending confirmation; current slot list was preserved.")
             elif code == 0:
                 song_count = len(job.get("songs", []))
-                pending_review = job.get("status") == "pending_review" or int(job.get("needs_review_count", 0) or 0) > 0
+                pending_review = job.get("kind") not in {"render", "mix"} and (job.get("status") == "pending_review" or int(job.get("needs_review_count", 0) or 0) > 0)
                 terminal_status = "pending_review" if pending_review else "done"
                 lifecycle_log("render_completed", job["id"], parent_pid=os.getpid(), child_pid=proc.pid, songs=song_count, pending_review=pending_review)
                 set_job(

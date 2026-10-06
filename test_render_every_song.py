@@ -37,3 +37,22 @@ def test_worker_uses_persisted_editor_cuts_without_reapplying_legacy_selections(
     with patch.object(app,'load_settings',return_value={}),patch.object(app,'configure_source_folder'),patch.object(app,'detection_state_signature'),patch.object(app,'load_detection_snapshot',return_value=snapshot),patch.object(app,'apply_saved_segment_selections') as legacy:
         assert app.load_render_state()['segments'][0].start==286
         legacy.assert_not_called()
+
+
+def test_successful_render_warnings_do_not_leave_completed_files_pending(tmp_path):
+    import jam_app as app
+    files=[tmp_path/'00.mp3',tmp_path/'01.mp3']
+    for path in files:path.write_bytes(b'already validated by render promotion')
+    job={'kind':'mix','status':'pending_review','needs_review_count':2,'batch_summary':{'requested':2,'completed':2,'failed':0,'songs':[{'file':str(path)} for path in files]}}
+    result=app.reconcile_completed_job_from_disk(job)
+    assert result['status']=='done' and result['done_count']==2
+    assert job['needs_review_count']==2
+    files[1].unlink()
+    assert app.reconcile_completed_job_from_disk(job) is None
+    job['batch_summary']['failed']=1
+    assert app.reconcile_completed_job_from_disk(job) is None
+
+
+def test_detection_review_cannot_be_marked_as_completed_render():
+    import jam_app as app
+    assert app.reconcile_completed_job_from_disk({'kind':'redetect','status':'pending_review','batch_summary':{'requested':1,'completed':1,'failed':0}}) is None

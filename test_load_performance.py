@@ -70,3 +70,20 @@ class CutReusePerformanceTest(unittest.TestCase):
         entry={'version':a.MIX_PLAN_VERSION,'signature':'plan','plan':{'analysis_cache_path':'missing.npz','stems':{}}}
         with patch.object(a,'load_json',return_value={'1':entry}),patch.object(a,'mix_plan_signature',return_value='plan'),patch.object(p,'load_analysis_cache',side_effect=OSError('missing derived cache')):
             self.assertIsNone(a.load_mix_plan(1,state_snapshot=state,overrides_snapshot={'songs':{}}))
+
+    def test_analysis_progress_follows_chunk_order_without_moving_backwards(self):
+        stems=[SimpleNamespace(samplerate=44100,path=Path(name)) for name in ['voice.wav','guitar.wav']]
+        updates=[]
+        def scan(stems,segment,sr,progress_callback):
+            for chunk in range(1,4):
+                for index,stem in enumerate(stems,1):
+                    progress_callback({'stem_index':index,'chunk_index':chunk,'stem':stem.path.name})
+            values={stem.path.name:-20. for stem in stems}
+            return values,values,{name:True for name in values},values,{name:np.ones(3,np.float32) for name in values},values
+        with tempfile.TemporaryDirectory() as folder,patch.object(a,'ACTIVE_SOURCE_STATE_ROOT',Path(folder)),patch.object(a,'mix_plan_signature',return_value='signature'),patch.object(a,'app_progress',side_effect=updates.append),patch.object(p,'scan_segment_activity',side_effect=scan),patch.object(p,'role_norms_from_detection_cache',return_value={}),patch.object(p,'analyze_song_mix_controls',return_value={}),patch.object(p,'classify_noise_stems',return_value={}),patch.object(p,'build_per_song_flattening',return_value={}),patch.object(p,'estimate_segment_drum_bpm',return_value=(90.,.5)):
+            a.song_analysis_snapshot({'stems':stems},p.Segment(0,p.RENDER_CHUNK_SECONDS*3),1)
+        progress=[row['song_progress'] for row in updates]
+        self.assertEqual(progress,sorted(progress))
+        self.assertEqual(progress[-1],15)
+        self.assertGreater(len(set(progress[:-1])),1)
+        self.assertLess(progress[0],progress[-1])
