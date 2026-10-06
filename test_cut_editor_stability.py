@@ -111,3 +111,14 @@ def test_stream_resampling_has_no_artificial_block_edges(tmp_path):
     expected=resample_poly(values,160,441)
     for boundary in [target,target*2]:
         np.testing.assert_allclose(actual[boundary-20:boundary+20],expected[boundary-20:boundary+20],atol=1/32767)
+
+
+def test_recovery_uses_time_overlap_and_preserves_recent_manual_cuts(editor):
+    c,state=editor
+    state['segments'][1]=p.Segment(200,300,boundary_source='manual-add-cut')
+    a.save_json_atomic(a.SEGMENT_SELECTIONS_PATH,{'segments':{
+        '1':{'start_sec':10,'end_sec':90,'source':'manual'},
+        '7':{'start_sec':110,'end_sec':190,'source':'manual'},
+        '8':{'start_sec':210,'end_sec':290,'source':'manual'}}})
+    assert a.restore_missing_saved_opening(state)
+    assert [(s.start,s.end) for s in state['segments']]==[(10,90),(110,190),(200,300)]

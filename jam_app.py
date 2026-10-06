@@ -1129,6 +1129,30 @@ def restore_missing_saved_opening(state: dict[str, Any]) -> bool:
                      "source_start": value.get("source_start", start), "source_end": value.get("source_end", end)})
     if not prefix:
         return False
+    # Recover other human selections by time overlap, never by their old
+    # ordinal. Recent manual split/move operations remain authoritative.
+    proposed = list(segments)
+    used = set()
+    for value in saved.values():
+        try:
+            start, end = float(value["start_sec"]), float(value["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if value.get("source") != "manual" or end <= segments[0].start or start >= end:
+            continue
+        scores = [(overlap_ratio(start,end,seg.start,seg.end), i) for i,seg in enumerate(segments)
+                  if i not in used and not seg.boundary_source.startswith("manual")]
+        if not scores:
+            continue
+        score, index = max(scores)
+        if score < 0.7:
+            continue
+        proposed[index] = replace(segments[index],start=start,end=end,core_start=start,core_end=end,
+            nominal_end=end,boundary_source="manual-recovered",boundary_validation="manual-selection",
+            boundary_validation_reason="recovered saved human selection from this source")
+        used.add(index)
+    if all(left.end <= right.start for left,right in zip(proposed,proposed[1:])):
+        segments = proposed
     # A saved opening before the commentator's known first introduction is song 0.
     history = load_json(EDITOR_HISTORY_PATH, {})
     introductions = [seg for snap in history.get("undo", []) for seg in snap.get("segments", [])
