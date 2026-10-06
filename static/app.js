@@ -1102,6 +1102,10 @@ async function resolveUnsavedCuts() {
 function applySavedEditorState(result) {
   if (!Array.isArray(result.songs)) throw new Error("Saved cuts did not return a song list.");
   appState.songs = result.songs;
+  appState.candidate_pending = false; appState.segmentation_status = "ready";
+  appState.source_integrity = {...appState.source_integrity, status:"ok", saved_slot_count:result.slot_count, expected_slot_count:result.slot_count, warning:""};
+  appState.slot_audit = {...appState.slot_audit, state_slot_count:result.slot_count, backend_slot_count:result.slot_count, visible_slot_count:result.slot_count, integrity_warning:""};
+  appState.detection_calibration = {...appState.detection_calibration, candidate_pending:false};
   if (result.overrides) appState.overrides = result.overrides;
   checkedSongs = new Set([...checkedSongs].filter(id => result.songs.some(song => song.id === id && !song.skipped)));
   cutSelector.timelineChanged = true;

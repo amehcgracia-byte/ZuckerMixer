@@ -4059,6 +4059,8 @@ def editor_result_state(state: dict[str, Any]) -> dict[str, Any]:
 
 def persist_manual_editor_state(state: dict[str, Any]) -> None:
     state["manual_editor_authoritative"] = True
+    state["candidate_pending"] = False
+    state["segmentation_status"] = "ready"
     state.setdefault("detection_calibration", {}).update(count=len(state["segments"]), expected_target=len(state["segments"]), candidate_pending=False, session_segmentation_usable=True)
     # Raw rows must reflect all shared-boundary edits, including neighbouring slots.
     for row, segment in zip(state.get("raw_songs", []), state["segments"]):
