@@ -1149,6 +1149,9 @@ function drawCutEditor() {
   const sx = x(ui.startValue), ex = x(ui.endValue);
   ctx.fillStyle = "rgba(200,111,47,.23)"; ctx.fillRect(sx, 0, Math.max(0, ex - sx), height);
   ctx.strokeStyle = "#ffd08f"; ctx.lineWidth = 2; [sx, ex].forEach((point) => { ctx.beginPath(); ctx.moveTo(point, 0); ctx.lineTo(point, height); ctx.stroke(); });
+  ui.selection.hidden = ui.endValue <= visibleStart || ui.startValue >= visibleEnd;
+  ui.dialog.querySelector(".cut-handle.left").hidden = ui.startValue < visibleStart || ui.startValue > visibleEnd;
+  ui.dialog.querySelector(".cut-handle.right").hidden = ui.endValue < visibleStart || ui.endValue > visibleEnd;
   ui.selection.style.left = `${sx / width * 100}%`; ui.selection.style.width = `${Math.max(0, (ex - sx) / width * 100)}%`;
   if (document.activeElement !== ui.start) ui.start.value = ui.startValue.toFixed(1); if (document.activeElement !== ui.end) ui.end.value = ui.endValue.toFixed(1);
   const duration = ui.endValue - ui.startValue;
@@ -1169,7 +1172,7 @@ function drawCutEditor() {
   if (ui.zoom) ui.zoom.value = Math.max(1, Math.min(20, ui.duration / visibleSpan));
   if (ui.playhead == null) ui.playhead = ui.startValue + (ui.endValue - ui.startValue) / 2;
   const playhead = x(ui.playhead); ctx.strokeStyle = "#79d7c4"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(playhead, 0); ctx.lineTo(playhead, height); ctx.stroke();
-  if (ui.playheadLine) ui.playheadLine.style.left = String(playhead / width * 100) + "%";
+  if (ui.playheadLine) { ui.playheadLine.hidden = ui.playhead < visibleStart || ui.playhead > visibleEnd; ui.playheadLine.style.left = String(playhead / width * 100) + "%"; }
   const readout = ui.dialog.querySelector("#cutPlayheadReadout"); if (readout) readout.textContent = `Playhead ${cutTime(ui.playhead)}`;
 }
 
@@ -1210,7 +1213,17 @@ function wireCutSelector(ui) {
   };
   ui.mode.addEventListener("change", () => setMode(ui.mode.value));
   setMode("select");
-  const refreshEditorAfterOperation = async (result, action, before, at, pointer) => { setCutLoading("Validating cuts", `${result.slot_count} slots preserved`, 80); reportCutAction(ui, action, { before, after: result.slot_count, time: at, pointer, finished: true }); await refreshState({ renderLarge: false }); await openCutSelector(Math.min(Number(ui.songId), result.slot_count)); setCutLoading("Finished", `Global editor updated; ${result.slot_count} slots remain`, 100); setTimeout(clearCutLoading, 700); };
+  const refreshEditorAfterOperation = async (result, action, before, at, pointer) => {
+    const view = [ui.viewStart, ui.viewEnd];
+    setCutLoading("Updating editor", "Cuts saved", 80);
+    await refreshState({renderLarge:false});
+    const atIndex = (result.segments || []).findIndex(segment => segment.start <= at && at < segment.end);
+    await openCutSelector(atIndex >= 0 ? atIndex + 1 : Math.min(Number(ui.songId), result.slot_count));
+    ui.viewStart = Math.max(ui.sourceStart, view[0]); ui.viewEnd = Math.min(ui.sourceEnd, view[1]);
+    movePlayheadTo(ui, at, {seek:false});
+    reportCutAction(ui,action,{before,after:result.slot_count,time:at,pointer,finished:true});
+    clearCutLoading();
+  };
   const editorOperation = async (operation, extra = {}) => {
     if (ui.operationPending || ui.saving) return;
     ui.operationPending = true;
