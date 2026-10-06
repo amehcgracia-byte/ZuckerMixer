@@ -915,6 +915,7 @@ function renderSongs() {
   box.innerHTML = "";
   appState.songs.forEach((song) => {
     const card = document.createElement("article");
+    card.dataset.songId = String(song.id);
     card.className = `song-card ${song.skipped ? "skipped" : ""}`;
     const speed = song.bpm ? `${Math.round(song.bpm)} bpm` : "speed unknown";
     const key = song.key || "key unknown";
@@ -4111,6 +4112,16 @@ function setupLoadingMedia() {
 if (typeof document !== "undefined") {
   setupLoadingMedia();
   setupDismissControls();
+  $("#selectAllSongs")?.addEventListener("click", () => {
+    const available = visibleSongs(); const allSelected = available.length > 0 && available.every(song => checkedSongs.has(song.id));
+    checkedSongs = allSelected ? new Set() : new Set(available.map(song => song.id));
+    document.querySelectorAll(".song-card[data-song-id]").forEach(card => {
+      const checkbox = card.querySelector(".song-main > input[type=checkbox]");
+      if (checkbox) checkbox.checked = checkedSongs.has(Number(card.dataset.songId));
+    });
+    $("#selectAllSongs").textContent = allSelected ? "Select all" : "Deselect all";
+    updateSelectedButton();
+  });
   $("#mixSelected").addEventListener("click", () => mixSongs([...checkedSongs], true, true).catch((error) => showToast(`Render failed: ${error.message || error}`)));
   $("#mixAll").addEventListener("click", () => mixEverything());
   $("#editAllCuts").addEventListener("click", () => editAllCuts().catch((error) => { setCutLoading("Error", error.message || String(error)); showToast(error.message || String(error)); }));
