@@ -1041,3 +1041,6 @@ dialog { position: fixed; padding-top: 42px; }
 @media (max-width: 720px) { .preview-transport { grid-template-columns: minmax(0, 1fr); } }
 
 [hidden] { display: none !important; }
+
+.progress-track > .progress-indeterminate { width: 35% !important; animation: progress-pending 1.2s ease-in-out infinite alternate; }
+@keyframes progress-pending { from { transform: translateX(0); } to { transform: translateX(180%); } }

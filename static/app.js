@@ -685,11 +685,11 @@ async function loadState() {
   refreshSlotSummary();
   syncOverrideSequenceFromState();
   const detected = visibleSongs().length;
-  const review = visibleSongs().filter((song) => song.render_valid === false).length;
+  const review = visibleSongs().filter((song) => song.needs_review).length;
   const loadError = appState.last_error || appState.audio_scan?.error;
   $("#songCount").textContent = loadError
     ? `Error loading folder: ${loadError}`
-    : `${detected} songs detected / ${renderableSongs().length} songs prepared${review ? ` · ${review} needs review` : ""}`;
+    : `${detected} songs${appState.source_integrity?.expected_slot_count === (appState.songs || []).length ? " in saved cuts" : " detected"} / ${renderableSongs().length} ready to render${review ? ` · ${review} suggested boundaries to review` : ""}`;
   if (appState.ffmpeg && !appState.ffmpeg.ok) {
     showToast("ffmpeg is missing. Install it with Homebrew: brew install ffmpeg");
   }
@@ -1009,13 +1009,16 @@ function ensureCutSelector() {
 async function openCutSelector(songId) {
   const ui = ensureCutSelector();
   suppressLoadingOverlay = false;
-  setCutLoading("Loading cut editor", `Loading selected slot ${songId}`, 8);
+  setCutLoading("Opening Edit Cuts", "Reading saved cuts", null);
   const sourceFolder = appState.source_folder; const generation = ui.loadingGeneration = (ui.loadingGeneration || 0) + 1;
-  const response = await fetch(`/api/cuts/${songId}`);
+  const reuseWaveform = ui.sourceFolder === sourceFolder && ui.data?.global_waveform && ui.waveformKey;
+  const response = await fetch(`/api/cuts/${songId}${reuseWaveform ? `?waveform_key=${encodeURIComponent(ui.waveformKey)}` : ""}`);
   const data = await response.json();
+  if (!data.global_waveform && reuseWaveform) data.global_waveform = ui.data.global_waveform;
   if (generation !== ui.loadingGeneration || sourceFolder !== appState.source_folder) return;
-  if (!response.ok) { setCutLoading("Error", data.error || "Could not load cut editor."); return showToast(data.error || "Could not load cut editor."); }
-  setCutLoading("Loading selected waveform", `Preparing slot ${songId}`, 40);
+  ui.waveformKey = data.waveform_key;
+  if (!response.ok) { clearCutLoading(); return showToast(data.error || "Could not load cut editor."); }
+  setCutLoading("Drawing timeline", "Saved cuts loaded", null);
   ui.songId = songId;
   ui.data = data;
   ui.allSlots = (data.markers || []).map((marker) => Number(marker.song_id)).filter(Number.isFinite);
@@ -1039,8 +1042,8 @@ async function openCutSelector(songId) {
   const slotList = ui.dialog.querySelector("#cutSlotList"); slotList.innerHTML = ui.allSlots.map((id, index) => `<option value="${id}">Slot ${index + 1} of ${ui.allSlots.length}</option>`).join(""); slotList.value = String(songId);
   ui.dialog.querySelector("#cutPrevious").disabled = slotIndex <= 0; ui.dialog.querySelector("#cutNext").disabled = slotIndex >= ui.allSlots.length - 1;
   ui.dialog.querySelector("#cutEvidence").innerHTML = data.markers.filter((marker) => marker.song_id === songId).map((marker) => `<span class="cut-evidence-item ${marker.status}">${cutTime(marker.start_sec)}–${cutTime(marker.end_sec)} · ${esc(marker.boundary_source || "automatic proposal")} · ${marker.confidence ? `${Math.round(marker.confidence * 100)}%` : "no confidence"}</span>`).join("");
-  const audio = ui.dialog.querySelector("#cutAudio"); if (audio) { audio.preload = "metadata"; if (ui.audioSourceFolder !== ui.sourceFolder) { audio.src = `/api/cuts/audio/${songId}`; ui.audioSourceFolder = ui.sourceFolder; } ui.pendingAudioTime = ui.playhead; audio.playbackRate = Number(ui.speed?.value || 1); audio.oncanplay = () => setCutLoading("Ready", `Playback ready for slot ${songId}`, 100); audio.onerror = () => setCutLoading("Playback error", "The selected source audio could not be loaded.", 100); }
-  setCutLoading("Rendering waveform", `Rendering complete-session waveform for slot ${songId}`, 70);
+  const audio = ui.dialog.querySelector("#cutAudio"); if (audio) { audio.preload = "metadata"; if (ui.audioSourceFolder !== ui.sourceFolder) { audio.src = `/api/cuts/audio/${songId}`; ui.audioSourceFolder = ui.sourceFolder; } ui.pendingAudioTime = ui.playhead; audio.playbackRate = Number(ui.speed?.value || 1); audio.oncanplay = () => { if (ui.dialog.open) ui.dialog.querySelector("#cutActionLog").textContent = "Playback ready"; }; audio.onerror = () => { if (ui.dialog.open) showToast("Source audio could not be loaded."); }; }
+  setCutLoading("Drawing timeline", "Displaying the source waveform", null);
   drawCutEditor();
   if (!ui.dialog.open) ui.dialog.showModal(); ui.dialog.focus({preventScroll:true});
   setCutLoading("Finished", `Slot ${songId} ready for precise editing`, 100);
@@ -1053,9 +1056,10 @@ function setCutLoading(label, detail, progress = 0) {
     box.hidden = false;
     $("#loadingLabel").textContent = label;
     $("#loadingDetail").textContent = detail || "";
-    $("#loadingProgressFill").style.width = String(Math.max(0, Math.min(100, progress))) + "%";
+    $("#loadingProgressFill").classList.toggle("progress-indeterminate", progress == null);
+    $("#loadingProgressFill").style.width = progress == null ? "35%" : String(Math.max(0, Math.min(100, progress))) + "%";
   }
-  loadingOverlayCut = progress >= 100 ? null : { kind: "cut", label, detail, progress, current_stage: "loading" };
+  loadingOverlayCut = progress >= 100 ? null : { kind: "cut", label, detail, progress, indeterminate: progress == null, current_stage: "loading" };
   renderLoadingOverlay();
 }
 function reportCutAction(ui, action, details = {}) {
@@ -1078,6 +1082,7 @@ function rememberCutSelection(ui) { ui.localUndo ||= []; ui.localUndo.push([ui.s
 async function saveCutChanges(ui) {
   if (ui.saving) return false;
   ui.saving = true;
+  setCutLoading("Saving cuts", "Writing your timeline to disk", null);
   const button = ui.dialog.querySelector("#cutApply"); button.disabled = true; button.textContent = "Saving…";
   try {
     const response = await fetch(`/api/segment-selection/${ui.songId}`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({start_sec:ui.startValue,end_sec:ui.endValue,source_folder:ui.sourceFolder})});
@@ -1085,7 +1090,7 @@ async function saveCutChanges(ui) {
     if (!response.ok) throw new Error(result.error || "Could not save cuts");
     ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue; ui.localUndo = []; ui.localRedo = [];
     button.textContent = "Saved"; ui.dialog.querySelector("#cutValidation").textContent = "Changes saved";
-    await refreshState({renderLarge:false}); showToast("Cuts saved."); return true;
+    applySavedEditorState(result); showToast("Cuts saved."); return true;
   } catch (error) { button.textContent = "Save Changes"; showToast(error.message || error); return false; }
   finally { ui.saving = false; button.disabled = false; clearCutLoading(); }
 }
@@ -1094,16 +1099,36 @@ async function resolveUnsavedCuts() {
   if (await showConfirm("Save changes?", "Yes", "No")) return saveCutChanges(cutSelector);
   return true;
 }
+function applySavedEditorState(result) {
+  if (!Array.isArray(result.songs)) throw new Error("Saved cuts did not return a song list.");
+  appState.songs = result.songs;
+  if (result.overrides) appState.overrides = result.overrides;
+  checkedSongs = new Set([...checkedSongs].filter(id => result.songs.some(song => song.id === id && !song.skipped)));
+  cutSelector.timelineChanged = true;
+  refreshSlotSummary();
+  renderSlotAudit();
+  const review = visibleSongs().filter(song => song.needs_review).length;
+  $("#songCount").textContent = `${result.songs.length} songs in saved cuts${review ? ` · ${review} suggested boundaries to review` : ""}`;
+}
+
 async function closeCutSelector() {
   if (cutSelector.closing || cutSelector.saving) return;
   cutSelector.closing = true;
-  try { if (await resolveUnsavedCuts()) { cutSelector.audio?.pause(); cutSelector.dialog.close(); songListSignature = ""; await refreshState(); } }
+  try { if (await resolveUnsavedCuts()) {
+    cutSelector.audio?.pause(); cutSelector.dialog.close(); clearCutLoading();
+    if (cutSelector.timelineChanged) {
+      setCutLoading("Updating song list", `${appState.songs.length} saved songs`, null);
+      await Promise.all(Object.keys(previewMixes).map(id => stopPreviewMix(id)));
+      document.querySelectorAll(".fine-tune[open]").forEach(panel => panel.open = false);
+      songListSignature = ""; renderCutTools(); renderSongs(); updateSelectedButton();
+      cutSelector.timelineChanged = false;
+    }
+  } }
   finally { cutSelector.closing = false; clearCutLoading(); }
 }
 async function editAllCuts() {
   const slots = (appState.songs || []).filter((song) => Number.isFinite(Number(song.id))).map((song) => Number(song.id));
   if (!slots.length) return showToast("No slots available for Edit All.");
-  cutSelector = null;
   const ui = ensureCutSelector();
   ui.editAllQueue = slots.slice(1);
   await openCutSelector(slots[0]);
@@ -1216,8 +1241,8 @@ function wireCutSelector(ui) {
   setMode("select");
   const refreshEditorAfterOperation = async (result, action, before, at, pointer) => {
     const view = [ui.viewStart, ui.viewEnd];
-    setCutLoading("Updating editor", "Cuts saved", 80);
-    await refreshState({renderLarge:false});
+    setCutLoading("Updating editor", "Cuts saved", null);
+    applySavedEditorState(result);
     const atIndex = (result.segments || []).findIndex(segment => segment.start <= at && at < segment.end);
     await openCutSelector(atIndex >= 0 ? atIndex + 1 : Math.min(Number(ui.songId), result.slot_count));
     ui.viewStart = Math.max(ui.sourceStart, view[0]); ui.viewEnd = Math.min(ui.sourceEnd, view[1]);
@@ -1418,7 +1443,7 @@ async function loadActiveStemFaders(root, songIndex) {
   if (faders.dataset.loaded === "true") return;
   const load = (async () => {
   faders.dataset.loading = "true";
-  faders.innerHTML = '<div class="muted">Loading active tracks...</div>';
+  faders.innerHTML = '<div class="muted">Preparing this song’s balance, gates and effects…</div>';
   try {
     const res = await fetch(`/api/active-stems/${songIndex}`);
     if (!res.ok) throw new Error("active stems unavailable");
@@ -3042,8 +3067,8 @@ async function refreshState(options = {}) {
   syncOverrideSequenceFromState();
   checkedSongs = new Set([...checkedSongs].filter((id) => appState.songs.some((song) => song.id === id && !song.skipped)));
   const detected = visibleSongs().length;
-  const review = visibleSongs().filter((song) => song.render_valid === false).length;
-  $("#songCount").textContent = `${detected} songs detected / ${renderableSongs().length} songs prepared${review ? ` · ${review} needs review` : ""}`;
+  const review = visibleSongs().filter((song) => song.needs_review).length;
+  $("#songCount").textContent = `${detected} songs${appState.source_integrity?.expected_slot_count === (appState.songs || []).length ? " in saved cuts" : " detected"} / ${renderableSongs().length} ready to render${review ? ` · ${review} suggested boundaries to review` : ""}`;
   if (renderLarge) {
     renderCutTools();
     renderSongs();
@@ -3279,16 +3304,15 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
       });
     }
     const singleSong = songs.length === 1 ? songs[0] : null;
-    // Rendering must never start a new detection/mix-parameter analysis. Fine
-    // Tune and Analyze prepare that state explicitly; the worker receives the
-    // current snapshot below and either renders it or reports a visible error.
+    // Render preserves saved cuts and prepares any missing per-song analysis
+    // in its worker before mixing. It never redetects the session.
     const previewEffectiveMix = singleSong != null ? effectiveMixDump(singleSong, "before-render-click") : null;
     const renderTargetDir = await chooseRenderFolder();
     if (renderTargetDir === false) return;
     console.info("RENDER DESTINATION request_target", renderTargetDir);
     await prepareOverridesForRender();
-    // Render takes a light in-memory snapshot. It never waits for or starts
-    // Whisper, thresholds, full-stem analysis, or DSP-plan preparation.
+    // Preparation belongs to the worker, with visible progress; preserve all
+    // requested songs and the current saved mix controls.
     const overridesResponse = await fetch("/api/overrides");
     const overridesSnapshot = overridesResponse.ok
       ? await overridesResponse.json()
@@ -3590,7 +3614,7 @@ function renderLoadingOverlay() {
   const progress = Number(state.kind === "redetect" ? state.progress : (state.progress ?? state.song_progress ?? 0));
   const renderProgress = Number(state.process_progress ?? state.song_progress ?? 0);
   const choices = loadingMessagesForState(state);
-  const fun = choices[Math.floor(Date.now() / 5000) % choices.length];
+  const fun = state.kind === "cut" ? "" : choices[Math.floor(Date.now() / 5000) % choices.length];
   const safeProgress = Math.max(0, Math.min(100, Number.isFinite(progress) ? progress : 0));
   const safeRenderProgress = Math.max(0, Math.min(100, Number.isFinite(renderProgress) ? renderProgress : 0));
   const titleNode = $("#loadingOverlayTitle");
@@ -3629,8 +3653,9 @@ function renderLoadingOverlay() {
     timingNode.innerHTML = `<span>${esc(elapsedText)}</span><span>${esc(etaText)}</span>`;
   }
   if (funNode) funNode.textContent = fun;
+  if (fillNode) fillNode.classList.toggle("progress-indeterminate", Boolean(state.indeterminate));
   if (fillNode) fillNode.style.width = String(safeProgress) + "%";
-  if (percentNode) percentNode.textContent = String(Math.round(safeProgress)) + "%";
+  if (percentNode) percentNode.textContent = state.indeterminate ? "Working…" : String(Math.round(safeProgress)) + "%";
   const showProcessRow = state.kind !== "cut";
   if (renderRow) renderRow.hidden = !showProcessRow;
   if (renderLabel && showProcessRow) {
@@ -3658,7 +3683,7 @@ function renderLoadingOverlay() {
   }
   if (renderFill) renderFill.style.width = String(safeRenderProgress) + "%";
   if (renderPercent) renderPercent.textContent = String(Math.round(safeRenderProgress)) + "%";
-  const phases = [
+  const phases = isRenderTask ? [["prepare", "Check saved cuts"], ["analyze", "Prepare this song’s mix"], ["mix", "Mix audio blocks"], ["master", "Master"], ["encode", "Encode MP3"], ["save", "Save result"]] : state.kind === "cut" ? [["read", "Read saved cuts"], ["draw", "Display timeline"]] : [
     ["prepare", "Prepare original session"],
     ["scan", "Scan WAV stems"],
     ["cache", "Read audio envelopes"],
@@ -3667,7 +3692,7 @@ function renderLoadingOverlay() {
     ["merge", "Merge song boundaries"],
     ["review", "Prepare cuts"],
   ];
-  const phaseIndex = Number.isFinite(Number(state.phase_index)) ? Number(state.phase_index) : (
+  const phaseIndex = isRenderTask ? (stage.includes("analyz") ? 1 : stage.includes("mix") ? 2 : stage.includes("master") ? 3 : stage.includes("encod") ? 4 : stage.includes("finish") ? 5 : 0) : Number.isFinite(Number(state.phase_index)) ? Number(state.phase_index) : (
     stage.includes("prepar") || stage === "waiting" ? 0 :
     stage.includes("scanning") ? 1 :
     stage.includes("cached") || stage.includes("envelope") ? 2 :
@@ -3692,12 +3717,13 @@ function renderLoadingOverlay() {
     const queueRows = requested.length
       ? requested.map((number, index) => {
         const numericNumber = Number(number);
-        const summary = summaryByNumber.get(numericNumber);
-        if (summary) return { ...summary, song: number };
-        const isCurrent = numericNumber === Number(state.current);
+        const displayNumber = appState.songs.find(song => Number(song.id) === numericNumber)?.display_number ?? numericNumber;
+        const summary = summaryByNumber.get(Number(displayNumber));
+        if (summary) return { ...summary, song: displayNumber };
+        const isCurrent = numericNumber === Number(state.current_segment_id ?? state.current);
         const isDone = !isCurrent && index < Number(state.done_count || 0);
         return {
-          song: number,
+          song: displayNumber,
           status: isCurrent ? "working" : isDone ? "done" : "queued",
           detail: isCurrent ? "working" : isDone ? "done" : "queued",
         };

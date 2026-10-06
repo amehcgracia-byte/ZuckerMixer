@@ -49,3 +49,18 @@ class LoadPerformanceTest(unittest.TestCase):
         self.assertIn('app;dur=',response.headers['Server-Timing'])
 
 if __name__=='__main__':unittest.main()
+
+class CutReusePerformanceTest(unittest.TestCase):
+    def test_editing_another_song_does_not_invalidate_this_mix(self):
+        with patch.object(a,'detection_state_signature',return_value=('source',(1.,2.),(('voice.wav',100,300),))) as signature, patch.object(a,'load_source_config',return_value={}):
+            old=a.mix_plan_signature(1,p.Segment(0,30),{})
+            signature.return_value=('source',(1.,9.),(('voice.wav',100,300),))
+            self.assertEqual(old,a.mix_plan_signature(1,p.Segment(0,30),{}))
+            self.assertNotEqual(old,a.mix_plan_signature(1,p.Segment(0,31),{}))
+
+    def test_global_waveform_hit_does_not_reload_detection_audio(self):
+        stem=SimpleNamespace(path=Path('voice.wav'),offset_seconds=0.,timeline_duration=3600.)
+        with tempfile.TemporaryDirectory() as folder, patch.object(a,'WAVEFORM_CACHE_PATH',Path(folder)/'wave.json'), patch.object(a,'_waveform_identity',return_value={'source':'same'}), patch.object(a,'ensure_pipeline_state',return_value={'stems':[stem]}), patch.object(p,'load_detection_cache') as load:
+            a.save_json_atomic(a.WAVEFORM_CACHE_PATH,{'identity':{'source':'same'},'global':{'window_end_sec':3600.,'peaks':[.1]*3600}})
+            self.assertTrue(a.full_session_waveform()['cached'])
+            load.assert_not_called()

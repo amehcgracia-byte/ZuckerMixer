@@ -7967,7 +7967,7 @@ def render_segment(
         raise RuntimeError(f"Render analysis snapshot is unavailable: {exc}") from exc
     if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
         raise RuntimeError("Render analysis snapshot version is unsupported.")
-    analysis_offset_seconds = analysis_window_offset(analysis_cache, segment, index, prepared_plan.get("preview_window"))
+    analysis_offset_seconds = analysis_window_offset(analysis_cache, segment, int(prepared_plan.get("analysis_song_id", index)), prepared_plan.get("preview_window"))
     rms_values_db = analysis_cache.get("rms_values_db", {})
     energies = analysis_cache.get("energies", {})
     has_audio = analysis_cache.get("has_audio", {})

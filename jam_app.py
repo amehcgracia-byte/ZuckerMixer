@@ -428,6 +428,7 @@ MIX_PLAN_VERSION = 13
 
 
 def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
+    identity = detection_state_signature()
     payload = {
         "version": MIX_PLAN_VERSION,
         "song_id": int(segment_id),
@@ -435,7 +436,7 @@ def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_override
         "end_sec": round(float(segment.end), 6),
         "overrides": song_overrides,
         "dsp_revision": MIX_PLAN_VERSION,
-        "source_identity": detection_state_signature(),
+        "source_identity": (identity[0], identity[2]),
         "source_config": load_source_config(),
         "auto_mix_profile": getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1),
     }
@@ -555,7 +556,13 @@ def song_analysis_snapshot(state: dict, segment: pipeline.Segment, segment_id: i
             if isinstance(cached, dict) and cached.get("input_signature") == signature:
                 return cached
         sr = state["stems"][0].samplerate
-        rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr)
+        chunks = max(1, math.ceil(segment.duration / pipeline.RENDER_CHUNK_SECONDS))
+        def scan_progress(update):
+            ratio = ((int(update["stem_index"]) - 1) + min(1, int(update["chunk_index"]) / chunks)) / max(1, len(state["stems"]))
+            app_progress({"current_stage": "analyzing", "song_progress": round(ratio * 15), "heartbeat": time.time(),
+                "stage_detail": f"Analyzing song {segment_id}: {update['stem']} ({update['stem_index']}/{len(state['stems'])}), block {update['chunk_index']}/{chunks}"})
+        rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr, progress_callback=scan_progress)
+        app_progress({"current_stage": "analyzing", "song_progress": 15, "heartbeat": time.time(), "stage_detail": f"Song {segment_id}: preparing balance, gates and effects"})
         role_norms_db = pipeline.role_norms_from_detection_cache(state["stems"])
         mix_controls = pipeline.analyze_song_mix_controls(state["stems"], segment, sr, rms_values_db, role_norms_db, active_levels_db={name: pipeline.active_level_db(rms_values_db.get(name, -120.0), env) for name, env in segment_envelopes.items()}, segment_envelopes=segment_envelopes)
         result = {
@@ -1173,7 +1180,8 @@ def restore_missing_saved_opening(state: dict[str, Any]) -> bool:
 def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> dict[str, Any] | None:
     payload = load_json(DETECTION_STATE_PATH, None)
     manual = load_json(MANUAL_EDITOR_STATE_PATH, None)
-    if isinstance(manual, dict) and manual.get("fingerprint") == source_job_identity(signature)["fingerprint"] and not pipeline.DETECTION_RESCAN_MODE:
+    manual_matches = isinstance(manual, dict) and manual.get("fingerprint") == source_job_identity(signature)["fingerprint"] and not pipeline.DETECTION_RESCAN_MODE
+    if manual_matches:
         payload = dict(manual)
         payload["source_signature"] = [signature[0], list(signature[1]) if isinstance(signature[1], tuple) else signature[1], [list(item) for item in signature[2]]]
     expected_signature = [
@@ -1183,7 +1191,7 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
     ]
     if not isinstance(payload, dict) or payload.get("source_signature") != expected_signature:
         return None
-    if legacy_single_slot_snapshot_reason(payload):
+    if not manual_matches and legacy_single_slot_snapshot_reason(payload):
         return None
     try:
         stems = [pipeline.Stem(path=Path(item["path"]), **{key: item[key] for key in ("name", "role", "samplerate", "channels", "frames", "duration", "timeline_frames", "offset_seconds", "offset_source")}) for item in payload["stems"]]
@@ -1200,6 +1208,7 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
             "raw_songs": payload["raw_songs"],
             "stem_info": payload["stem_info"],
             "active_stems_by_song": {},
+            "manual_editor_authoritative": bool(manual_matches),
             "candidate_pending": bool(payload.get("candidate_pending")),
             "segmentation_status": payload.get("segmentation_status"),
             "audio_scan": payload.get("audio_scan", {}),
@@ -1462,6 +1471,9 @@ def full_session_waveform(points: int = 1800) -> dict[str, Any]:
         cache = {"identity": identity, "version": 2, "slots": {}}
     state = ensure_pipeline_state()
     end_sec = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in state["stems"]), default=0.0)
+    existing = cache.get("global")
+    if isinstance(existing, dict) and len(existing.get("peaks", [])) >= points and abs(float(existing.get("window_end_sec", 0)) - end_sec) < 0.01:
+        return {**existing, "cached": True}
     activity = pipeline.load_detection_cache(state["stems"])
     detail_points = min(60000, max(points, int(math.ceil(end_sec / pipeline.DETECTION_FRAME_SECONDS)))) if activity else min(points, 512)
     existing = cache.get("global")
@@ -2123,8 +2135,7 @@ def visible_songs(
         item["needs_review"] = bool(boundary_review)
         item["render_valid"] = (
             not user_skipped
-            and pipeline.HARD_MIN_SONG_SECONDS <= duration <= pipeline.HARD_MAX_SONG_SECONDS
-            and not boundary_review
+            and math.isfinite(duration) and duration >= 0.1
         )
         item["render_validation"] = (
             "valid"
@@ -2231,12 +2242,12 @@ def public_state() -> dict[str, Any]:
         "backend_slot_count": len(songs),
         "slot_ids": [item.get("slot_id") for item in raw_slots],
         "visible_slot_count": len(songs),
-        "integrity_warning": "Persisted state contains only one slot; full-session re-detection is required before replacement." if len(raw_slots) == 1 else "",
+        "integrity_warning": "Persisted state contains only one slot; full-session re-detection is required before replacement." if len(raw_slots) == 1 and not state.get("manual_editor_authoritative") else "",
     }
     source_stems = state.get("stems", [])
     source_duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in source_stems), default=0.0)
-    expected_slot_count = pipeline.KNOWN_SONG_COUNT or pipeline.EXPECTED_SLOT_COUNT
-    incomplete_source = len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS
+    expected_slot_count = len(raw_slots) if state.get("manual_editor_authoritative") else (pipeline.KNOWN_SONG_COUNT or pipeline.EXPECTED_SLOT_COUNT)
+    incomplete_source = not state.get("manual_editor_authoritative") and len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS
     count_mismatch = expected_slot_count is not None and len(raw_slots) != expected_slot_count
     candidate_pending = bool(
         state.get("candidate_pending")
@@ -2829,7 +2840,7 @@ def visible_index_for_segment(segment_id: int, state_snapshot: dict[str, Any] | 
     songs = visible_songs(state, load_settings(), load_json(HISTORY_PATH, {}))
     for song in songs:
         if int(song["id"]) == int(segment_id):
-            return int(song["index"] or segment_id)
+            return int(song["index"] if song["index"] is not None else segment_id)
     return segment_id
 
 
@@ -2854,7 +2865,7 @@ def resolve_segment_for_split(state: dict[str, Any], segment_id: int, payload: d
         return segment_id, state["segments"][segment_id - 1]
     songs = visible_songs(state, load_settings(), load_json(HISTORY_PATH, {}))
     for song in songs:
-        if int(song.get("index") or -1) == int(segment_id):
+        if int(song.get("index") if song.get("index") is not None else -1) == int(segment_id):
             raw_id = int(song["id"])
             return raw_id, state["segments"][raw_id - 1]
     return None
@@ -2914,6 +2925,8 @@ def apply_overrides_for_song(
         finally:
             analysis_finished.set()
             heartbeat_thread.join(timeout=0.2)
+    prepared_mix = dict(prepared_mix)
+    prepared_mix["analysis_song_id"] = int(segment_id)
     write_trace = disk_payload.get("_write_trace", {}) if isinstance(disk_payload, dict) else {}
     overrides = normalize_overrides(disk_payload)
     source_song = overrides.get("songs", {}).get(str(segment_id), {}) if use_saved_mixes else {}
@@ -3787,14 +3800,15 @@ def api_cuts(song_id: int) -> Response:
     if song_id < 1 or song_id > len(state["segments"]):
         return jsonify({"error": "song not found"}), 404
     selected = state["segments"][song_id - 1]
-    global_waveform = full_session_waveform()
+    waveform_key = hashlib.sha256(json.dumps(_waveform_identity(), sort_keys=True).encode()).hexdigest()
+    global_waveform = full_session_waveform() if request.args.get("waveform_key") != waveform_key else None
     # The canvas draws the global curve. Building an unused per-slot waveform
     # incurred thousands of random disk reads on every edited interval.
     duration = float(selected.end - selected.start)
-    peaks = global_waveform.get("peaks", [])
-    positions = np.linspace(float(global_waveform.get("window_start_sec", 0)), float(global_waveform.get("window_end_sec", 0)), len(peaks))
+    peaks = (global_waveform or {}).get("peaks", [])
+    positions = np.linspace(float((global_waveform or {}).get("window_start_sec", 0)), float((global_waveform or {}).get("window_end_sec", 0)), len(peaks))
     selected_peaks = np.interp(np.linspace(float(selected.start), float(selected.end), min(1400, max(2, len(peaks)))), positions, peaks).tolist() if peaks else []
-    waveform = {"window_start_sec": float(selected.start), "window_end_sec": float(selected.end), "duration_sec": duration, "peaks": selected_peaks, "cached": bool(global_waveform.get("cached"))}
+    waveform = {"window_start_sec": float(selected.start), "window_end_sec": float(selected.end), "duration_sec": duration, "peaks": selected_peaks, "cached": bool((global_waveform or {}).get("cached"))}
     markers = []
     for index, segment in enumerate(state["segments"], 1):
         markers.append({
@@ -3814,6 +3828,7 @@ def api_cuts(song_id: int) -> Response:
         "song_id": song_id,
         "waveform": waveform,
         "global_waveform": global_waveform,
+        "waveform_key": waveform_key,
         "selection": {"start_sec": float(selected.start), "end_sec": float(selected.end)},
         "markers": markers,
         "bounds": {"min_sec": pipeline.HARD_MIN_SONG_SECONDS, "max_sec": pipeline.HARD_MAX_SONG_SECONDS},
@@ -4003,12 +4018,10 @@ def api_segment_selection(song_id: int) -> Response:
         global pipeline_state, pipeline_state_signature
         pipeline_state = state
         pipeline_state_signature = detection_state_signature()
-        if state.get("raw_songs") and all(hasattr(stem, "path") for stem in state.get("stems", [])):
-            save_detection_snapshot(state, pipeline_state_signature)
     persist_manual_editor_state(state)
     save_json_atomic(EDITOR_HISTORY_PATH, history)
     append_log("ui", f"Saved manual cut for song {song_id}: {start:.3f}-{end:.3f}s")
-    return jsonify({"ok": True, "song_id": song_id, "start_sec": start, "end_sec": end, "duration_sec": duration, "source": "manual"})
+    return jsonify({"ok": True, "song_id": song_id, "start_sec": start, "end_sec": end, "duration_sec": duration, "source": "manual", **editor_result_state(state)})
 
 
 def _editor_snapshot(state: dict[str, Any]) -> dict[str, Any]:
@@ -4027,7 +4040,16 @@ def _restore_editor_snapshot(state: dict[str, Any], snapshot: dict[str, Any]) ->
     if "skipped" in snapshot: save_skipped_segments(snapshot["skipped"])
 
 
+def editor_result_state(state: dict[str, Any]) -> dict[str, Any]:
+    """The persisted timeline is authoritative immediately after every edit."""
+    return {"slot_count": len(state["segments"]), "songs": visible_songs(state, load_settings(), load_json(HISTORY_PATH, {})),
+            "overrides": load_json(OVERRIDES_PATH, {"songs": {}}),
+            "segments": [{"start": s.start, "end": s.end} for s in state["segments"]]}
+
+
 def persist_manual_editor_state(state: dict[str, Any]) -> None:
+    state["manual_editor_authoritative"] = True
+    state.setdefault("detection_calibration", {}).update(count=len(state["segments"]), expected_target=len(state["segments"]), candidate_pending=False, session_segmentation_usable=True)
     # Raw rows must reflect all shared-boundary edits, including neighbouring slots.
     for row, segment in zip(state.get("raw_songs", []), state["segments"]):
         row.update(start=segment.start, end=segment.end, render_end=segment.end,
@@ -4148,11 +4170,10 @@ def api_editor_cut_operation() -> Response:
         global pipeline_state, pipeline_state_signature
         pipeline_state = state
         pipeline_state_signature = detection_state_signature()
-        save_detection_snapshot(state, pipeline_state_signature)
     persist_manual_editor_state(state)
     save_json_atomic(EDITOR_HISTORY_PATH, history)
     append_log("ui", f"Global editor operation {operation} applied at {payload.get('at_sec')}")
-    return jsonify({"ok": True, "operation": operation, "slot_count": len(state["segments"]), "segments": [{"start": s.start, "end": s.end} for s in state["segments"]]})
+    return jsonify({"ok": True, "operation": operation, **editor_result_state(state)})
 
 
 @app.post("/api/overrides")

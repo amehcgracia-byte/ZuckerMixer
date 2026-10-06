@@ -50,7 +50,8 @@ class ManualMixControls(unittest.TestCase):
         with patch.object(a,'load_mix_plan',return_value=None), patch.object(a,'canonical_mix_params_for_song',return_value=plan) as prepare, patch.object(a,'load_settings',return_value={}), patch.object(a,'app_progress'), patch.object(p,'validate_mastering_reference'), patch.object(p,'MIX_OVERRIDES',{}):
             result=a.apply_overrides_for_song(2,2,overrides_snapshot=snapshot,state_snapshot=state)
             prepare.assert_called_once_with(2,state_snapshot=state,overrides_snapshot=snapshot)
-            self.assertIs(result,plan)
+            self.assertEqual(result["stems"],plan["stems"])
+            self.assertEqual(result["analysis_song_id"],2)
             self.assertEqual(p.MIX_OVERRIDES['songs']['2']['stems']['Guitar.wav']['auto_mix_gain_db'],2.)
 
 class ExactPreviewAnalysis(unittest.TestCase):

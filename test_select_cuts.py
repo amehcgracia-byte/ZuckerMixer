@@ -11,7 +11,7 @@ def test_select_cuts_contract_and_endpoint(tmp_path, monkeypatch):
     try:
         segment = pipeline.Segment(0.0, 600.0, nominal_end=600.0)
         stem = type("StemStub", (), {"offset_seconds": 0.0, "timeline_duration": 1200.0})()
-        monkeypatch.setattr(jam_app, "ensure_pipeline_state", lambda: {"segments": [segment], "stems": [stem]})
+        monkeypatch.setattr(jam_app, "ensure_pipeline_state", lambda: {"segments": [segment], "stems": [stem], "raw_songs": [{"id": 1, "start": 0, "end": 600, "duration": 600, "segment": {}}]})
         selection_path = tmp_path / "segment_selections.json"
         monkeypatch.setattr(jam_app, "SEGMENT_SELECTIONS_PATH", selection_path)
         client = jam_app.app.test_client()

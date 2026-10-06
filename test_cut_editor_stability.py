@@ -122,3 +122,53 @@ def test_recovery_uses_time_overlap_and_preserves_recent_manual_cuts(editor):
         '8':{'start_sec':210,'end_sec':290,'source':'manual'}}})
     assert a.restore_missing_saved_opening(state)
     assert [(s.start,s.end) for s in state['segments']]==[(10,90),(110,190),(200,300)]
+
+
+def test_saved_editor_list_is_authoritative_even_for_short_songs(editor):
+    c,state=editor
+    response=c.post('/api/segment-selection/1',json={'start_sec':100,'end_sec':101})
+    assert response.status_code==200
+    assert response.json['slot_count']==2
+    assert response.json['songs'][0]['render_valid']
+    assert response.json['songs'][0]['duration']==1
+    assert state['manual_editor_authoritative']
+    assert state['detection_calibration']['expected_target']==2
+
+
+def test_navigation_reuses_source_waveform_but_reads_latest_markers(editor,monkeypatch):
+    c,state=editor
+    calls=[]
+    def waveform():
+        calls.append(1)
+        return {'peaks':[0,.2,.1,0], 'window_start_sec':0,'window_end_sec':400,'cached':True}
+    monkeypatch.setattr(a,'full_session_waveform',waveform)
+    first=c.get('/api/cuts/1').json
+    assert first['global_waveform']
+    response=c.post('/api/editor-cut-operation',json={'operation':'add','at_sec':150})
+    assert response.json['slot_count']==3
+    second=c.get('/api/cuts/2',query_string={'waveform_key':first['waveform_key']}).json
+    assert second['global_waveform'] is None
+    assert len(second['markers'])==3
+    assert calls==[1]
+    assert c.get('/api/cuts/2',query_string={'waveform_key':'old-project'}).json['global_waveform']
+    assert len(calls)==2
+
+
+def test_song_zero_is_a_display_number_not_an_analysis_id(editor,monkeypatch):
+    c,state=editor
+    c.post('/api/editor-cut-operation',json={'operation':'numbering','first_song_number':0})
+    assert a.visible_index_for_segment(1,state)==0
+    assert a.visible_index_for_segment(2,state)==1
+    monkeypatch.setattr(a,'load_mix_plan',lambda *args,**kwargs:{'stems':{}})
+    monkeypatch.setattr(p,'validate_mastering_reference',lambda *args:None)
+    monkeypatch.setattr(a,'app_progress',lambda *args:None)
+    plan=a.apply_overrides_for_song(2,1,overrides_snapshot={'songs':{}},state_snapshot=state)
+    assert plan['analysis_song_id']==2
+    cache={'version':2,'song_id':2,'selection':{'start_sec':200,'end_sec':300},'mix_controls':{}}
+    monkeypatch.setattr(p,'load_analysis_cache',lambda *args:cache)
+    monkeypatch.setattr(p,'empty_noise_stem_names',lambda *args:{state['stems'][0].path.name})
+    plan.update(analysis_cache_path='cached.npz',analysis_cache_signature='test')
+    # Passing ID validation reaches the later empty-audio check; using display
+    # number 1 here previously failed before any audio was read.
+    with pytest.raises(RuntimeError,match='No decodable stems'):
+        p.render_segment(state['stems'],state['segments'][1],1,a.STATE_ROOT,prepared_plan=plan)
