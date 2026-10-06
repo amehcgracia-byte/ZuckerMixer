@@ -3687,7 +3687,7 @@ function renderLoadingOverlay() {
   }
   if (renderFill) renderFill.style.width = String(safeRenderProgress) + "%";
   if (renderPercent) renderPercent.textContent = String(Math.round(safeRenderProgress)) + "%";
-  const phases = isRenderTask ? [["prepare", "Check saved cuts"], ["analyze", "Prepare this song’s mix"], ["mix", "Mix audio blocks"], ["master", "Master"], ["encode", "Encode MP3"], ["save", "Save result"]] : state.kind === "cut" ? [["read", "Read saved cuts"], ["draw", "Display timeline"]] : [
+  const phases = isRenderTask ? [["prepare", "Check saved cuts"], ["analyze", "Prepare this song’s mix"], ["mix", "Mix audio blocks"], ["master", "Master"], ["encode", "Encode MP3"], ["save", "Save result"]] : state.kind === "cut" ? [["edit", state.label || "Edit Cuts"]] : [
     ["prepare", "Prepare original session"],
     ["scan", "Scan WAV stems"],
     ["cache", "Read audio envelopes"],
@@ -3696,7 +3696,7 @@ function renderLoadingOverlay() {
     ["merge", "Merge song boundaries"],
     ["review", "Prepare cuts"],
   ];
-  const phaseIndex = isRenderTask ? (stage.includes("analyz") ? 1 : stage.includes("mix") ? 2 : stage.includes("master") ? 3 : stage.includes("encod") ? 4 : stage.includes("finish") ? 5 : 0) : Number.isFinite(Number(state.phase_index)) ? Number(state.phase_index) : (
+  const phaseIndex = state.kind === "cut" ? 0 : isRenderTask ? (stage.includes("analyz") ? 1 : stage.includes("mix") ? 2 : stage.includes("master") ? 3 : stage.includes("encod") ? 4 : stage.includes("finish") ? 5 : 0) : Number.isFinite(Number(state.phase_index)) ? Number(state.phase_index) : (
     stage.includes("prepar") || stage === "waiting" ? 0 :
     stage.includes("scanning") ? 1 :
     stage.includes("cached") || stage.includes("envelope") ? 2 :
