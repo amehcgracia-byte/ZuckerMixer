@@ -2273,7 +2273,7 @@ def public_state() -> dict[str, Any]:
     transitions = [
         {
             "id": int(song["id"]),
-            "label": f"Song {str(song['index']).zfill(2)}" if song.get("index") else f"Skipped {song['id']}",
+            "label": f"Song {str(song['index']).zfill(2)}" if song.get("index") is not None else f"Skipped {song['id']}",
             "start": song["segment"].get("mc_start"),
             "end": song["segment"].get("mc_end"),
             "duration": (
