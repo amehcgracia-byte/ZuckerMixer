@@ -1051,6 +1051,7 @@ async function openCutSelector(songId) {
 }
 
 function setCutLoading(label, detail, progress = 0) {
+  if (progress < 100) progress = null;
   const box = $("#loadingStatus");
   if (box) {
     box.hidden = false;
@@ -1059,7 +1060,7 @@ function setCutLoading(label, detail, progress = 0) {
     $("#loadingProgressFill").classList.toggle("progress-indeterminate", progress == null);
     $("#loadingProgressFill").style.width = progress == null ? "35%" : String(Math.max(0, Math.min(100, progress))) + "%";
   }
-  loadingOverlayCut = progress >= 100 ? null : { kind: "cut", label, detail, progress, indeterminate: progress == null, current_stage: "loading" };
+  loadingOverlayCut = progress >= 100 ? null : { kind: "cut", label, detail, progress, indeterminate: progress == null, phase_index:0, phase_total:1, current_stage: "loading" };
   renderLoadingOverlay();
 }
 function reportCutAction(ui, action, details = {}) {
