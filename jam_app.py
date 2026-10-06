@@ -470,6 +470,16 @@ def load_mix_plan(
         return None
     plan = entry.get("plan")
     if isinstance(plan, dict):
+        try:
+            analysis = pipeline.load_analysis_cache(Path(str(plan["analysis_cache_path"])))
+            segment = state["segments"][segment_id - 1]
+            if int(analysis.get("version", 0)) != 2 or analysis.get("input_signature") != mix_plan_signature(segment_id, segment, {}):
+                return None
+            pipeline.analysis_window_offset(analysis, segment, segment_id)
+        except Exception:
+            # Missing/stale/corrupt derived caches are rebuilt before mixing;
+            # original WAVs and the saved human timeline remain authoritative.
+            return None
         profile = plan.get("auto_mix_balance", {}).get("effect_profile", {})
         if not profile:
             profile = pipeline.per_song_effect_profile({name: params.get("role", "") for name, params in plan.get("stems", {}).items()}, {}, 0.0, 0.0, {})
@@ -551,7 +561,7 @@ def song_analysis_snapshot(state: dict, segment: pipeline.Segment, segment_id: i
         if path.is_file():
             try:
                 cached = pipeline.load_analysis_cache(path)
-            except (OSError, ValueError, RuntimeError):
+            except Exception:
                 cached = None
             if isinstance(cached, dict) and cached.get("input_signature") == signature:
                 return cached

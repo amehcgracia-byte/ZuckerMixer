@@ -64,3 +64,9 @@ class CutReusePerformanceTest(unittest.TestCase):
             a.save_json_atomic(a.WAVEFORM_CACHE_PATH,{'identity':{'source':'same'},'global':{'window_end_sec':3600.,'peaks':[.1]*3600}})
             self.assertTrue(a.full_session_waveform()['cached'])
             load.assert_not_called()
+
+    def test_missing_or_corrupt_analysis_reprepares_instead_of_failing_render(self):
+        state={'segments':[p.Segment(0,30)]}
+        entry={'version':a.MIX_PLAN_VERSION,'signature':'plan','plan':{'analysis_cache_path':'missing.npz','stems':{}}}
+        with patch.object(a,'load_json',return_value={'1':entry}),patch.object(a,'mix_plan_signature',return_value='plan'),patch.object(p,'load_analysis_cache',side_effect=OSError('missing derived cache')):
+            self.assertIsNone(a.load_mix_plan(1,state_snapshot=state,overrides_snapshot={'songs':{}}))
