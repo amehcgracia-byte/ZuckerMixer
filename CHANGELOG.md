@@ -1,3 +1,9 @@
+## 2.8.1
+
+- Scan detection stems with up to four bounded workers and reuse individual envelopes when files and their alignment remain unchanged.
+- Preserve exact sequential detection results; recover corrupt cache entries and report aggregate scan progress.
+- Include the faster cut editor, complete saved-song counts, automatic per-song render preparation and correct successful batch status from 2.1.71.
+
 ## 2.1.70
 
 - Save both cut edges atomically, including the first and last edges; persist a source-fingerprinted manual timeline across restarts and project changes.
