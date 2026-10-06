@@ -1039,3 +1039,5 @@ dialog { position: fixed; padding-top: 42px; }
 .simple-sliders { position: static; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
 .preview-transport { grid-template-columns: auto minmax(0, 1fr) auto; }
 @media (max-width: 720px) { .preview-transport { grid-template-columns: minmax(0, 1fr); } }
+
+[hidden] { display: none !important; }

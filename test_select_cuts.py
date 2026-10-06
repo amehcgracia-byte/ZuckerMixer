@@ -20,7 +20,7 @@ def test_select_cuts_contract_and_endpoint(tmp_path, monkeypatch):
         saved = json.loads(selection_path.read_text())
         assert saved["segments"]["1"]["start_sec"] == 100.0
         assert saved["segments"]["1"]["end_sec"] == 700.0
-        invalid = client.post("/api/segment-selection/1", json={"start_sec": 0, "end_sec": 479})
+        invalid = client.post("/api/segment-selection/1", json={"start_sec": 0, "end_sec": 0})
         assert invalid.status_code == 400
     finally:
         monkeypatch.setattr(jam_app, "ensure_pipeline_state", original_state)

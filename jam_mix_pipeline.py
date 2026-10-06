@@ -3495,6 +3495,12 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     # slots before any acoustic duration-repair pass can split a slot into
     # multiple songs.  Activity remains diagnostic only.
     segments = finalize_presented_slot_segments(whisper_transcripts, session_end)
+    if segments and segments[0].start > 0 and _has_meaningful_pre_session_content(segments[0], stems, timelines):
+        end = segments[0].start
+        segments.insert(0, Segment(0.0, end, core_start=0.0, core_end=end, nominal_end=end,
+                                  assigned_song_number=0, boundary_source="pre-session-content"))
+    if segments and segments[0].assigned_song_number == 0:
+        segments = [replace(seg, assigned_song_number=i) for i, seg in enumerate(segments)]
     DETECTION_STRATEGY.update({
         "id": "commentator_presented_slots",
         "label": "One global slot per commentator presentation",
@@ -3924,6 +3930,13 @@ def songs_from_mc_breaks(
     last_activity_end = active_regions[-1][1] if active_regions else session_end
 
     segments: list[Segment] = []
+    opening_end = float(mc_breaks[0][0])
+    opening_activity = instrument_playing[:int(opening_end / DETECTION_FRAME_SECONDS)]
+    if opening_end > 0 and np.count_nonzero(opening_activity) * DETECTION_FRAME_SECONDS >= MC_STRUCTURAL_MIN_SONG_SECONDS:
+        first_active = float(np.flatnonzero(opening_activity)[0]) * DETECTION_FRAME_SECONDS
+        segments.append(Segment(first_active, opening_end, core_start=first_active, core_end=opening_end,
+            nominal_end=opening_end, boundary_source="acoustic-opening-content",
+            boundary_validation="needs_review", boundary_validation_reason="recorded music before the first detected introduction; preserved for editing"))
     for idx, (mc_start, mc_end) in enumerate(mc_breaks):
         song_start = mc_end
         if idx + 1 < len(mc_breaks):

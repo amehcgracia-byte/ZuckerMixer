@@ -1,3 +1,12 @@
+## 2.1.70
+
+- Save both cut edges atomically, including the first and last edges; persist a source-fingerprinted manual timeline across restarts and project changes.
+- Add cuts in uncovered opening, interior and ending regions. Preserve short and long manual selections, with duration warnings instead of blocked saves.
+- Recover previously saved opening cuts when a later automatic snapshot omitted them. Preserve opening music during acoustic detection.
+- Support song 0 with independent internal slot IDs and source-scoped numbering. Keep names, skip decisions and mix settings attached when cuts are inserted or undone.
+- Stream ranged source preview audio without preparing whole-song WAV files. Space toggles playback, arrows seek, wheel zooms, Command/Control-wheel pans. Keep native text-field shortcuts and add Command/Control-S to save.
+- Ask Yes/No to save pending edits when closing or changing slots, and visibly acknowledge successful saves.
+
 ## 2.1.69
 
 - Compare vocal and instrument activity over their common duration when recordings end at different times, preventing batch failures.
