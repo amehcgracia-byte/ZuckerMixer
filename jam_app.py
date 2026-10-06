@@ -493,6 +493,7 @@ def save_mix_plan(segment_id: int, segment: pipeline.Segment, song_overrides: di
     save_json_atomic(MIX_PLANS_PATH, payload)
 
 
+@source_edit_locked
 def load_render_state() -> dict[str, Any]:
     """Load Analyze output for a worker without running detection again."""
     settings = load_settings()
@@ -1973,6 +1974,7 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
         return pipeline_state
 
 
+@source_edit_locked
 def ensure_pipeline_state() -> dict[str, Any]:
     """Build detection once, even when multiple UI requests arrive together."""
     with pipeline_state_build_lock:
@@ -2173,6 +2175,7 @@ def _loading_state(error: str = "", detection_job: dict[str, Any] | None = None)
     }
 
 
+@source_edit_locked
 def public_state() -> dict[str, Any]:
     global last_load_error
     try:
@@ -3673,6 +3676,7 @@ def favicon() -> Response:
 
 
 @app.get("/api/state")
+@source_edit_locked
 def api_state() -> Response:
     global pipeline_state, pipeline_state_signature
     # Loading/detection failures are application state, not a server crash.
@@ -3752,6 +3756,7 @@ def api_state() -> Response:
     return jsonify(public_state()), 200
 
 @app.get("/api/cuts/<int:song_id>")
+@source_edit_locked
 def api_cuts(song_id: int) -> Response:
     """Return cached waveform plus automatic boundary evidence for Select Cuts."""
     state = ensure_pipeline_state()
@@ -3843,6 +3848,7 @@ def cut_source_audio_blocks(stems: list, sample_rate: int, first_frame: int, fra
 
 
 @app.get("/api/cuts/audio/<int:song_id>")
+@source_edit_locked
 def api_cut_audio(song_id: int) -> Response:
     state = ensure_pipeline_state()
     if song_id < 1 or song_id > len(state["segments"]):
@@ -4234,6 +4240,7 @@ def api_mix_plan_status(segment_id: int) -> Response:
 
 
 @app.post("/api/settings")
+@source_edit_locked
 def api_settings() -> Response:
     global pipeline_state, pipeline_state_signature, last_load_error
     payload = request.get_json(force=True, silent=True) or {}
@@ -4481,6 +4488,7 @@ def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | N
     return dict(live[-1]) if live else None
 
 
+@source_edit_locked
 def _queue_redetect_job(allow_whisper: bool = True) -> dict[str, Any]:
     """Serialize simultaneous requests so double clicks cannot queue duplicates."""
     with state_lock:
@@ -4576,6 +4584,7 @@ def api_redetect_candidate() -> Response:
 
 
 @app.post("/api/redetect/commit")
+@source_edit_locked
 def api_redetect_commit() -> Response:
     candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
     if not isinstance(candidate, dict):
@@ -4591,7 +4600,13 @@ def api_redetect_commit() -> Response:
     expected = detection_state_signature()
     if candidate.get("source_signature") != [expected[0], list(expected[1]), [list(item) for item in expected[2]]]:
         return jsonify({"error": "Source changed since detection; run Detect Songs again."}), 409
+    candidate["fingerprint"] = source_job_identity(expected)["fingerprint"]
+    previous_manual = load_json(MANUAL_EDITOR_STATE_PATH, None)
+    if isinstance(previous_manual, dict):
+        save_json_atomic(ACTIVE_SOURCE_STATE_ROOT / f"manual-editor-before-redetect-{time.time_ns()}.json", previous_manual)
     save_json_atomic(DETECTION_STATE_PATH, candidate)
+    # Only explicit confirmation may replace the authoritative human timeline.
+    save_json_atomic(MANUAL_EDITOR_STATE_PATH, candidate)
     try:
         REDETECTION_CANDIDATE_PATH.unlink()
     except FileNotFoundError:
