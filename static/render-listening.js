@@ -9,7 +9,7 @@
     document.querySelectorAll('#songList .song-card').forEach(card => {
       const song = appState?.songs?.find(item => String(item.id) === card.dataset.songId);
       if (!song || song.index == null) { card.querySelector('.render-listen-button')?.remove(); return; }
-      const index = Number(song.index), entry = ready.get(index) || (selected?.index === index ? selected : null);
+      const index = Number(song.index), entry = ready.get(index) || (selected?.index === index && playing() ? selected : null);
       let button = card.querySelector('.render-listen-button');
       if (!entry) { button?.remove(); return; }
       if (!button) {
