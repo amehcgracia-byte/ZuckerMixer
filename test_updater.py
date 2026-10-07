@@ -118,3 +118,11 @@ def test_bad_download_never_runs_helper(tmp_path,monkeypatch):
     updater._prepare(lambda:False,lambda process:pytest.fail('helper started for bad package'))
     assert updater.status()['status']=='error' and 'SHA-256' in updater.status()['error']
     assert exe.read_text()=='old'
+
+
+def test_restart_is_independent_of_helper_process(tmp_path,monkeypatch):
+    folder=tmp_path/'ZuckerMixer';folder.mkdir();calls=[]
+    monkeypatch.setattr(h.subprocess,'Popen',lambda args,**kwargs:calls.append((args,kwargs)))
+    h.launch(folder,tmp_path/'receipt.json')
+    assert calls[0][1]['start_new_session']==(h.os.name!='nt')
+    assert calls[0][0][1]=='--update-receipt'

@@ -205,7 +205,9 @@ class Updater:
                 raise RuntimeError('A job started during download; finish it and retry the update')
             self.set(status='installing', progress=None)
             process = subprocess.Popen([str(executable(helper)), '--update-helper', str(path)],
-                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       start_new_session=(os.name != 'nt'),
+                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0)
             finished(process)
         except Exception as exc:
             if stage and stage.exists():

@@ -39,7 +39,9 @@ def launch(folder, receipt=None):
     if receipt:
         args += ['--update-receipt', str(receipt)]
     return subprocess.Popen(args, cwd=str(folder.parent), stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=(os.name != 'nt'),
+                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0)
 
 
 def apply_update(manifest, *, wait=wait_for_parent, start=launch, receipt_timeout=180):
