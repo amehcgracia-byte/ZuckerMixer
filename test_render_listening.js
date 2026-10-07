@@ -28,6 +28,7 @@ vm.runInNewContext(fs.readFileSync('static/render-listening.js','utf8'),context)
  assert.equal(cards[0].button,first);assert.equal(player.currentTime,11);assert.equal(player.paused,false);
  await first.onclick();assert.equal(player.paused,true);await first.onclick();assert.equal(player.currentTime,11);
  data.items[0]={index:0,url:'/audio/rendered/0/new-version',version:2};await listening.poll('/source');assert.equal(player.src,'/audio/rendered/0/first');
+ await first.onclick();await first.onclick();assert.equal(player.src,'/audio/rendered/0/new-version');assert.equal(player.currentTime,0);
  await cards[1].button.onclick();assert.equal(player.src,'/audio/rendered/2/second');assert.equal(player.currentTime,0);assert.equal(first['aria-label'],'Play rendered song 0');
  player.ended=true;player.events.ended();assert.equal(cards[1].button['aria-label'],'Play rendered song 2');
  context.appState.source_folder='/another';data={source_folder:'/another',items:[]};await listening.poll('/another');assert.equal(player.paused,true);assert.equal(folder.disabled,true);

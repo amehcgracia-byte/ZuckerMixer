@@ -21,7 +21,7 @@
       button.innerHTML = `<span>${String(index).padStart(2,'0')}</span>${icon(active)}`;
       button.setAttribute('aria-label', `${active ? 'Pause' : 'Play'} rendered song ${index}`);
       button.setAttribute('aria-pressed', String(active));
-      button.title = `Completed render · v${entry.version ?? ''}`;
+      button.title = `Completed render · v${(active ? selected.version : entry.version) ?? ''}`;
     });
     const folder = document.querySelector('#openRenderFolder');
     if (folder) { folder.disabled = ready.size === 0; folder.textContent = platform === 'darwin' ? 'Open in Finder' : platform === 'win32' ? 'Open in Explorer' : 'Open renders folder'; }
@@ -37,7 +37,7 @@
       await Promise.all(Object.keys(previewMixes).map(id => stopPreviewMix(id)));
     }
     if (token !== generation) return;
-    if (!selected || selected.index !== index || player.ended) {
+    if (!selected || selected.index !== index || player.ended || selected.url !== entry.url) {
       player.pause(); selected = entry; player.src = entry.url; player.currentTime = 0;
     }
     pending = true; sync();
