@@ -9,7 +9,7 @@
     document.querySelectorAll('#songList .song-card').forEach(card => {
       const song = appState?.songs?.find(item => String(item.id) === card.dataset.songId);
       if (!song || song.index == null) { card.querySelector('.render-listen-button')?.remove(); return; }
-      const index = Number(song.index), entry = ready.get(index);
+      const index = Number(song.index), entry = ready.get(index) || (selected?.index === index ? selected : null);
       let button = card.querySelector('.render-listen-button');
       if (!entry) { button?.remove(); return; }
       if (!button) {
@@ -29,8 +29,8 @@
   function pause() { generation++; pending = false; player.pause(); sync(); }
   function reset() { generation++; pause(); selected = null; ready.clear(); source = null; player.removeAttribute('src'); player.load(); sync(); }
   async function toggle(index) {
-    const entry = ready.get(index); if (!entry) return;
     if (selected?.index === index && playing()) { pause(); return; }
+    const entry = ready.get(index) || (selected?.index === index ? selected : null); if (!entry) return;
     const token = ++generation;
     document.querySelectorAll('audio').forEach(audio => audio.pause());
     if (typeof previewMixes !== 'undefined' && typeof stopPreviewMix === 'function') {
