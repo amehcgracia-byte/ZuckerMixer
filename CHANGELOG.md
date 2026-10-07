@@ -1,3 +1,9 @@
+## 2.8.2
+
+- Check public GitHub releases at desktop startup without blocking project loading. Ask before downloading and installing updates.
+- Verify package checksums and frozen startup before replacement; restart via an independent helper and restore the previous application if startup fails.
+- Preserve user projects and refuse updates during active jobs or unsaved cut edits.
+
 ## 2.8.1
 
 - Scan detection stems with up to four bounded workers and reuse individual envelopes when files and their alignment remain unchanged.

@@ -36,6 +36,12 @@ def record_worker_bootstrap() -> None:
 record_worker_bootstrap()
 
 
+if "--update-helper" in sys.argv:
+    import runpy
+    helper_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "update_helper.py"
+    runpy.run_path(str(helper_path), run_name="__main__")
+    raise SystemExit(0)
+
 def ensure_pipeline_module() -> None:
     """Load jam_mix_pipeline from the frozen bundle when import discovery misses it."""
     try:
@@ -86,6 +92,8 @@ import jam_mix_pipeline as pipeline
 
 
 if "--self-check" in sys.argv:
+    import update_manager
+    assert (Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "update_helper.py").is_file()
     try:
         import faster_whisper  # noqa: F401
     except Exception as exc:
@@ -105,6 +113,29 @@ if "--self-check" in sys.argv:
 
 
 class ZuckerMixerApi:
+    def __init__(self):
+        from update_manager import Updater
+        self.updater = Updater(jam_app.runtime_build_metadata()['app_version'], jam_app.STATE_ROOT)
+
+    def check_update(self):
+        return self.updater.check()
+
+    def update_status(self):
+        return self.updater.status()
+
+    def install_update(self):
+        def finish(process):
+            window = webview.windows[0]
+            try:
+                if jam_app.has_active_jobs() or not window.evaluate_js("window.canInstallUpdate()"):
+                    raise RuntimeError("Finish current work and save pending changes before updating")
+                window.destroy()
+            except Exception:
+                process.terminate()
+                process.wait(timeout=30)
+                raise
+        return self.updater.install(jam_app.has_active_jobs, finish)
+
     def choose_source_folder(self, default_dir: str) -> dict[str, Any]:
         window = webview.windows[0] if webview.windows else None
         if window is None:
@@ -183,6 +214,9 @@ def main() -> None:
     )
 
     def on_loaded() -> None:
+        if "--update-receipt" in sys.argv:
+            receipt = Path(sys.argv[sys.argv.index("--update-receipt") + 1])
+            receipt.write_text(json.dumps({"version": jam_app.runtime_build_metadata()['app_version']}))
         if not pipeline.resolve_ffmpeg():
             window.create_confirmation_dialog(
                 "ffmpeg is missing",

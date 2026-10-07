@@ -1044,3 +1044,7 @@ dialog { position: fixed; padding-top: 42px; }
 
 .progress-track > .progress-indeterminate { width: 35% !important; animation: progress-pending 1.2s ease-in-out infinite alternate; }
 @keyframes progress-pending { from { transform: translateX(0); } to { transform: translateX(180%); } }
+
+.update-dialog button { margin: 8px 8px 0 0; }
+#checkUpdate { font-size: 11px; padding: 4px 8px; margin-right: 8px; }
+#updateNotice { margin-right: 8px; overflow-wrap: anywhere; }

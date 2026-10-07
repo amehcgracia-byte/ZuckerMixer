@@ -13,6 +13,9 @@ $env:ZUCKER_BUILD_CONSOLE = '1'
 python -m PyInstaller --noconfirm zucker_mixer.spec
 if ($LASTEXITCODE -ne 0) { throw 'Diagnostic PyInstaller build failed' }
 $exe = "$PWD/dist/ZuckerMixer/ZuckerMixer.exe"
+$helper = Start-Process -FilePath $exe -ArgumentList '--update-helper', '--self-check' -PassThru
+if (-not $helper.WaitForExit(30000)) { Stop-Process -Id $helper.Id -Force; throw 'Frozen updater helper timed out' }
+if ($helper.ExitCode -ne 0) { throw 'Frozen updater helper failed' }
 $process = Start-Process -FilePath $exe -ArgumentList '--self-check' -RedirectStandardOutput "$PWD/build/self-check.stdout.log" -RedirectStandardError "$PWD/build/self-check.stderr.log" -PassThru
 if (-not $process.WaitForExit(120000)) {
   Stop-Process -Id $process.Id -Force
