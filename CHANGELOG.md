@@ -1,5 +1,8 @@
 ## 2.8.4
 
+- Show Canceling… until workers stop; preserve cancellation across late progress events and stop workers before status I/O.
+- Bound native application shutdown and cover cancellation during worker launch.
+
 - Restore the loading video during batch renders.
 - Put completed-song play/pause controls and Open in Finder/Explorer inside the loading screen, rather than the song cards.
 

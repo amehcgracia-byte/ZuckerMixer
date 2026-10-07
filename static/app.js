@@ -3618,7 +3618,7 @@ function renderLoadingOverlay() {
   const stage = String(state.current_stage || state.stage || "").toLowerCase();
   const isRenderTask = ["render", "mix"].includes(String(state.kind || "").toLowerCase());
   const title = state.kind === "cut" ? (state.label || "Loading editor") :
-    (state.status === "stopping" ? "Finishing the current task..." :
+    (state.status === "stopping" ? "Canceling…" :
       stage.includes("preparing") || stage === "waiting" ? "Preparing the session..." :
       stage.includes("redetect") || stage.includes("detecting") ? "Finding songs..." : "Working...");
   const detail = state.detail || state.stage_detail || "Please wait...";
@@ -3648,7 +3648,7 @@ function renderLoadingOverlay() {
   if (cancelNode) {
     cancelNode.hidden = !cancellable;
     cancelNode.disabled = String(state.status || "") === "stopping";
-    cancelNode.textContent = String(state.status || "") === "stopping" ? "Stopping…" : "Cancel loading";
+    cancelNode.textContent = String(state.status || "") === "stopping" ? "Canceling…" : "Cancel loading";
   }
   if (titleNode) titleNode.textContent = title;
   if (detailNode) detailNode.textContent = detail;
@@ -3845,7 +3845,7 @@ function renderJobs(items) {
     $(".progress-box").classList.remove("success", "warning");
     const current = active.current_item || (active.current ? `Song ${String(active.current).padStart(2, "0")}` : "Waiting");
     const stage = active.current_stage ? ` · ${active.current_stage}` : "";
-    $("#currentWork").textContent = active.status === "stopping" ? "Stopping after this song" : `${current}${stage}`;
+    $("#currentWork").textContent = active.status === "stopping" ? "Canceling…" : `${current}${stage}`;
     const total = active.total_count || active.songs.length;
     const position = active.current ? (active.done_count || 0) + 1 : (active.done_count || 0);
     const elapsed = shortElapsed(active.started);
@@ -3940,6 +3940,7 @@ function hideLoadingOverlayImmediately() {
   renderLoadingOverlay();
 }
 
+let cancellationUiPending = false;
 async function cancelActiveWork() {
   if (!await showConfirm("Are you sure you want to cancel all active work?")) return;
   const buttons = [$("#cancelLoadingWork"), $("#cancelJob")].filter(Boolean);
@@ -3947,12 +3948,15 @@ async function cancelActiveWork() {
     button.disabled = true;
     button.textContent = "Canceling…";
   });
-  suppressLoadingOverlay = true;
+  cancellationUiPending = true;
+  window.renderListening?.pause();
+  if (loadingOverlayJob) loadingOverlayJob = { ...loadingOverlayJob, status: "stopping", current_stage: "cancelling", stage_detail: "Stopping active processes…" };
+  renderLoadingOverlay();
   showToast("Canceling… stopping the active processes.");
-  hideLoadingOverlayImmediately();
-  setRenderControlsBusy(false);
+  setRenderControlsBusy(true);
 
   const finishCancellationUi = async (message) => {
+    cancellationUiPending = false;
     const cutDialog = $("#cutSelectorDialog");
     if (cutDialog?.open) cutDialog.close("cancel");
     cutSelector = null;
@@ -3980,19 +3984,17 @@ async function cancelActiveWork() {
       throw new Error(data.error || "Could not cancel the active work.");
     }
   } catch (error) {
-    suppressLoadingOverlay = false;
-    await finishCancellationUi(error.name === "AbortError"
-      ? "Cancellation is still being requested; the interface is ready."
-      : (error.message || String(error)));
+    cancellationUiPending = false;
+    buttons.forEach(button => { button.disabled = false; button.textContent = "Retry cancel"; });
+    showToast(error.name === "AbortError" ? "Could not confirm cancellation yet. Retry cancel." : (error.message || String(error)));
     return;
   }
 
   // Do not make the browser wait for ffmpeg/Whisper. Poll in the background
   // and restore the normal page only after the backend reports a terminal job.
   void (async () => {
-    const deadline = Date.now() + 30000;
     let terminal = false;
-    while (Date.now() < deadline) {
+    while (cancellationUiPending) {
       try {
         const jobs = await pollJobs();
         if (!jobs.some((job) => ["queued", "running", "stopping"].includes(String(job.status || "")))) {
@@ -4005,12 +4007,11 @@ async function cancelActiveWork() {
       }
       await new Promise((resolve) => setTimeout(resolve, 350));
     }
-    suppressLoadingOverlay = false;
     if (terminal) {
       await finishCancellationUi("All active work was cancelled. Ready.");
       await refreshState({ renderLarge: true }).catch(() => {});
     } else {
-      await finishCancellationUi("Cancellation requested. The worker is still finishing cleanup.");
+      showToast("Canceling… waiting for process cleanup. Keep this window open or close the application to stop it.");
     }
   })();
 }
@@ -4022,7 +4023,7 @@ function pollJobs() {
 
 async function pollJobsOnce() {
   const res = await fetch("/api/jobs");
-  const jobs = await res.json();
+  const jobs = (await res.json()).map(job => cancellationUiPending && ["queued", "running", "stopping"].includes(job.status) ? {...job, status: "stopping", current_stage: "cancelling", stage_detail: "Stopping active processes…"} : job);
   console.log("[jobs poll]", jobs.map((job) => ({
     id: job.id,
     status: job.status,

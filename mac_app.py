@@ -233,6 +233,18 @@ def main() -> None:
             if not proceed:
                 return False
         threading.Thread(target=jam_app.stop_server, daemon=True).start()
+        # A stuck WebView or disk request must not keep the desktop alive after
+        # an accepted close. Give worker termination/reaping a bounded interval.
+        def force_exit() -> None:
+            for proc in list(jam_app.child_processes.values()):
+                try:
+                    jam_app.signal_owned_process_group(proc, force=True)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            os._exit(0)
+        timer = threading.Timer(6.0, force_exit)
+        timer.daemon = True
+        timer.start()
         return True
 
     window.events.loaded += on_loaded

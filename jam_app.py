@@ -1727,29 +1727,21 @@ def ffmpeg_status() -> dict[str, str | bool]:
 def request_cancel() -> None:
     global cancel_requested
     cancel_requested = True
-    lifecycle_log("cancel_requested", reason="explicit_cancel_or_shutdown")
-    to_stop: list[tuple[str, subprocess.Popen[str]]] = []
-    with state_lock:
-        for job in jobs:
-            if job.get("status") in {"queued", "running"}:
-                lifecycle_log("job_cancel_mark", str(job.get("id")), previous_status=job.get("status"))
-                job["status"] = "stopping" if job.get("status") == "running" else "cancelled"
-                job["heartbeat"] = time.time()
-                write_job_status(job)
-        for job_id, proc in child_processes.items():
-            if proc.poll() is None:
-                to_stop.append((job_id, proc))
+    for job in list(jobs):
+        if job.get("status") in {"queued", "running", "stopping"}:
+            job["cancel_requested"] = True
+    # Signal owned workers before status/log I/O: an external disk or a
+    # concurrent status write must not postpone stopping audio processes.
+    to_stop = [(job_id, proc) for job_id, proc in list(child_processes.items()) if proc.poll() is None]
     for job_id, proc in to_stop:
         # Workers are isolated in their own process group so a render and any
         # helper it spawned stop together. Escalate after two seconds: the UI
         # must never wait for a multi-minute DSP checkpoint.
         try:
             signal_owned_process_group(proc)
-            lifecycle_log("child_group_sigterm", job_id, child_pid=proc.pid)
         except ProcessLookupError:
             pass
-        except OSError as exc:
-            lifecycle_log("child_group_sigterm_failed", job_id, child_pid=proc.pid, error=str(exc))
+        except (OSError, subprocess.SubprocessError) as exc:
             try:
                 proc.terminate()
             except OSError:
@@ -1765,7 +1757,17 @@ def request_cancel() -> None:
                 except OSError as exc:
                     lifecycle_log("child_group_sigkill_failed", target_job_id, child_pid=target.pid, error=str(exc))
 
-        threading.Timer(2.0, escalate).start()
+        timer = threading.Timer(2.0, escalate)
+        timer.daemon = True
+        timer.start()
+    with state_lock:
+        for job in jobs:
+            if job.get("status") in {"queued", "running", "stopping"}:
+                job["cancel_requested"] = True
+                job["status"] = "stopping" if job.get("status") != "queued" else "cancelled"
+                job["heartbeat"] = time.time()
+                write_job_status(job)
+    lifecycle_log("cancel_requested", reason="explicit_cancel_or_shutdown")
     append_log("system", "Stop requested. The current mix process is being terminated.")
 
 
@@ -3580,6 +3582,8 @@ def _run_child_job(job_path: Path) -> int:
 
 def handle_child_line(job: dict[str, Any], line: str) -> None:
     if line.startswith("APP_PROGRESS "):
+        if cancel_requested or job.get("cancel_requested"):
+            return
         try:
             updates = json.loads(line[len("APP_PROGRESS "):])
         except json.JSONDecodeError:
@@ -3594,7 +3598,9 @@ def worker() -> None:
     while True:
         job = job_queue.get()
         try:
-            if job.get("status") in {"cancelled", "error"}:
+            if job.get("cancel_requested") or job.get("status") in {"cancelled", "error"}:
+                if job.get("cancel_requested"):
+                    set_job(job, status="cancelled", current_stage="cancelled", stage_detail="Cancelled before starting")
                 lifecycle_log("queued_job_skipped_cancelled", str(job.get("id")))
                 continue
             set_job(job, status="running", progress=0, started=time.time(), heartbeat=time.time())
@@ -3624,6 +3630,9 @@ def worker() -> None:
                 lifecycle_log("spawned", job["id"], child_pid=proc.pid, argv=command)
                 with state_lock:
                     child_processes[job["id"]] = proc
+                # Cancellation may arrive between dequeuing and registration.
+                if cancel_requested or job.get("cancel_requested") or job.get("status") in {"stopping", "cancelled"}:
+                    request_cancel()
                 if proc.stdout:
                     for line in proc.stdout:
                         handle_child_line(job, line.rstrip("\n"))
@@ -3642,7 +3651,7 @@ def worker() -> None:
                     pipeline_state = None
                     pipeline_state_signature = None
                 append_log(job["id"], "Fresh detection completed; invalidated the parent song list and boundaries.")
-            cancelled = cancel_requested or job.get("status") in {"stopping", "cancelled"} or code in {130, 143, 145, 146}
+            cancelled = cancel_requested or job.get("cancel_requested") or job.get("status") in {"stopping", "cancelled"} or code in {130, 143, 145, 146}
             if cancelled:
                 set_job(job, status="cancelled", error=None, current=None, current_stage="cancelled", stage_detail="Cancelled by user", progress=job.get("progress", 0))
                 append_log(job["id"], "Mixing stopped.")
@@ -5209,7 +5218,7 @@ def signal_owned_process_group(proc: subprocess.Popen, force: bool = False) -> N
     """Stop only an owned worker and its helpers on either desktop platform."""
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
     else:
         os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
 
@@ -5229,8 +5238,8 @@ def stop_server() -> None:
 
 
 def has_active_jobs() -> bool:
-    with state_lock:
-        return any(job.get("status") in {"queued", "running", "stopping"} for job in jobs)
+    # Native close/update checks must not wait behind a disk-backed status write.
+    return any(job.get("status") in {"queued", "running", "stopping"} for job in list(jobs))
 
 
 def wait_for_jobs_to_stop(timeout_seconds: float | None = None) -> None:
