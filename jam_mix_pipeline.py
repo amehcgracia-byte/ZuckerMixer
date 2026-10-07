@@ -28,6 +28,7 @@ import queue
 import threading
 from contextlib import ExitStack, contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
@@ -7293,62 +7294,68 @@ def master_temp_wav_streaming(premaster_path: Path, master_path: Path, sr: int) 
     return final_lufs, final_peak
 
 
-def measure_encoded_lufs(path: Path) -> float:
-    """Measure encoded loudness without buffering the complete MP3 in Python."""
-    ffmpeg = resolve_ffmpeg()
-    if not ffmpeg:
-        return float("nan")
-    # Let FFmpeg's ebur128 filter perform the integrated-loudness pass in
-    # streaming mode. The previous implementation decoded the whole MP3 into
-    # a Python bytes object and then into a NumPy array for every song.
+@lru_cache(maxsize=16)
+def _measure_ebur128_cached(path: str, ffmpeg: str, signature: tuple) -> tuple[float, float]:
+    # The signature includes nanosecond times and inode: any trim, rewrite or
+    # replacement invalidates the result, including same-size audio files.
     result = subprocess.run(
-        [
-            ffmpeg,
-            "-hide_banner",
-            "-nostats",
-            "-i",
-            str(path),
-            "-af",
-            "ebur128=peak=true",
-            "-f",
-            "null",
-            "-",
-        ],
-        capture_output=True,
-        text=True,
+        [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-i", path,
+         "-af", "ebur128=peak=true:framelog=verbose", "-f", "null", "-"],
+        capture_output=True, text=True,
     )
     if result.returncode != 0:
+        raise RuntimeError(f"audio measurement failed for {path}: {(result.stderr or '').strip()}")
+    loudness = re.findall(r"\bI:\s*([-+]?\d+(?:\.\d+)?)\s*LUFS", result.stderr or "")
+    peaks = re.findall(r"Peak:\s*([-+]?\d+(?:\.\d+)?)\s*dBFS", result.stderr or "")
+    if not peaks:
+        raise RuntimeError(f"ffmpeg did not return a true-peak value for {path}")
+    return (float(loudness[-1]) if loudness else float("nan"), float(peaks[-1]))
+
+
+def measure_audio_loudness_and_peak(path: Path) -> tuple[float, float]:
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for independent true-peak validation")
+    path = Path(path).resolve()
+    stat = path.stat()
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    return _measure_ebur128_cached(str(path), str(ffmpeg), signature)
+
+
+def measure_encoded_lufs(path: Path) -> float:
+    """Reuse the delivered file's independent loudness/true-peak pass."""
+    try:
+        loudness, _peak = measure_audio_loudness_and_peak(path)
+        if np.isfinite(loudness):
+            return loudness
+    except (RuntimeError, OSError):
         return float("nan")
-    matches = re.findall(r"\bI:\s*([-+]?\d+(?:\.\d+)?)\s*LUFS", result.stderr or "")
-    if matches:
-        return float(matches[-1])
-    # Keep a compatibility fallback for FFmpeg builds that omit the summary
-    # line from stderr.
+    # Compatibility for older FFmpeg builds which omit integrated loudness.
     try:
         decoded = subprocess.check_output(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "wav", "-"],
+            [resolve_ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "wav", "-"],
         )
         audio, sample_rate = sf.read(io.BytesIO(decoded), dtype="float32", always_2d=True)
         return float(pyln.Meter(sample_rate).integrated_loudness(audio))
     except Exception:
         return float("nan")
 
+
 def measure_true_peak_db(path: Path) -> float:
-    """Measure the delivered file with ffmpeg's independent true-peak meter."""
-    ffmpeg = resolve_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError("ffmpeg is required for independent true-peak validation")
-    result = subprocess.run(
-        [ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true", "-f", "null", "-"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"true-peak measurement failed for {path}: {(result.stderr or '').strip()}")
-    matches = re.findall(r"Peak:\s*([-+]?\d+(?:\.\d+)?)\s*dBFS", result.stderr or "")
-    if not matches:
-        raise RuntimeError(f"ffmpeg did not return a true-peak value for {path}")
-    return float(matches[-1])
+    """Measure independent true peak once per exact file revision."""
+    return measure_audio_loudness_and_peak(path)[1]
+
+
+def accumulate_audio_meter(meter: dict, audio: np.ndarray) -> None:
+    values = np.asarray(audio)
+    if not values.size:
+        return
+    meter["peak"] = max(float(meter["peak"]), float(np.max(np.abs(values))))
+    flat = values.reshape(-1)
+    # Double-precision reduction without allocating a float64 copy and a
+    # second full-size squared buffer for every bus/stem on every chunk.
+    meter["sumsq"] += float(np.einsum("i,i->", flat, flat, dtype=np.float64))
+    meter["count"] += int(values.size)
 
 
 def attenuate_wav_in_place(path: Path, attenuation_db: float) -> None:
@@ -8409,12 +8416,7 @@ def render_segment(
         }
 
         def meter_stage(name: str, audio: np.ndarray) -> None:
-            values = np.asarray(audio, dtype=np.float64)
-            meter = stage_meters[name]
-            if values.size:
-                meter["peak"] = max(float(meter["peak"]), float(np.max(np.abs(values))))
-                meter["sumsq"] += float(np.sum(values * values))
-                meter["count"] += int(values.size)
+            accumulate_audio_meter(stage_meters[name], audio)
 
         def finish_stage_meters() -> dict[str, dict[str, float]]:
             result: dict[str, dict[str, float]] = {}

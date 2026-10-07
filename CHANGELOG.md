@@ -1,3 +1,9 @@
+## 2.8.5
+
+- Reuse one independent FFmpeg loudness/true-peak measurement per exact file revision instead of rescanning unchanged exports. Invalidate on trims, rewrites and file replacements.
+- Reduce diagnostic-meter allocations while preserving float64 RMS accumulation and exact peaks.
+- Synthetic 60-second check: duplicate measurement 4.61s → 2.08s with identical loudness/peak; diagnostic meter 0.089s → 0.068s. Whole-batch speedup depends on DSP, mastering and concurrent disk/CPU use.
+
 ## 2.8.4
 
 - Show Canceling… until workers stop; preserve cancellation across late progress events and stop workers before status I/O.
