@@ -1,3 +1,8 @@
+## 2.8.4
+
+- Restore the loading video during batch renders.
+- Put completed-song play/pause controls and Open in Finder/Explorer inside the loading screen, rather than the song cards.
+
 ## 2.8.3
 
 - Show a numbered play/pause button in each song card as soon as a completed export is registered, while other songs continue rendering.

@@ -9,13 +9,13 @@ class Audio {
 }
 class Button {setAttribute(k,v){this[k]=v;} remove(){this.parent.button=null;}}
 class Card {
- constructor(id){this.dataset={songId:String(id)};this.title={prepend:b=>{this.button=b;b.parent=this;}};}
- querySelector(s){return s==='.song-title'?this.title:this.button;}
+ constructor(id){this.dataset={songIndex:String(id)};this.title={prepend:b=>{this.button=b;b.parent=this;}};}
+ querySelector(s){return s==='.loading-song-label'?this.title:this.button;}
 }
-const cards=[new Card(1),new Card(2)],folder={addEventListener(){}};
+const cards=[new Card(0),new Card(2)],folder={addEventListener(){}};
 let data={source_folder:'/source',items:[]};const messages=[];
 const context={Audio,window:{},appState:{source_folder:'/source',songs:[{id:1,index:0},{id:2,index:2}]},
- document:{querySelectorAll:s=>s==='audio'?[]:cards,querySelector:()=>folder,createElement:()=>new Button(),addEventListener(){}},
+ document:{querySelectorAll:s=>s==='audio'?[]:s.includes('openRenderFolder')?[folder]:cards,querySelector:()=>folder,createElement:()=>new Button(),addEventListener(){}},
  fetch:async()=>({ok:true,json:async()=>data}),showToast:message=>messages.push(message)};
 vm.runInNewContext(fs.readFileSync('static/render-listening.js','utf8'),context);
 (async()=>{

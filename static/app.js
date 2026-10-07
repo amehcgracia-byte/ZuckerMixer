@@ -3609,8 +3609,7 @@ function renderLoadingOverlay() {
   // Whisper/render job must not cover or block waveform editing.
   const cutEditorOpen = Boolean(document.querySelector("#cutSelectorDialog[open]"));
   const state = cutEditorOpen ? loadingOverlayCut : (loadingOverlayCut || loadingOverlayJob);
-  const backgroundRender = ["render", "mix"].includes(String(state?.kind || "").toLowerCase());
-  const busy = Boolean(state) && !suppressLoadingOverlay && !backgroundRender;
+  const busy = Boolean(state) && !suppressLoadingOverlay;
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
   const video = $("#loadingStageVideo");
@@ -3762,7 +3761,7 @@ function renderLoadingOverlay() {
               : "";
         const mark = finished ? "✓" : status.includes("fail") || status.includes("error") ? "!" : status === "working" || Number(number) === Number(state.current) ? "●" : "○";
         const detail = finished ? "done" : (row.detail || row.status || row.state || "queued");
-        return `<div class="loading-song-state ${cls}" data-song-status="${esc(status)}"><span><span class="loading-song-check" aria-hidden="true">${mark}</span> Song ${String(number).padStart(2, "0")}</span><span>${esc(detail)}</span></div>`;
+        return `<div class="loading-song-state ${cls}" data-song-status="${esc(status)}" data-song-index="${esc(number)}"><span class="loading-song-label"><span class="loading-song-check" aria-hidden="true">${mark}</span> Song ${String(number).padStart(2, "0")}</span><span>${esc(detail)}</span></div>`;
       }).join("");
     } else {
       const facts = [
@@ -3774,6 +3773,7 @@ function renderLoadingOverlay() {
       songStates.innerHTML = facts.length ? `<div class="loading-song-state"><span>Detection status</span><span>${esc(facts.join(" · "))}</span></div>` : "";
     }
   }
+  window.renderListening?.sync();
   const lastUpdate = Number(state.progress_updated_at || state.heartbeat || state.updated_at || 0) * 1000;
   const age = lastUpdate ? Math.max(0, Math.floor((Date.now() - lastUpdate) / 1000)) : 0;
   if (activityAge) activityAge.textContent = age ? `updated ${age}s ago` : "updating now";
