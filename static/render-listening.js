@@ -52,7 +52,13 @@
     request = fetch('/api/render-previews').then(response => { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); }).then(data => {
       if (source !== requestedSource || appState?.source_folder !== requestedSource || data.source_folder !== requestedSource) return;
       platform = data.platform;
-      ready = new Map((data.items || []).map(entry => [Number(entry.index), entry])); sync();
+      const active = (appState?.jobs || []).find(job => ['render','mix'].includes(job.kind) && ['running','stopping'].includes(job.status) && (!job.source_folder || job.source_folder === requestedSource))
+        || (appState?.jobs || []).find(job => ['render','mix'].includes(job.kind) && job.status === 'queued' && (!job.source_folder || job.source_folder === requestedSource));
+      const requestedSongs = new Set((active?.songs || []).map(Number));
+      ready = new Map((data.items || []).filter(entry => {
+        const song = appState?.songs?.find(song => Number(song.index) === Number(entry.index) && song.index != null);
+        return !active || !requestedSongs.has(Number(song?.id)) || String(entry.job_id) === String(active.id);
+      }).map(entry => [Number(entry.index), entry])); sync();
     }).finally(() => { request = null; });
     return request;
   }

@@ -22,12 +22,15 @@ vm.runInNewContext(fs.readFileSync('static/render-listening.js','utf8'),context)
  const listening=context.window.renderListening,player=Audio.instance;
  await listening.poll('/source');assert.equal(cards[0].button,undefined);assert.equal(folder.disabled,true);
  data.items=[{index:0,url:'/audio/rendered/0/first',version:1}];await listening.poll('/source');
+ context.appState.jobs=[{id:'batch',kind:'render',status:'running',songs:[1,2]}];
+ data.items[0].job_id='previous';await listening.poll('/source');assert.equal(cards[0].button,null);
+ data.items[0].job_id='batch';await listening.poll('/source');
  const first=cards[0].button;assert.equal(first['aria-label'],'Play rendered song 0');await first.onclick();
  assert.equal(first['aria-label'],'Pause rendered song 0');player.currentTime=11;
- data.items.push({index:2,url:'/audio/rendered/2/second',version:1});await listening.poll('/source');
+ data.items.push({index:2,url:'/audio/rendered/2/second',version:1,job_id:'batch'});await listening.poll('/source');
  assert.equal(cards[0].button,first);assert.equal(player.currentTime,11);assert.equal(player.paused,false);
  await first.onclick();assert.equal(player.paused,true);await first.onclick();assert.equal(player.currentTime,11);
- data.items[0]={index:0,url:'/audio/rendered/0/new-version',version:2};await listening.poll('/source');assert.equal(player.src,'/audio/rendered/0/first');
+ data.items[0]={index:0,url:'/audio/rendered/0/new-version',version:2,job_id:'batch'};await listening.poll('/source');assert.equal(player.src,'/audio/rendered/0/first');
  await first.onclick();await first.onclick();assert.equal(player.src,'/audio/rendered/0/new-version');assert.equal(player.currentTime,0);
  await cards[1].button.onclick();assert.equal(player.src,'/audio/rendered/2/second');assert.equal(player.currentTime,0);assert.equal(first['aria-label'],'Play rendered song 0');
  data.items=[];await listening.poll('/source');assert.equal(cards[1].button['aria-label'],'Pause rendered song 2');await cards[1].button.onclick();assert.equal(player.paused,true);

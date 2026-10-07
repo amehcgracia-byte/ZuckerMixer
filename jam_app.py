@@ -5100,6 +5100,7 @@ def registered_render_previews() -> list[dict]:
                 index = int(number)
                 items.append({"index": index, "key": render_preview_key(entry),
                               "version": entry.get("version"), "created": entry.get("created", ""),
+                              "job_id": entry.get("job_id"),
                               "url": f"/audio/rendered/{index}/{render_preview_key(entry)}"})
                 break
             except (OSError, KeyError, TypeError, ValueError):
