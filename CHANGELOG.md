@@ -1,3 +1,10 @@
+## 2.8.3
+
+- Show a numbered play/pause button in each song card as soon as a completed export is registered, while other songs continue rendering.
+- Stream the exported MP3 without rebuilding cards, seeking controls or automatic next-song playback; preserve playback as further outputs arrive.
+- Pin listening to the selected render, prevent overlapping preview audio and clear playback when projects change.
+- Keep batch progress visible without covering the song list, and add a platform-specific button to open the completed renders folder.
+
 ## 2.8.2
 
 - Check public GitHub releases at desktop startup without blocking project loading. Ask before downloading and installing updates.

@@ -5080,6 +5080,83 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
     return response
 
 
+def render_preview_key(entry: dict) -> str:
+    return hashlib.sha256(str(entry.get("path", "")).encode()).hexdigest()[:24]
+
+
+def registered_render_previews() -> list[dict]:
+    history = load_json(HISTORY_PATH, {})
+    items = []
+    if not isinstance(history, dict):
+        return items
+    for number, entries in history.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in reversed(entries):
+            try:
+                path = Path(entry["path"])
+                if not path.is_file() or path.stat().st_size == 0:
+                    continue
+                index = int(number)
+                items.append({"index": index, "key": render_preview_key(entry),
+                              "version": entry.get("version"), "created": entry.get("created", ""),
+                              "url": f"/audio/rendered/{index}/{render_preview_key(entry)}"})
+                break
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+    return items
+
+
+@app.get("/api/render-previews")
+@source_edit_locked
+def api_render_previews() -> Response:
+    # Read only promoted render registrations, never trigger analysis or scan WAVs.
+    return jsonify({"source_folder": str(pipeline.SOURCE_DIR), "platform": sys.platform, "items": registered_render_previews()})
+
+
+@app.get("/audio/rendered/<int:song_index>/<render_key>")
+@source_edit_locked
+def rendered_audio(song_index: int, render_key: str) -> Response:
+    entries = load_json(HISTORY_PATH, {}).get(str(song_index), [])
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and render_preview_key(entry) == render_key:
+            path = Path(str(entry.get("path", "")))
+            if path.is_file() and path.stat().st_size:
+                return ranged_file_response(path, mimetype="audio/mpeg")
+    return Response(status=404)
+
+
+@app.post("/api/open-render-folder")
+@source_edit_locked
+def api_open_render_folder() -> Response:
+    history = load_json(HISTORY_PATH, {})
+    entries = [entry for versions in (history.values() if isinstance(history, dict) else []) if isinstance(versions, list)
+               for entry in versions if isinstance(entry, dict) and entry.get("path")]
+    entries.sort(key=lambda entry: str(entry.get("created", "")), reverse=True)
+    folder = None
+    for entry in entries:
+        try:
+            path = Path(entry['path'])
+            if path.is_file() and path.stat().st_size > 0:
+                folder = path.parent
+                break
+        except (OSError, TypeError, ValueError):
+            continue
+    if folder is None:
+        return jsonify({"error": "No completed renders yet"}), 404
+    open_render_location(folder)
+    return jsonify({"ok": True})
+
+
+def open_render_location(path: Path) -> None:
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)] if path.is_file() else ["open", str(path)])
+    elif sys.platform == "win32":
+        os.startfile(str(path.parent if path.is_file() else path))
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent if path.is_file() else path)])
+
+
 @app.get("/audio/<int:song_index>/<int:slot>")
 def audio(song_index: int, slot: int) -> Response:
     selected = history_entry(song_index, slot)
@@ -5104,7 +5181,7 @@ def api_open(song_index: int) -> Response:
     path = Path(selected["path"]) if selected else out_dir()
     import subprocess
 
-    subprocess.Popen(["open", "-R", str(path)])
+    open_render_location(path)
     return jsonify({"ok": True})
 
 

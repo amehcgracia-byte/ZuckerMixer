@@ -768,7 +768,8 @@ function isEditingText() {
 
 function hasProtectedPlaybackOrPanel() {
   return Boolean(
-    document.querySelector(".fine-tune[open]")
+    window.renderListening?.isPlaying()
+    || document.querySelector(".fine-tune[open]")
     || [...document.querySelectorAll("audio")].some((audio) => !audio.paused && !audio.ended)
   );
 }
@@ -972,6 +973,7 @@ function renderSongs() {
     wireFineTune(card, song.id);
   });
   updateSelectedButton();
+  window.renderListening?.sync();
 }
 
 let cutSelector = null;
@@ -1007,6 +1009,7 @@ function ensureCutSelector() {
 }
 
 async function openCutSelector(songId) {
+  window.renderListening?.pause();
   const ui = ensureCutSelector();
   suppressLoadingOverlay = false;
   setCutLoading("Opening Edit Cuts", "Reading saved cuts", null);
@@ -1301,7 +1304,7 @@ function wireCutSelector(ui) {
   });
   waveform.addEventListener("click", (event) => { if (event.target.closest("#cutMarkers, .cut-selection")) return; waveformClick(event); });
   ui.speed.addEventListener("change", () => { if (ui.audio) ui.audio.playbackRate = Number(ui.speed.value); });
-  ui.dialog.querySelector("#cutPlay").addEventListener("click", () => { if (!ui.audio) return; movePlayheadTo(ui, ui.playhead ?? ui.startValue); ui.audio.play().catch((error) => setCutLoading("Playback error", error.message, 100)); });
+  ui.dialog.querySelector("#cutPlay").addEventListener("click", () => { if (!ui.audio) return; movePlayheadTo(ui, ui.playhead ?? ui.startValue); (window.renderListening?.pause(), ui.audio.play()).catch((error) => setCutLoading("Playback error", error.message, 100)); });
   ui.dialog.querySelector("#cutPause").addEventListener("click", () => ui.audio?.pause());
   ui.dialog.querySelector("#cutStop").addEventListener("click", () => { if (ui.audio) { ui.audio.pause(); ui.audio.currentTime = 0; } });
   ui.dialog.querySelector("#cutBack5").addEventListener("click", () => { if (ui.audio) ui.audio.currentTime = Math.max(0, ui.audio.currentTime - 5); });
@@ -2872,6 +2875,7 @@ function currentPreviewOffset(mix) {
 }
 
 async function toggleFullStemPreview(root, songIndex) {
+  window.renderListening?.pause();
   const mix = await loadFullStemPreview(root, songIndex);
   if (!mix || !mix.buffers.length) return;
   if (mix.ctx.state === "suspended") await mix.ctx.resume();
@@ -3061,11 +3065,13 @@ async function refreshState(options = {}) {
     await Promise.all(Object.keys(previewMixes).map(id => stopPreviewMix(id)));
     document.querySelectorAll(".fine-tune[open]").forEach(panel => panel.open = false);
     document.querySelectorAll("audio").forEach(audio => audio.pause());
+    window.renderListening?.reset();
     checkedSongs.clear(); Object.keys(livePreviewOverrides).forEach(key => delete livePreviewOverrides[key]); pendingOverrideSongs.clear(); songListSignature = ""; transitionSignature = "";
     if (cutSelector?.dialog.open) { cutSelector.audio?.pause(); cutSelector.dialog.close(); }
     if (cutSelector) { cutSelector.clipboard = null; cutSelector.data = null; }
   }
   appState = next;
+  window.renderListening?.sync();
   refreshSlotSummary();
     renderBuildInfo();
     renderSlotAudit();
@@ -3603,7 +3609,8 @@ function renderLoadingOverlay() {
   // Whisper/render job must not cover or block waveform editing.
   const cutEditorOpen = Boolean(document.querySelector("#cutSelectorDialog[open]"));
   const state = cutEditorOpen ? loadingOverlayCut : (loadingOverlayCut || loadingOverlayJob);
-  const busy = Boolean(state) && !suppressLoadingOverlay;
+  const backgroundRender = ["render", "mix"].includes(String(state?.kind || "").toLowerCase());
+  const busy = Boolean(state) && !suppressLoadingOverlay && !backgroundRender;
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
   const video = $("#loadingStageVideo");
@@ -4049,6 +4056,7 @@ async function pollJobsOnce() {
   }
   appState.jobs = jobs;
   renderJobs(jobs);
+  window.renderListening?.poll(appState.source_folder).catch(error => console.warn("[render previews]", error));
   Object.entries(realPreviewJobs).forEach(([songId, jobId]) => {
     const job = jobs.find((item) => item.id === jobId);
     if (!job) return;

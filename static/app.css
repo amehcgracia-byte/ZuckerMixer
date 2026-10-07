@@ -1048,3 +1048,7 @@ dialog { position: fixed; padding-top: 42px; }
 .update-dialog button { margin: 8px 8px 0 0; }
 #checkUpdate { font-size: 11px; padding: 4px 8px; margin-right: 8px; }
 #updateNotice { margin-right: 8px; overflow-wrap: anywhere; }
+
+.render-listen-button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; flex-shrink: 0; color: var(--cream); }
+.render-listen-button svg { width: 14px; height: 14px; fill: currentColor; }
+.render-listen-button[aria-pressed="true"] { color: #9bd7a5; border-color: #9bd7a5; }
