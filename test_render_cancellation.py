@@ -49,3 +49,27 @@ def test_native_close_check_never_waits_for_status_lock(monkeypatch):
         def __exit__(self,*args):pass
     monkeypatch.setattr(a,'state_lock',ForbiddenLock())
     assert a.has_active_jobs()
+
+
+@pytest.mark.skipif(sys.platform=='win32',reason='POSIX inherited helper group')
+def test_cancel_stops_helper_even_after_worker_leader_exits(monkeypatch):
+    helper='import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print("helper-ready",flush=True); time.sleep(60)'
+    leader='import subprocess,sys,time; subprocess.Popen([sys.executable,"-u","-c",'+repr(helper)+']); time.sleep(60)'
+    proc=subprocess.Popen([sys.executable,'-u','-c',leader],stdout=subprocess.PIPE,text=True,start_new_session=True)
+    assert proc.stdout.readline().strip()=='helper-ready'
+    monkeypatch.setattr(a,'child_processes',{'helper-test':proc})
+    monkeypatch.setattr(a,'jobs',[])
+    monkeypatch.setattr(a,'cancel_requested',False)
+    monkeypatch.setattr(a,'lifecycle_log',lambda *args,**kwargs:None)
+    monkeypatch.setattr(a,'append_log',lambda *args:None)
+    eof=threading.Event()
+    reader=threading.Thread(target=lambda:(proc.stdout.read(),eof.set()),daemon=True)
+    reader.start()
+    try:
+        a.request_cancel()
+        assert proc.wait(timeout=1)==-15
+        assert eof.wait(4),'helper retained the worker stdout after its leader exited'
+    finally:
+        try:a.signal_owned_process_group(proc,force=True)
+        except ProcessLookupError:pass
+        reader.join(timeout=1);proc.stdout.close()

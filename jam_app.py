@@ -1748,7 +1748,8 @@ def request_cancel() -> None:
                 pass
 
         def escalate(target: subprocess.Popen[str] = proc, target_job_id: str = job_id) -> None:
-            if target.poll() is None:
+            # The group may still contain ffmpeg/helpers after its leader exits.
+            if os.name != "nt" or target.poll() is None:
                 try:
                     signal_owned_process_group(target, force=True)
                     lifecycle_log("child_group_sigkill", target_job_id, child_pid=target.pid)
