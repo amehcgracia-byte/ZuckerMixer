@@ -34,7 +34,9 @@
     const token = ++generation;
     document.querySelectorAll('audio').forEach(audio => audio.pause());
     if (typeof previewMixes !== 'undefined' && typeof stopPreviewMix === 'function') {
-      await Promise.all(Object.keys(previewMixes).map(id => stopPreviewMix(id)));
+      // Sources stop synchronously; do not wait for context disposal before
+      // play(), so the media request stays inside the user click.
+      Promise.all(Object.keys(previewMixes).map(id => stopPreviewMix(id))).catch(() => {});
     }
     if (token !== generation) return;
     if (!selected || selected.index !== index || player.ended || selected.url !== entry.url) {

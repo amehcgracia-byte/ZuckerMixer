@@ -25,6 +25,7 @@ vm.runInNewContext(fs.readFileSync('static/render-listening.js','utf8'),context)
  context.appState.jobs=[{id:'batch',kind:'render',status:'running',songs:[1,2]}];
  data.items[0].job_id='previous';await listening.poll('/source');assert.equal(cards[0].button,null);
  data.items[0].job_id='batch';await listening.poll('/source');
+ context.previewMixes={1:{}};context.stopPreviewMix=()=>new Promise(()=>{});
  const first=cards[0].button;assert.equal(first['aria-label'],'Play rendered song 0');await first.onclick();
  assert.equal(first['aria-label'],'Pause rendered song 0');player.currentTime=11;
  data.items.push({index:2,url:'/audio/rendered/2/second',version:1,job_id:'batch'});await listening.poll('/source');
