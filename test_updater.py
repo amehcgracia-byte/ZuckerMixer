@@ -127,3 +127,11 @@ def test_restart_is_independent_of_helper_process(tmp_path,monkeypatch):
     h.launch(folder,tmp_path/'receipt.json')
     assert calls[0][1]['start_new_session']==(h.os.name!='nt')
     assert calls[0][0][1]=='--update-receipt'
+
+
+def test_mac_bundle_copy_preserves_signed_resource_metadata(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(u.subprocess, 'run', lambda command, **kwargs: calls.append((command, kwargs)))
+    u.copy_app_bundle(tmp_path/'source.app', tmp_path/'stage.app', 'darwin')
+    assert calls[0][0] == ['ditto', '--rsrc', '--extattr', str(tmp_path/'source.app'), str(tmp_path/'stage.app')]
+    assert calls[0][1]['check'] is True

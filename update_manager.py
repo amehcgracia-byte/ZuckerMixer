@@ -81,6 +81,15 @@ def extract_windows(package, destination):
     return destination/'ZuckerMixer'
 
 
+def copy_app_bundle(source: Path, destination: Path, platform: str) -> None:
+    # macOS stores signatures for non-Mach-O resources in extended attributes.
+    # copytree drops those attributes; ditto preserves signed bundle metadata.
+    if platform == 'darwin':
+        subprocess.run(['ditto', '--rsrc', '--extattr', str(source), str(destination)], check=True, capture_output=True)
+    else:
+        shutil.copytree(source, destination, symlinks=True)
+
+
 def validate_app(folder, version, platform):
     if platform == 'darwin':
         subprocess.run(['codesign', '--verify', '--deep', '--strict', str(folder)], check=True, capture_output=True)
@@ -192,9 +201,9 @@ class Updater:
             validate_app(source, version, self.platform)
             token = uuid.uuid4().hex
             stage = target.with_name(f'.{target.stem}-update-{token}{target.suffix}')
-            shutil.copytree(source, stage, symlinks=True)
+            copy_app_bundle(source, stage, self.platform)
             helper = work/target.name
-            shutil.copytree(target, helper, symlinks=True)
+            copy_app_bundle(target, helper, self.platform)
             from update_helper import executable
             receipt = work/'startup.json'
             manifest = {'target': str(target), 'stage': str(stage),

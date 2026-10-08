@@ -1485,6 +1485,18 @@ async function loadActiveStemFaders(root, songIndex) {
   }
 }
 
+function automaticFaderLevel(params) {
+  return Number(params?.makeup_gain_db ?? params?.automatic_fader_db ?? params?.computed_gain_db ?? 0);
+}
+
+function displayedFaderLevel(params, userTrimDb) {
+  return automaticFaderLevel(params) + Number(userTrimDb || 0);
+}
+
+function userTrimFromFader(params, displayedDb) {
+  return Number(displayedDb) - automaticFaderLevel(params);
+}
+
 function renderFaders(root, songIndex) {
   const faders = root.querySelector(`[data-faders="${songIndex}"]`);
   faders.innerHTML = "";
@@ -1519,10 +1531,11 @@ function renderFaders(root, songIndex) {
       ov.eq_air_gain_db ??= Number(params.eq_air_gain_db);
     }
     const gainDb = stemGainDb(songIndex, stem);
-    const fader = ov.user_confirmed
+    const userFader = ov.user_confirmed
       ? Number(ov.fader_db || 0)
       : Number(params?.user_fader_db ?? 0);
-    const automaticFaderDb = Number(params?.automatic_fader_db ?? params?.computed_gain_db ?? 0);
+    const automaticFaderDb = automaticFaderLevel(params);
+    const fader = displayedFaderLevel(params, userFader);
     if (!Number.isFinite(Number(ov.pan))) ov.pan = defaultPan(stem);
     const pan = Number(ov.pan);
     ov.fx_enabled ??= params?.fx_enabled ?? true;
@@ -1543,8 +1556,8 @@ function renderFaders(root, songIndex) {
       <strong class="stem-label">${esc(linkedLabel)}</strong>
       <div class="kind">${stem.role === "vocal" ? "voice" : "instrument"}</div>
       <label class="gain-control">Gain <input data-gain type="range" min="-20" max="20" step="0.5" value="${gainDb}"><span>${signedDb(gainDb)}</span></label>
-      <input data-fader type="range" min="-60" max="12" step="0.5" value="${fader}">
-      <div class="amount">Trim ${amount(fader)} · auto ${signedDb(automaticFaderDb)}</div>
+      <input data-fader type="range" min="${Math.min(-60, automaticFaderDb - 60)}" max="${Math.max(12, automaticFaderDb + 12)}" step="0.5" value="${fader}">
+      <div class="amount">Level ${signedDb(fader)} · auto ${signedDb(automaticFaderDb)}</div>
       <button type="button" class="fx-toggle ${fxEnabled ? "active" : ""}" data-fx-toggle>${fxEnabled ? "FX ON" : "FX OFF"}</button>
       <div class="stem-effects" aria-label="Per-stem effects">
         ${[["gate_enabled", "Gate"], ["space_enabled", "Space"], ["echo_enabled", "Echo"]].map(([key, label]) => `<button type="button" class="effect-dot ${ov[key] === true ? "active" : ""}" data-effect="${key}" title="Toggle ${label}"><span></span>${label}</button>`).join("")}
@@ -1598,11 +1611,11 @@ function renderFaders(root, songIndex) {
         feedsNodeId: previewNodeId(liveNode?.__feedsNode),
         currentAudioParamValue: liveNode?.gain ? liveNode.gain.value : null,
       });
-      const liveFaderDb = Number(slider.value);
+      const liveFaderDb = userTrimFromFader(params, slider.value);
       ov.fader_db = liveFaderDb;
       setLinkedOverride(songIndex, linked, "fader_db", liveFaderDb);
       linked.forEach((item) => { stemOverrides(songIndex, item.file).user_confirmed = true; });
-      label.textContent = `Trim ${amount(ov.fader_db)} · auto ${signedDb(automaticFaderDb)}`;
+      label.textContent = `Level ${signedDb(Number(slider.value))} · auto ${signedDb(automaticFaderDb)}`;
       applyLiveFaderGain(songIndex, stem, liveFaderDb, "fader:direct-input");
       linked.forEach((item) => updatePreviewGains(songIndex, item.file, "fader", { faderDb: liveFaderDb }));
       persistPreviewChange(songIndex, `fader:${stem.file}`);
@@ -2689,6 +2702,9 @@ async function loadFullStemPreview(root, songIndex) {
     if (previewStems.some((stem) => stem.role === "vocal")) {
       await ctx.audioWorklet.addModule("/static/vocal-expander.js");
     }
+    let loadedTracks = 0;
+    const totalTracks = previewStems.length;
+    if (status) status.textContent = `Preparing preview · 0/${totalTracks} tracks`;
     decoded = await Promise.all(previewStems.map(async (stem) => {
       const res = await fetch(`/stem-full/${songIndex}/${stem.index}`);
       if (!res.ok || res.status === 204) return null;
@@ -2696,6 +2712,10 @@ async function loadFullStemPreview(root, songIndex) {
       const arrayBuffer = await res.arrayBuffer();
       const buffer = await ctx.decodeAudioData(arrayBuffer);
       restorePreviewSourceLevel(buffer, res.headers.get("X-Preview-Source-Gain-Db"));
+      loadedTracks += 1;
+      if (status && previewMixFor(songIndex) === mix && !mix.closed) {
+        status.textContent = `Preparing preview · ${loadedTracks}/${totalTracks} tracks`;
+      }
       return { stem, buffer, bytes: bytes || arrayBuffer.byteLength };
     }));
   } catch (_err) {

@@ -25,6 +25,7 @@ import webbrowser
 import signal
 import struct
 from functools import wraps
+from collections import OrderedDict
 from dsp_imports import signal as audio_signal
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -552,6 +553,7 @@ def persisted_fader_values(stem_ov: dict[str, Any]) -> tuple[float, float, bool]
 
 
 analysis_snapshot_lock = threading.RLock()
+analysis_snapshot_memory = OrderedDict()
 
 
 def song_analysis_snapshot(state: dict, segment: pipeline.Segment, segment_id: int) -> dict:
@@ -559,11 +561,19 @@ def song_analysis_snapshot(state: dict, segment: pipeline.Segment, segment_id: i
     path = ACTIVE_SOURCE_STATE_ROOT / f"song_analysis_{segment_id}_{signature}.npz"
     with analysis_snapshot_lock:
         if path.is_file():
+            metadata = path.stat()
+            memory_key = (str(path), metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+            if memory_key in analysis_snapshot_memory:
+                analysis_snapshot_memory.move_to_end(memory_key)
+                return analysis_snapshot_memory[memory_key]
             try:
                 cached = pipeline.load_analysis_cache(path)
             except Exception:
                 cached = None
             if isinstance(cached, dict) and cached.get("input_signature") == signature:
+                analysis_snapshot_memory[memory_key] = cached
+                while len(analysis_snapshot_memory) > 4:
+                    analysis_snapshot_memory.popitem(last=False)
                 return cached
         sr = state["stems"][0].samplerate
         chunks = max(1, math.ceil(segment.duration / pipeline.RENDER_CHUNK_SECONDS))
@@ -5085,46 +5095,30 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
     path = PREVIEW_DIR / f"song_{segment_id:03d}_full_v4_stem_{stem_index:02d}_{start_ms}_{end_ms}_{encoding_gain_db:.2f}_{safe_stem}.mp3"
     if not path.exists():
         chunk_frames = int(round(30.0 * sr))
-        with tempfile.TemporaryDirectory(prefix=f"zucker_preview_{segment_id:03d}_{stem_index:02d}_") as tmp:
-            wav_path = Path(tmp) / "stem.wav"
-            noise_info = analysis.get("noise_diagnostics", {}).get(stem.path.name, {})
-            noise_state = {}
-            with sf.SoundFile(str(wav_path), "w", samplerate=sr, channels=channels, subtype="FLOAT") as writer:
-                for chunk_start in range(0, target_frames, chunk_frames):
-                    nframes = min(chunk_frames, target_frames - chunk_start)
-                    chunk = pipeline.read_stem_chunk(stem, segment, chunk_start, nframes)
-                    if chunk is None:
-                        chunk = np.zeros((nframes, channels), dtype=np.float32) if channels > 1 else np.zeros(nframes, dtype=np.float32)
-                    if channels == 1 and chunk.ndim == 2:
-                        chunk = np.mean(chunk, axis=1).astype(np.float32)
-                    elif channels == 2 and chunk.ndim == 1:
-                        chunk = np.column_stack((chunk, chunk)).astype(np.float32)
-                    if noise_info.get("case") in {"A", "hum"}:
-                        if chunk.ndim == 2:
-                            chunk = np.column_stack([
-                                pipeline.apply_noise_watchdog_streaming(chunk[:, channel], sr, noise_info,
-                                    noise_state, f"preview:{stem.path.name}:{channel}")[0]
-                                for channel in range(chunk.shape[1])])
-                        else:
-                            chunk, _ = pipeline.apply_noise_watchdog_streaming(
-                                chunk, sr, noise_info, noise_state, f"preview:{stem.path.name}")
-                    writer.write(np.clip(np.nan_to_num(chunk[:nframes]) * encoding_gain, -1.0, 1.0))
-            cmd = [
-                ffmpeg,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(wav_path),
-                "-vn",
-                "-codec:a",
-                "libmp3lame",
-                "-b:a",
-                bitrate,
-                str(path),
-            ]
-            subprocess.run(cmd, check=True)
+        noise_info = analysis.get("noise_diagnostics", {}).get(stem.path.name, {})
+        noise_state = {}
+        def chunks():
+            for chunk_start in range(0, target_frames, chunk_frames):
+                nframes = min(chunk_frames, target_frames - chunk_start)
+                chunk = pipeline.read_stem_chunk(stem, segment, chunk_start, nframes)
+                if chunk is None:
+                    chunk = np.zeros((nframes, channels), dtype=np.float32) if channels > 1 else np.zeros(nframes, dtype=np.float32)
+                if channels == 1 and chunk.ndim == 2:
+                    chunk = np.mean(chunk, axis=1).astype(np.float32)
+                elif channels == 2 and chunk.ndim == 1:
+                    chunk = np.column_stack((chunk, chunk)).astype(np.float32)
+                if noise_info.get("case") in {"A", "hum"}:
+                    if chunk.ndim == 2:
+                        chunk = np.column_stack([
+                            pipeline.apply_noise_watchdog_streaming(chunk[:, channel], sr, noise_info,
+                                noise_state, f"preview:{stem.path.name}:{channel}")[0]
+                            for channel in range(chunk.shape[1])])
+                    else:
+                        chunk, _ = pipeline.apply_noise_watchdog_streaming(
+                            chunk, sr, noise_info, noise_state, f"preview:{stem.path.name}")
+                yield np.clip(np.nan_to_num(chunk[:nframes]) * encoding_gain, -1.0, 1.0)
+        from preview_encoding import encode_float_chunks
+        encode_float_chunks(ffmpeg, chunks(), sr, channels, bitrate, path)
     response = ranged_file_response(path, mimetype="audio/mpeg")
     response.headers["X-Preview-Cache-Bytes"] = str(path.stat().st_size)
     response.headers["X-Preview-Source-Gain-Db"] = str(encoding_gain_db)

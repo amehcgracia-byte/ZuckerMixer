@@ -1,3 +1,11 @@
+## 2.8.7
+
+- Fine Tune faders show each prepared song’s automatic level plus saved edits. Moving one fader stores only the change relative to its automatic level, preserving the other tracks and avoiding double gain.
+- Feed full-song preview chunks directly to FFmpeg, avoiding a full temporary WAV write and reread; retain identical noise treatment, source level and MP3 sample timing.
+- Reuse up to four file-versioned song analysis snapshots in memory while preparing preview tracks. Changed source/config/cuts or rewritten analysis invalidate reuse.
+- Show completed-track progress while preparing the preview.
+- Preserve macOS signed resource attributes when staging automatic updates.
+
 ## 2.8.6
 
 - Keep application startup available when the external project disk is disconnected; saved project data remains on its original disk.

@@ -26,7 +26,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements_app.txt -r requirements_whisper.txt pytest
       - run: python -m pytest -q
-      - run: node test_state_loading.js && node test_render_messages.js && node test_split_time.js && node test_preview_source_gain.js && node test_vocal_expander.js && node test_preview_normalization.js && node test_preview_gate.js && node test_updater.js && node test_render_listening.js && node test_loading_overlay_dismiss.js && node test_cancel_ui.js
+      - run: node test_state_loading.js && node test_render_messages.js && node test_split_time.js && node test_preview_source_gain.js && node test_fader_auto_level.js && node test_vocal_expander.js && node test_preview_normalization.js && node test_preview_gate.js && node test_updater.js && node test_render_listening.js && node test_loading_overlay_dismiss.js && node test_cancel_ui.js
   build-dmg:
     needs: test-suite
     runs-on: macos-15-intel
