@@ -1024,9 +1024,10 @@ def save_skipped_segments(values: Any) -> None:
 
 def save_settings(settings: dict[str, Any]) -> None:
     if settings.get("source_folder") == str(pipeline.SOURCE_DIR) and settings.get("last_render_dir"):
-        config = load_source_config()
+        project_settings_path = ACTIVE_SOURCE_STATE_ROOT / "project_settings.json"
+        config = load_json(project_settings_path, {})
         config["last_render_dir"] = str(settings["last_render_dir"])
-        save_source_config(config)
+        save_json(project_settings_path, config)
     save_json(SETTINGS_PATH, settings)
 
 
@@ -4376,7 +4377,7 @@ def api_settings() -> Response:
         configure_source_folder(source)
         last_load_error = ""
         if settings.get("source_folder") != str(source):
-            settings["last_render_dir"] = str(load_source_config().get("last_render_dir") or out_dir())
+            settings["last_render_dir"] = str(load_json(ACTIVE_SOURCE_STATE_ROOT / "project_settings.json", {}).get("last_render_dir") or out_dir())
         settings["source_folder"] = str(source)
         with state_lock:
             pipeline_state = None

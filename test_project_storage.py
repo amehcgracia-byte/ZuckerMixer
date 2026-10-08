@@ -56,15 +56,19 @@ def test_application_import_with_disconnected_project_disk(tmp_path):
 
 
 def test_render_destination_is_saved_for_current_project_only(tmp_path, monkeypatch):
+    import json
     import jam_app as app
     settings_file = tmp_path/'settings.json'
     source = tmp_path/'sound';source.mkdir()
+    project = tmp_path/'project';project.mkdir()
     monkeypatch.setattr(app.pipeline, 'SOURCE_DIR', source)
     monkeypatch.setattr(app, 'SETTINGS_PATH', settings_file)
+    monkeypatch.setattr(app, 'ACTIVE_SOURCE_STATE_ROOT', project)
+    # Destination changes must not touch the DSP configuration/signature.
     saved = []
-    monkeypatch.setattr(app, 'load_source_config', lambda: {'expected_song_count':22})
     monkeypatch.setattr(app, 'save_source_config', saved.append)
     app.save_settings({'source_folder':str(source),'last_render_dir':'/selected/renders'})
-    assert saved == [{'expected_song_count':22,'last_render_dir':'/selected/renders'}]
+    assert json.loads((project/'project_settings.json').read_text())['last_render_dir'] == '/selected/renders'
     app.save_settings({'source_folder':'/other/source','last_render_dir':'/other/renders'})
-    assert len(saved) == 1
+    assert json.loads((project/'project_settings.json').read_text())['last_render_dir'] == '/selected/renders'
+    assert saved == []
