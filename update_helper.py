@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import subprocess
+import shutil
 import sys
 import time
 
@@ -63,7 +64,16 @@ def apply_update(manifest, *, wait=wait_for_parent, start=launch, receipt_timeou
                 data = json.loads(receipt.read_text())
                 if data.get('version') != manifest['version']:
                     raise RuntimeError('Updated application reported the wrong version')
-                return {'status': 'installed', 'version': manifest['version'], 'backup': str(backup)}
+                # Keep rollback only until the replacement confirms startup.
+                # Cleanup failure must not undo an already running update.
+                try:
+                    shutil.rmtree(backup)
+                    cleanup_error = None
+                except OSError as exc:
+                    cleanup_error = str(exc)
+                return {'status': 'installed', 'version': manifest['version'],
+                        'backup': str(backup) if backup.exists() else None,
+                        'cleanup_error': cleanup_error}
             if process.poll() is not None:
                 raise RuntimeError('Updated application could not start')
             time.sleep(.5)

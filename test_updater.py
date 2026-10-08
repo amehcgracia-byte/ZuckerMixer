@@ -76,7 +76,8 @@ def test_swap_waits_and_receipt_confirms_startup(tmp_path):
         receipt.write_text(json.dumps({'version':'2.8.3'}));return Process()
     result=h.apply_update(m,wait=wait,start=start)
     assert result['status']=='installed' and events==[123]
-    assert Path(m['backup']).joinpath('ZuckerMixer.exe').read_text()=='old'
+    assert not Path(m['backup']).exists()
+    assert result['backup'] is None
 
 @pytest.mark.parametrize('failure',['exit','timeout','wrong_version'])
 def test_rollback_and_relaunch_old_app(tmp_path,failure):

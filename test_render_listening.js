@@ -34,7 +34,7 @@ vm.runInNewContext(fs.readFileSync('static/render-listening.js','utf8'),context)
  data.items[0]={index:0,url:'/audio/rendered/0/new-version',version:2,job_id:'batch'};await listening.poll('/source');assert.equal(player.src,'/audio/rendered/0/first');
  await first.onclick();await first.onclick();assert.equal(player.src,'/audio/rendered/0/new-version');assert.equal(player.currentTime,0);
  await cards[1].button.onclick();assert.equal(player.src,'/audio/rendered/2/second');assert.equal(player.currentTime,0);assert.equal(first['aria-label'],'Play rendered song 0');
- data.items=[];await listening.poll('/source');assert.equal(cards[1].button['aria-label'],'Pause rendered song 2');await cards[1].button.onclick();assert.equal(player.paused,true);
+ data.items=[];await listening.poll('/source');assert.equal(cards[1].button['aria-label'],'Pause rendered song 2');let propagationStopped=false;await cards[1].button.onclick({stopPropagation(){propagationStopped=true;}});assert.equal(propagationStopped,true);assert.equal(player.paused,true);
  player.ended=true;player.events.ended();assert.equal(cards[1].button,null);
  context.appState.source_folder='/another';data={source_folder:'/another',items:[]};await listening.poll('/another');assert.equal(player.paused,true);assert.equal(folder.disabled,true);
  assert.equal(messages.length,0);

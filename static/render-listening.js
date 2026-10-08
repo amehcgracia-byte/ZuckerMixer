@@ -13,7 +13,11 @@
       if (!entry) { button?.remove(); return; }
       if (!button) {
         button = document.createElement('button'); button.type = 'button'; button.className = 'render-listen-button';
-        button.onclick = () => toggle(index).catch(error => { pending = false; selected = null; sync(); showToast(`Could not play render: ${error.message || error}`); });
+        button.onclick = event => {
+          // sync() can remove this button before the click bubbles.
+          event?.stopPropagation();
+          return toggle(index).catch(error => { pending = false; selected = null; sync(); showToast(`Could not play render: ${error.message || error}`); });
+        };
         card.querySelector('.loading-song-label')?.prepend(button);
       }
       const active = selected?.index === index && playing();

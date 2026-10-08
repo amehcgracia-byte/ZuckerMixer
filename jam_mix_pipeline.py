@@ -34,9 +34,9 @@ from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
-import pyloudnorm as pyln
+from dsp_imports import pyloudnorm as pyln
 import soundfile as sf
-from scipy import ndimage, signal
+from dsp_imports import ndimage, signal
 matchering_api = None
 MATCHERING_IMPORT_ERROR = ""
 _MATCHERING_IMPORT_ATTEMPTED = False

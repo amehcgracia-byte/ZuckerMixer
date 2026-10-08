@@ -1,5 +1,10 @@
 ## 2.8.5
 
+- Los controles de preescucha no cierran el vídeo de carga; al ocultarlo se pausa el audio.
+- Los datos de cada proyecto se migran con verificación a ZuckerMixer junto a las sesiones; renders nuevos usan su carpeta de proyecto como destino inicial.
+- El trabajador se detiene si desaparece la aplicación, incluso con escritura del estado bloqueada.
+- Las bibliotecas DSP se cargan al usarse; el actualizador elimina el respaldo antiguo tras confirmar el arranque correcto.
+
 - Reuse one independent FFmpeg loudness/true-peak measurement per exact file revision instead of rescanning unchanged exports. Invalidate on trims, rewrites and file replacements.
 - Reduce diagnostic-meter allocations while preserving float64 RMS accumulation and exact peaks.
 - Synthetic 60-second check: duplicate measurement 4.61s → 2.08s with identical loudness/peak; diagnostic meter 0.089s → 0.068s. Whole-batch speedup depends on DSP, mastering and concurrent disk/CPU use.

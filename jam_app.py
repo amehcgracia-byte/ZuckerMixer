@@ -25,7 +25,7 @@ import webbrowser
 import signal
 import struct
 from functools import wraps
-from scipy import signal as audio_signal
+from dsp_imports import signal as audio_signal
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -940,6 +940,9 @@ def override_write_trace(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def out_dir() -> Path:
+    if pipeline.SOURCE_DIR.is_dir():
+        from project_storage import project_directory
+        return project_directory(pipeline.SOURCE_DIR) / "renders"
     return pipeline.OUTPUT_ROOT / pipeline.SESSION_DATE
 
 
@@ -1095,10 +1098,16 @@ def configure_source_folder(source_folder: str | Path) -> Path:
         "status": "Scanning folder",
         "error": "",
     }
-    pipeline.configure_detection_cache(source, STATE_ROOT)
     source_key = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:20]
-    ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "sources" / source_key
-    ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    legacy_state = STATE_ROOT / "sources" / source_key
+    if source.is_dir():
+        from project_storage import migrate_source_state
+        ACTIVE_SOURCE_STATE_ROOT = migrate_source_state(source, legacy_state)
+        (ACTIVE_SOURCE_STATE_ROOT.parent / "renders").mkdir(exist_ok=True)
+    else:
+        ACTIVE_SOURCE_STATE_ROOT = legacy_state
+        ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    pipeline.configure_detection_cache(source, ACTIVE_SOURCE_STATE_ROOT / "cache")
     OVERRIDES_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_overrides.json"
     HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
     MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"
@@ -3147,6 +3156,15 @@ def app_progress(payload: dict[str, Any]) -> None:
 
 def run_child_job(job_path: Path) -> int:
     payload = load_json(job_path, {})
+    from worker_lifecycle import start_parent_watch
+    def parent_exited():
+        status_path = Path(str(payload.get("status_path") or job_status_path(str(payload.get("id", "child")))))
+        latest = load_json(status_path, payload)
+        latest.update(status="cancelled", current=None, error=None,
+                      current_stage="cancelled", stage_detail="Application closed; stopped worker",
+                      cancel_requested=True, finished_at=time.time(), heartbeat=time.time())
+        save_json_atomic(status_path, latest)
+    parent_watch = start_parent_watch(payload.get("launch_pid"), parent_exited)
     job_id = str(payload.get("id", "child"))
     lifecycle_log("child_run_enter", job_id, argv=sys.argv, job_path=str(job_path))
     try:
@@ -3229,6 +3247,9 @@ def run_child_job(job_path: Path) -> int:
             traceback.print_exc()
         lifecycle_log("child_exception", job_id, exception_type=type(exc).__name__, error=str(exc), traceback=traceback.format_exc())
         return 1
+    finally:
+        if parent_watch is not None:
+            parent_watch.set()
 
 
 def _run_child_job(job_path: Path) -> int:

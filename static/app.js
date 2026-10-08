@@ -75,12 +75,13 @@ function showConfirm(message, confirmLabel = "Continue", cancelLabel = "Cancel")
 
 function setupDismissControls() {
   $("#closeLoadingOverlay").addEventListener("click", dismissLoadingOverlay);
-  $("#loadingOverlay").addEventListener("click", (event) => { if (!event.target.closest(".loading-stage-visual")) dismissLoadingOverlay(); });
+  $("#loadingOverlay").addEventListener("click", (event) => { if (event.target === event.currentTarget) dismissLoadingOverlay(); });
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !document.querySelector("dialog[open]")) dismissLoadingOverlay(); });
   document.addEventListener("click", (event) => { const toast = $("#toast"); if (toast?.classList.contains("show") && !toast.contains(event.target)) toast.classList.remove("show"); });
 }
 
 function dismissLoadingOverlay() {
+  window.renderListening?.pause();
   suppressLoadingOverlay = true;
   renderLoadingOverlay();
   document.querySelector("#loadingStageVideo")?.pause();
@@ -3613,7 +3614,11 @@ function renderLoadingOverlay() {
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
   const video = $("#loadingStageVideo");
-  if (!busy) { video?.pause(); return; }
+  if (!busy) {
+    if (window.renderListening?.isPlaying()) window.renderListening.pause();
+    video?.pause();
+    return;
+  }
   if (video?.paused) video.play().catch(() => {});
   const stage = String(state.current_stage || state.stage || "").toLowerCase();
   const isRenderTask = ["render", "mix"].includes(String(state.kind || "").toLowerCase());
