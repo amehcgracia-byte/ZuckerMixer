@@ -6826,6 +6826,22 @@ def mix_source_label(song_overrides: dict[str, object]) -> str:
     return "Automatic mix"
 
 
+def has_confirmed_manual_levels(song_overrides: dict[str, object]) -> bool:
+    stems = song_overrides.get("stems", {})
+    if not isinstance(stems, dict):
+        return False
+    return any(
+        isinstance(settings, dict) and (
+            override_bool(settings.get("manual_makeup_gain_db"), False)
+            or ((override_bool(settings.get("user_confirmed"), False)
+                 or override_bool(settings.get("user_fader_confirmed"), False))
+                and (abs(override_float(settings.get("fader_db"), 0.0)) > 0.001
+                     or abs(override_float(settings.get("gain_db"), 0.0)) > 0.001))
+        )
+        for settings in stems.values()
+    )
+
+
 def stem_override(song_overrides: dict[str, object], stem_name: str) -> dict[str, object]:
     stems = song_overrides.get("stems", {})
     if not isinstance(stems, dict):
@@ -6984,7 +7000,7 @@ def effective_mix_snapshot(
             "legacy_fader_db": override_float(row.get("legacy_fader_db"), 0.0),
             "legacy_gain_db": override_float(row.get("legacy_gain_db"), 0.0),
             "legacy_gain_state": row.get("legacy_gain_state", "none"),
-            "user_confirmed": bool(row.get("user_confirmed", False)),
+            "user_confirmed": override_bool(stem_override(song_overrides, name).get("user_confirmed"), False) or override_bool(stem_override(song_overrides, name).get("user_fader_confirmed"), False),
             "noise_detected": bool(row.get("noise_detected")),
             "noise_watchdog_flagged": bool(row.get("noise_watchdog_flagged")),
             "noise_case": row.get("noise_case", "none"),
@@ -8334,12 +8350,15 @@ def render_segment(
             }
         )
 
-    # Final, non-bypassable hierarchy ceiling. This runs after automatic gain,
+    # Automatic hierarchy is a fallback for untouched mixes. Confirmed Fine
+    # Tune levels are final artistic choices, not input for another rebalance.
+    manual_levels = has_confirmed_manual_levels(song_overrides)
+    # This runs after automatic gain,
     # rhythm/harmonic trims, and manual fader/makeup decisions. It is applied
     # to the actual DSP settings before any audio chunk is rendered.
     melodic_rows = [row for row in stem_report if row.get("status") == "active" and row.get("effective_role") in {"guitar", "keys", "keys_l", "keys_r"}]
     synth_rows = [row for row in stem_report if row.get("status") == "active" and row.get("effective_role") == "synth"]
-    if melodic_rows and synth_rows:
+    if not manual_levels and melodic_rows and synth_rows:
         melodic_levels = [float(row.get("rms_dbfs", -120.0)) + float(row.get("makeup_gain_db", 0.0)) + float(row.get("user_gain_db", 0.0)) + float(row.get("level_gain_db", 0.0)) for row in melodic_rows]
         synth_target = min(melodic_levels) - SYNTH_BELOW_MELODIC_MARGIN_DB
         for row in synth_rows:
@@ -8367,7 +8386,7 @@ def render_segment(
         for row in vocal_rows
     ])) if vocal_rows else None
     ceiling_hits: list[dict[str, object]] = []
-    if vocal_level is not None:
+    if not manual_levels and vocal_level is not None:
         for row in stem_report:
             if row.get("status") != "active" or row.get("effective_role") in {"vocal", "kick", "snare", "drums"}:
                 continue

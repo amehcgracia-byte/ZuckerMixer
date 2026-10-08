@@ -1,3 +1,10 @@
+## 2.8.8
+
+- Preserve manual fader/gain confirmation in both live Fine Tune state and the persisted render snapshot. Previously the preview state overwrote the confirmation marker, causing Render to discard edited levels as untrusted legacy values.
+- Confirmed manual levels are applied after automatic balancing; automatic synth/vocal hierarchy ceilings no longer undo a user’s Fine Tune mix. Automatic mixes retain their previous balance policy and exported audio retains the existing noise and peak protection.
+- Report manual confirmation accurately in the effective render mix.
+- Regression checks exercise the actual fader/gain handlers, live snapshot cloning, API normalization and worker override preparation. Real song 12 comparison produces different automatic/manual MP3s and identical repeat manual exports with the requested synth gains.
+
 ## 2.8.7
 
 - Fine Tune faders show each prepared song’s automatic level plus saved edits. Moving one fader stores only the change relative to its automatic level, preserving the other tracks and avoiding double gain.
