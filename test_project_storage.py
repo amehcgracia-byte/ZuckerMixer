@@ -53,3 +53,18 @@ def test_application_import_with_disconnected_project_disk(tmp_path):
     result = subprocess.run([sys.executable, '-c', 'import jam_app; assert jam_app.ACTIVE_SOURCE_STATE_ROOT.is_dir()'],
         cwd=Path(__file__).parent, env={**os.environ, 'ZUCKER_MIXER_STATE_ROOT':str(state)}, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
+
+
+def test_render_destination_is_saved_for_current_project_only(tmp_path, monkeypatch):
+    import jam_app as app
+    settings_file = tmp_path/'settings.json'
+    source = tmp_path/'sound';source.mkdir()
+    monkeypatch.setattr(app.pipeline, 'SOURCE_DIR', source)
+    monkeypatch.setattr(app, 'SETTINGS_PATH', settings_file)
+    saved = []
+    monkeypatch.setattr(app, 'load_source_config', lambda: {'expected_song_count':22})
+    monkeypatch.setattr(app, 'save_source_config', saved.append)
+    app.save_settings({'source_folder':str(source),'last_render_dir':'/selected/renders'})
+    assert saved == [{'expected_song_count':22,'last_render_dir':'/selected/renders'}]
+    app.save_settings({'source_folder':'/other/source','last_render_dir':'/other/renders'})
+    assert len(saved) == 1

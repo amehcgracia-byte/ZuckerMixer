@@ -1023,6 +1023,10 @@ def save_skipped_segments(values: Any) -> None:
     save_json_atomic(SKIPPED_SEGMENTS_PATH, {"version": 1, "segments": sorted(result)})
 
 def save_settings(settings: dict[str, Any]) -> None:
+    if settings.get("source_folder") == str(pipeline.SOURCE_DIR) and settings.get("last_render_dir"):
+        config = load_source_config()
+        config["last_render_dir"] = str(settings["last_render_dir"])
+        save_source_config(config)
     save_json(SETTINGS_PATH, settings)
 
 
@@ -4371,6 +4375,8 @@ def api_settings() -> Response:
             return jsonify({"error": "source folder not found"}), 400
         configure_source_folder(source)
         last_load_error = ""
+        if settings.get("source_folder") != str(source):
+            settings["last_render_dir"] = str(load_source_config().get("last_render_dir") or out_dir())
         settings["source_folder"] = str(source)
         with state_lock:
             pipeline_state = None
