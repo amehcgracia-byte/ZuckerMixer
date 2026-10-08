@@ -5759,6 +5759,13 @@ def biquad_filter(x: np.ndarray, sr: int, kind: str, freq: float, q: float = 0.7
 
 
 def make_sos(sr: int, kind: str, freq: float, q: float = 0.707, gain_db: float = 0.0) -> np.ndarray:
+    # Coefficients depend only on these parameters; DSP state stays per stem.
+    # Return a writable copy so callers cannot corrupt another track.
+    return _cached_sos(sr, kind, freq, q, gain_db).copy()
+
+
+@lru_cache(maxsize=512)
+def _cached_sos(sr: int, kind: str, freq: float, q: float, gain_db: float) -> np.ndarray:
     if kind == "highpass":
         return signal.butter(2, freq, btype="highpass", fs=sr, output="sos")
     elif kind == "lowpass":

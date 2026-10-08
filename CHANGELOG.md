@@ -1,5 +1,7 @@
 ## 2.8.5
 
+- Reuse filter coefficients by exact parameters, with independent writable copies and separate per-track DSP state.
+
 - Los controles de preescucha no cierran el vídeo de carga; al ocultarlo se pausa el audio.
 - Los datos de cada proyecto se migran con verificación a ZuckerMixer junto a las sesiones; renders nuevos usan su carpeta de proyecto como destino inicial.
 - El trabajador se detiene si desaparece la aplicación, incluso con escritura del estado bloqueada.
