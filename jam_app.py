@@ -1107,7 +1107,18 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     else:
         ACTIVE_SOURCE_STATE_ROOT = legacy_state
         ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    pipeline.configure_detection_cache(source, ACTIVE_SOURCE_STATE_ROOT / "cache")
+    cache_root = ACTIVE_SOURCE_STATE_ROOT / "cache"
+    old_detection = STATE_ROOT / f"jam_detection_envelopes_{source_key[:16]}.npz"
+    if old_detection.is_file() and not (cache_root / old_detection.name).exists():
+        # Keep the validated envelopes so migration does not force a full scan.
+        cache_root.mkdir(parents=True, exist_ok=True)
+        copied = cache_root / old_detection.name
+        shutil.copy2(old_detection, copied)
+        if hashlib.sha256(copied.read_bytes()).digest() != hashlib.sha256(old_detection.read_bytes()).digest():
+            copied.unlink()
+            raise RuntimeError("Detection cache migration verification failed")
+        old_detection.unlink()
+    pipeline.configure_detection_cache(source, cache_root)
     OVERRIDES_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_overrides.json"
     HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
     MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"

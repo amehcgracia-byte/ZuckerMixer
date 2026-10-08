@@ -47,6 +47,21 @@ def migrate_source_state(source, legacy):
                 raise RuntimeError('Project data changed during migration; original retained')
         else:
             stage.mkdir()
+        # Analysis plans may contain absolute paths into the old private state.
+        # Rewrite only that prefix; original recordings and exports keep theirs.
+        def relocate(value):
+            if isinstance(value, str) and value.startswith(str(legacy) + '/'):
+                return str(target / Path(value).relative_to(legacy))
+            if isinstance(value, list):
+                return [relocate(item) for item in value]
+            if isinstance(value, dict):
+                return {key: relocate(item) for key, item in value.items()}
+            return value
+        for file in stage.glob('*.json'):
+            payload = json.loads(file.read_text())
+            rewritten = relocate(payload)
+            if rewritten != payload:
+                file.write_text(json.dumps(rewritten, indent=2))
         stage.rename(target)
         (project / 'project.json').write_text(json.dumps({'source_folder': str(Path(source).resolve()), 'state_folder': '.zuckermixer'}, indent=2))
         if legacy.exists():
