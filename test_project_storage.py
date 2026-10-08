@@ -44,3 +44,12 @@ def test_cached_analysis_paths_are_relocated_but_exports_are_not(tmp_path, monke
     assert saved['analysis_cache_path'] == str(target/'analysis.npz')
     assert saved['export'] == '/external/song.mp3'
     assert Path(saved['analysis_cache_path']).read_bytes() == b'cache'
+
+
+def test_application_import_with_disconnected_project_disk(tmp_path):
+    import os, subprocess, sys
+    state = tmp_path/'state';state.mkdir()
+    (state/'sources').symlink_to(tmp_path/'disconnected', target_is_directory=True)
+    result = subprocess.run([sys.executable, '-c', 'import jam_app; assert jam_app.ACTIVE_SOURCE_STATE_ROOT.is_dir()'],
+        cwd=Path(__file__).parent, env={**os.environ, 'ZUCKER_MIXER_STATE_ROOT':str(state)}, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr

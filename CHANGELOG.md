@@ -1,3 +1,7 @@
+## 2.8.6
+
+- Keep application startup available when the external project disk is disconnected; saved project data remains on its original disk.
+
 ## 2.8.5
 
 - Reuse filter coefficients by exact parameters, with independent writable copies and separate per-track DSP state.

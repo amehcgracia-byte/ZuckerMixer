@@ -53,7 +53,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT))
 STATE_ROOT = Path(os.environ.get("ZUCKER_MIXER_STATE_ROOT", str(Path.home() / "Music" / "JamMixes" / "ZuckerMixerState"))).expanduser().resolve()
 STATE_ROOT.mkdir(parents=True, exist_ok=True)
-ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "sources" / "default"
+ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "runtime" / "default"
 ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
 OVERRIDES_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_overrides.json"
 HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
@@ -1105,7 +1105,9 @@ def configure_source_folder(source_folder: str | Path) -> Path:
         ACTIVE_SOURCE_STATE_ROOT = migrate_source_state(source, legacy_state)
         (ACTIVE_SOURCE_STATE_ROOT.parent / "renders").mkdir(exist_ok=True)
     else:
-        ACTIVE_SOURCE_STATE_ROOT = legacy_state
+        # The external project volume may be disconnected. Keep startup
+        # independent of it; never recreate or overwrite its saved project.
+        ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "offline" / source_key
         ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
     cache_root = ACTIVE_SOURCE_STATE_ROOT / "cache"
     old_detection = STATE_ROOT / f"jam_detection_envelopes_{source_key[:16]}.npz"
