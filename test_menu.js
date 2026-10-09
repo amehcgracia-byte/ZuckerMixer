@@ -10,7 +10,7 @@ const vm = require('node:vm');
     openRenderFolder: { disabled: true, hidden: false, textContent: ' Open renders folder ', click: () => clicks.push('openRenderFolder') },
   };
   const context = {
-    window: { zuckerOpenGuide: () => opened.push('guide'), zuckerOpenAbout: () => opened.push('about') },
+    window: { MixerTutorial: { start: () => opened.push('tutorial') }, zuckerOpenAbout: () => opened.push('about') },
     document: { getElementById: (id) => buttons[id] || null },
     showToast: (text) => toasts.push(text),
   };
@@ -21,8 +21,8 @@ const vm = require('node:vm');
   assert.equal(menu('openRenderFolder'), false);
   assert.deepEqual(clicks, ['mixAll'], 'disabled buttons are not pressed');
   assert.deepEqual(toasts, ['Open renders folder is not available right now.']);
-  assert.equal(menu('guide'), true); assert.equal(menu('about'), true);
-  assert.deepEqual(opened, ['guide', 'about']);
+  assert.equal(menu('tutorial'), true); assert.equal(menu('about'), true);
+  assert.deepEqual(opened, ['tutorial', 'about']);
   assert.equal(menu('missing'), false);
 }
 

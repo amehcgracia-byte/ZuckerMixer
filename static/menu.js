@@ -1,7 +1,7 @@
 /* Menu bar actions (mac_app.MENU_LAYOUT) press the same buttons as the window. */
 (() => {
   const special = {
-    guide: () => window.zuckerOpenGuide?.(),
+    tutorial: () => window.MixerTutorial?.start(),
     about: () => window.zuckerOpenAbout?.(),
   };
   window.zuckerMenu = (action) => {

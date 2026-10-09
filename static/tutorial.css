@@ -1,0 +1,29 @@
+.einstein-tour{position:fixed;inset:0;width:100vw;height:100dvh;max-width:none;max-height:none;margin:0;padding:0;border:0;background:transparent;color:#27241e;overflow:hidden;font-family:system-ui,sans-serif}
+.einstein-tour::backdrop{background:#09140f99;backdrop-filter:blur(3px)}
+.tour-shade{position:absolute;inset:0;width:100%;height:100%;z-index:1;pointer-events:none}
+.tour-demo{position:absolute;left:8%;top:6%;width:70%;max-height:40%;overflow:hidden;padding:26px 40px;border-radius:34px;background:var(--card2,#2a231d);color:var(--cream,#f4ead7);border:1px solid var(--line,#46392f);box-sizing:border-box;pointer-events:none}
+.tour-demo>input{width:90%;font-size:24px;padding:14px}
+.tour-demo .platforms{display:flex;gap:10px}.tour-demo .platform-card{flex:1;min-width:0}
+.tour-demo details{margin:6px}.tour-demo canvas{height:80px;max-width:100%;background:linear-gradient(150deg,#253c32,#6a7e6c);border-radius:12px}
+.tour-demo fieldset{max-width:100%}.tour-demo .progress-report,.tour-demo pre{max-height:100px}
+.tour-preview-label{display:block;font-size:11px;font-weight:800;letter-spacing:1.7px;opacity:.7;margin-bottom:16px}
+.tour-guide{position:absolute;inset:auto 5% 5%;display:flex;align-items:flex-end;justify-content:center;gap:18px;z-index:2;pointer-events:none}
+.tour-guide>img{width:clamp(150px,23vw,285px);max-height:49vh;object-fit:contain;filter:drop-shadow(0 10px 16px #0008);animation:einstein-arrive .45s ease-out;transform-origin:bottom}
+.tour-bubble{position:relative;max-width:680px;flex:1;background:#fff7dc;border:3px solid #2b281f;border-radius:40px 40px 40px 8px;padding:clamp(20px,3vw,36px);box-shadow:7px 9px 0 #0005;pointer-events:auto;animation:bubble-arrive .3s ease-out}
+.tour-bubble:before{content:'';position:absolute;left:-23px;bottom:52px;width:33px;height:28px;background:#fff7dc;border-left:3px solid #2b281f;border-bottom:3px solid #2b281f;transform:skewY(-30deg);border-radius:0 0 0 8px}
+.tour-count{font-size:12px;letter-spacing:1.5px;font-weight:800;color:#6b633f}
+.tour-bubble h2{font-size:clamp(24px,3vw,36px);line-height:1.12;margin:14px 0;color:#27241e}
+.tour-copy{font-size:clamp(17px,1.9vw,22px);line-height:1.5;margin:0 0 20px;color:#393628}
+.tour-actions{display:flex;justify-content:flex-end;gap:12px}.tour-actions button{font:700 16px system-ui;padding:12px 24px;border:2px solid #314932;border-radius:999px;background:transparent;color:#314932;cursor:pointer}.tour-actions .tour-primary{background:#294a35;color:#fff}.tour-actions button:disabled{opacity:.4;cursor:default}
+.tour-actions button:focus-visible,.tour-close:focus-visible{outline:4px solid #df9b22;outline-offset:4px}
+.tour-close{position:absolute;right:22px;top:20px;z-index:3;width:46px;height:46px;border:2px solid #fff8;border-radius:50%;background:#17241d;color:#fff;font-size:30px;cursor:pointer}
+.tour-error{color:#a03020;font-size:15px}.tour-error:empty{display:none}
+.tour-welcome .tour-guide{bottom:16%;align-items:center}.tour-welcome .tour-guide>img{max-height:65vh;width:30vw}.tour-welcome .tour-demo{display:none}
+@keyframes einstein-arrive{from{opacity:0;transform:translateY(22px) rotate(-3deg)}to{opacity:1;transform:none}}
+@keyframes bubble-arrive{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
+@media(max-width:650px){.tour-demo{left:6%;width:88%;top:8%;max-height:30%;padding:20px}.tour-guide{inset:auto 4% 3%;gap:0}.tour-guide>img{position:absolute;bottom:100%;left:0;width:90px;max-height:120px}.tour-bubble{border-radius:24px;padding:20px;max-height:53vh;overflow:auto}.tour-bubble:before{display:none}.tour-welcome .tour-guide{bottom:10%}.tour-welcome .tour-guide>img{width:125px;max-height:170px}.tour-copy{font-size:17px}.tour-actions button{padding:10px 18px}}
+@media(prefers-reduced-motion:reduce){.tour-guide>img,.tour-bubble{animation:none}}
+.einstein-tour::backdrop{background:transparent;backdrop-filter:none}
+.tour-demo[hidden]{display:none}
+.tour-close{display:grid;place-items:center;padding:0;line-height:1}
+.tour-demo details>label{display:inline-flex;flex-direction:column;gap:4px;width:28%;margin:4px;font-size:14px}.tour-demo details>label input,.tour-demo details>label select{width:100%;box-sizing:border-box;min-width:0}
