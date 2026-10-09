@@ -45,13 +45,28 @@ def select_release(release, current, platform):
     return dict(version=version, asset=assets[name], checksums=assets['SHA256SUMS.txt'])
 
 
-def request(url):
-    context = ssl.create_default_context()
+SYSTEM_CA_FILES = ('/etc/ssl/cert.pem',)
+
+
+def ca_bundle():
+    """CA file for GitHub HTTPS, or None for OpenSSL's defaults.
+
+    The frozen python.org runtime looks for certificates inside its own
+    framework folder, which is empty on most Macs. Prefer the bundled certifi
+    file and fall back to the macOS system bundle.
+    """
     try:
         import certifi
-        context = ssl.create_default_context(cafile=certifi.where())
+        path = certifi.where()
+        if os.path.isfile(path):
+            return path
     except ImportError:
         pass
+    return next((path for path in SYSTEM_CA_FILES if os.path.isfile(path)), None)
+
+
+def request(url):
+    context = ssl.create_default_context(cafile=ca_bundle())
     return urllib.request.urlopen(urllib.request.Request(url, headers={
         'User-Agent': 'ZuckerMixer-Updater', 'Accept': 'application/vnd.github+json'
     }), timeout=20, context=context)

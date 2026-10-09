@@ -93,7 +93,18 @@ import jam_mix_pipeline as pipeline
 
 if "--self-check" in sys.argv:
     import update_manager
-    assert (Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "update_helper.py").is_file()
+    resources = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    assert (resources / "update_helper.py").is_file()
+    if not (resources / "README_Zucker_Mixer_App.md").is_file():
+        raise SystemExit("ZuckerMixer guide self-check failed: README_Zucker_Mixer_App.md is not bundled")
+    # The system fallback hides a missing bundle on build machines; require
+    # certifi itself so update checks work on every user's Mac.
+    try:
+        import certifi
+        if not Path(certifi.where()).is_file():
+            raise FileNotFoundError(certifi.where())
+    except Exception as exc:
+        raise SystemExit(f"ZuckerMixer update certificate self-check failed: {type(exc).__name__}: {exc}")
     try:
         import faster_whisper  # noqa: F401
     except Exception as exc:
@@ -109,6 +120,7 @@ if "--self-check" in sys.argv:
     print("ZuckerMixer Matchering import self-check: OK", flush=True)
     print("ZuckerMixer frozen import self-check: OK", flush=True)
     print("ZuckerMixer bundled Whisper import self-check: OK", flush=True)
+    print("ZuckerMixer update certificate and guide self-check: OK", flush=True)
     raise SystemExit(0)
 
 
@@ -199,6 +211,56 @@ class ZuckerMixerApi:
         return {"cancelled": False, "folder": str(folder)}
 
 
+REPOSITORY_URL = "https://github.com/amehcgracia-byte/ZuckerMixer"
+
+# Menu bar: each action is the id of a button in templates/index.html, so a
+# menu item does exactly what that button does. "guide", "about" and
+# "github" are handled by static/menu.js or here.
+MENU_LAYOUT: list[tuple[str, list[tuple[str, str] | None]]] = [
+    ("File", [
+        ("Change Source Folder…", "changeSourceFolder"),
+        ("Choose Mastering Reference…", "chooseMatcheringReference"),
+        None,
+        ("Open Renders Folder", "openRenderFolder"),
+    ]),
+    ("Songs", [
+        ("Select All Songs", "selectAllSongs"),
+        ("Edit All Cuts", "editAllCuts"),
+        None,
+        ("Re-detect Songs (Acoustic)", "redetectSongs"),
+        ("Analyze with Whisper (Optional)", "secondWhisperPass"),
+    ]),
+    ("Mix", [
+        ("Mix Selected", "mixSelected"),
+        ("Mix Everything", "mixAll"),
+        None,
+        ("Cancel Current Job", "cancelJob"),
+    ]),
+    ("Help", [
+        ("Read Me First", "guide"),
+        ("Check for Updates…", "checkUpdate"),
+        None,
+        ("About ZuckerMixer", "about"),
+        ("ZuckerMixer on GitHub", "github"),
+    ]),
+]
+
+
+def build_menu(run_action) -> list:
+    from webview.menu import Menu, MenuAction, MenuSeparator
+
+    def action(title: str, name: str):
+        # Cocoa calls menu items on the UI thread, where evaluate_js would
+        # wait on itself; always dispatch from a worker thread.
+        return MenuAction(title, lambda: threading.Thread(target=run_action, args=(name,), daemon=True).start())
+
+    menus = [Menu(title, [MenuSeparator() if item is None else action(*item) for item in items]) for title, items in MENU_LAYOUT]
+    if sys.platform == "darwin":
+        # macOS convention: the app menu (next to the Apple menu) also offers updates.
+        menus.insert(0, Menu("__app__", [action("Check for Updates…", "checkUpdate")]))
+    return menus
+
+
 def main() -> None:
     if len(sys.argv) >= 3 and sys.argv[1] == "--worker":
         raise SystemExit(jam_app.run_child_job(Path(sys.argv[2])))
@@ -247,9 +309,16 @@ def main() -> None:
         timer.start()
         return True
 
+    def run_menu_action(name: str) -> None:
+        if name == "github":
+            import webbrowser
+            webbrowser.open(REPOSITORY_URL)
+            return
+        window.evaluate_js(f"window.zuckerMenu && window.zuckerMenu({json.dumps(name)})")
+
     window.events.loaded += on_loaded
     window.events.closing += on_closing
-    webview.start(debug=False)
+    webview.start(debug=False, menu=build_menu(run_menu_action))
     # Closing the WebView must never wait for a multi-minute Whisper/ffmpeg
     # worker. Process groups were already signalled by on_closing.
     jam_app.wait_for_jobs_to_stop(timeout_seconds=2.5)

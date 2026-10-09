@@ -1,3 +1,10 @@
+## 2.8.11
+
+- Fix update checks on macOS. The 2.8.9 and 2.8.10 Mac builds no longer received `certifi` indirectly from other dependencies, and the frozen Python runtime then found no CA certificates, so every check failed with "Could not check for updates". The Mac build now installs `certifi` explicitly, the updater falls back to the macOS system bundle (`/etc/ssl/cert.pem`), and `--self-check` fails the build if the bundle is missing. Mac users on 2.8.9 or 2.8.10 must install 2.8.11 once from the DMG.
+- A manual update check now shows the actual error instead of a generic message.
+- Add a menu bar with every app action: File (source folder, mastering reference, renders folder), Songs (select all, edit cuts, re-detect, Whisper analysis), Mix (mix selected, mix everything, cancel) and Help (Read me first, Check for updates, About, GitHub). On macOS, Check for Updates is also in the ZuckerMixer app menu. Menu items press the same buttons as the window.
+- Add an About window (Help → About ZuckerMixer, or the footer) with the version, author, purpose, license and the open-source tools ZuckerMixer is built with. The same credits appear in the macOS About panel.
+
 ## 2.8.10
 
 - Show the "Read me first" guide inside the app the first time each newly installed or updated version opens, and add a **Read me first** footer button to reopen it. In-app updates never show the DMG, so its guide was previously invisible after updating. The guide waits for any open update or confirmation dialog.

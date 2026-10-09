@@ -1047,8 +1047,12 @@ dialog { position: fixed; padding-top: 42px; }
 
 .update-dialog button { margin: 8px 8px 0 0; }
 .guide-dialog { max-width: min(720px, 92vw); }
+.about-dialog { max-width: min(600px, 92vw); }
+.about-dialog .about-version { color: var(--muted); font-size: 12px; }
+.about-dialog .about-credits p { white-space: normal; line-height: 1.5; }
+.about-dialog a { color: inherit; }
 .guide-dialog pre { max-height: 62vh; overflow: auto; white-space: pre-wrap; font-size: 12px; line-height: 1.45; margin: 0 0 12px; }
-#checkUpdate, #openGuide { font-size: 11px; padding: 4px 8px; margin-right: 8px; }
+#checkUpdate, #openGuide, #openAbout { font-size: 11px; padding: 4px 8px; margin-right: 8px; }
 #updateNotice { margin-right: 8px; overflow-wrap: anywhere; }
 
 .render-listen-button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; flex-shrink: 0; color: var(--cream); }

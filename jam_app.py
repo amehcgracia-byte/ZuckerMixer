@@ -416,6 +416,19 @@ def api_guide_seen() -> Response:
     return jsonify({"version": version})
 
 
+CREDITS_PATH = RESOURCE_ROOT / "Credits.html"
+
+
+@app.get("/api/about")
+def api_about() -> Response:
+    # Credits.html also feeds the native macOS About panel; one text for both.
+    try:
+        credits = re.sub(r"<!--.*?-->", "", CREDITS_PATH.read_text(encoding="utf-8"), flags=re.S).strip()
+    except OSError:
+        credits = ""
+    return jsonify({**BUILD_METADATA, "credits_html": credits})
+
+
 @app.get("/api/performance")
 def api_performance() -> Response:
     with request_timings_lock:

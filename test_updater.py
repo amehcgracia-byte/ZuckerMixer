@@ -135,3 +135,21 @@ def test_mac_bundle_copy_preserves_signed_resource_metadata(tmp_path, monkeypatc
     u.copy_app_bundle(tmp_path/'source.app', tmp_path/'stage.app', 'darwin')
     assert calls[0][0] == ['ditto', '--rsrc', '--extattr', str(tmp_path/'source.app'), str(tmp_path/'stage.app')]
     assert calls[0][1]['check'] is True
+
+
+def test_ca_bundle_prefers_certifi_then_macos_system_file(monkeypatch, tmp_path):
+    import builtins, types
+    bundle = tmp_path / 'cacert.pem'; bundle.write_text('x')
+    monkeypatch.setitem(__import__('sys').modules, 'certifi', types.SimpleNamespace(where=lambda: str(bundle)))
+    assert u.ca_bundle() == str(bundle)
+    real_import = builtins.__import__
+    def no_certifi(name, *args, **kwargs):
+        if name == 'certifi':
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', no_certifi)
+    system = tmp_path / 'system.pem'; system.write_text('x')
+    monkeypatch.setattr(u, 'SYSTEM_CA_FILES', (str(tmp_path / 'missing.pem'), str(system)))
+    assert u.ca_bundle() == str(system)
+    monkeypatch.setattr(u, 'SYSTEM_CA_FILES', (str(tmp_path / 'missing.pem'),))
+    assert u.ca_bundle() is None
