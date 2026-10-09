@@ -1,62 +1,5 @@
-ZUCKER MIXER — LÉEME PRIMERO / READ ME FIRST
-=============================================
-
-(English below)
-
-
-ESPAÑOL
--------
-
-1. INSTALAR
-   Arrastra ZuckerMixer.app a la carpeta Aplicaciones.
-
-2. LA PRIMERA VEZ, macOS LA BLOQUEARÁ (ES NORMAL)
-   Al abrirla verás un aviso parecido a:
-   "No se ha abierto ZuckerMixer. Apple no ha podido verificar que
-   ZuckerMixer no contiene software malicioso..."
-
-   No es un virus ni un fallo. Ocurre porque Zucker Mixer es una app
-   gratuita y no hemos pagado la cuota de desarrollador de Apple
-   (99 €/año), así que Apple no la ha "notarizado". Tus grabaciones no
-   salen de tu ordenador. La app solo se conecta a internet para buscar
-   actualizaciones en GitHub y, la primera vez que detecta canciones,
-   para descargar el modelo de voz Whisper.
-
-   Para abrirla (solo hace falta una vez):
-     a) En el aviso, pulsa "Aceptar" (NO "Trasladar a la papelera").
-     b) Abre  Ajustes del Sistema  >  Privacidad y seguridad.
-     c) Baja hasta la sección "Seguridad". Verás:
-        "Se ha bloqueado ZuckerMixer para proteger tu Mac."
-     d) Pulsa  "Abrir igualmente"  y escribe tu contraseña del Mac.
-     e) En el último aviso, pulsa otra vez "Abrir igualmente".
-
-   A partir de ahí se abre normalmente, con doble clic.
-   Las actualizaciones automáticas no vuelven a pedir este paso.
-
-   En macOS 14 (Sonoma) o anterior también vale:
-   clic derecho sobre ZuckerMixer.app  >  Abrir  >  Abrir.
-
-   Plan B (Terminal), si lo anterior no aparece:
-     xattr -dr com.apple.quarantine /Applications/ZuckerMixer.app
-
-3. MAC CON CHIP APPLE (M1, M2, M3...)
-   Si macOS pide instalar Rosetta, acepta. La app está hecha para Intel
-   y Rosetta permite usarla en estos Mac.
-
-4. FFMPEG (para crear los MP3)
-   Si la app dice que falta ffmpeg, instálalo en Terminal:
-     brew install ffmpeg
-
-5. TUS ARCHIVOS
-   Todo se queda en este Mac. Ajustes e informes de diagnóstico:
-     ~/Music/JamMixes/ZuckerMixerState
-
-Zucker Mixer es software libre bajo la licencia GNU GPL v3.0
-(ver LICENSE.txt). Copyright (C) 2026 José Manuel García.
-
-
-ENGLISH
--------
+ZUCKER MIXER — READ ME FIRST
+============================
 
 1. INSTALL
    Drag ZuckerMixer.app into the Applications folder.
@@ -97,9 +40,18 @@ ENGLISH
    If the app says ffmpeg is missing, install it in Terminal:
      brew install ffmpeg
 
-5. YOUR FILES
-   Everything stays on this Mac. Settings and diagnostic reports:
+5. WINDOWS
+   Extract the whole ZIP and run ZuckerMixer\ZuckerMixer.exe; keep the
+   _internal folder next to it. If Windows shows "Windows protected your
+   PC", click "More info" and then "Run anyway". The Windows package
+   already includes ffmpeg.
+
+6. YOUR FILES
+   Everything stays on your computer. Settings and diagnostic reports:
      ~/Music/JamMixes/ZuckerMixerState
+
+You can open this guide again at any time with "Read me first" at the
+bottom of the ZuckerMixer window.
 
 Zucker Mixer is free software licensed under the GNU GPL v3.0
 (see LICENSE.txt). Copyright (C) 2026 José Manuel García.

@@ -1,3 +1,10 @@
+## 2.8.10
+
+- Show the "Read me first" guide inside the app the first time each newly installed or updated version opens, and add a **Read me first** footer button to reopen it. In-app updates never show the DMG, so its guide was previously invisible after updating. The guide waits for any open update or confirmation dialog.
+- The guide is now English only and the DMG file is named `READ ME FIRST.txt`; translations will be added separately. It also covers the Windows SmartScreen prompt ("More info" → "Run anyway").
+- Translate the remaining Spanish close-confirmation dialog to English.
+- Declare `certifi` as a build requirement so locally built apps can verify GitHub update downloads.
+
 ## 2.8.9
 
 - Process the stems of each render chunk on up to four threads, then sum them in the original stem order. Exported audio is byte-identical to serial rendering; on a real 12-stem session a 5-minute exact render dropped from 48.6s to 36.0s (-26%). `ZUCKER_RENDER_STEM_WORKERS=1` restores serial processing.

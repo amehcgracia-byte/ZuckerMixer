@@ -18,6 +18,7 @@ a = Analysis(
         ("build/build_metadata.json", "build"),
         ("whisper_transcribe.py", "."),
         ("update_helper.py", "."),
+        ("README_Zucker_Mixer_App.md", "."),
         ("jam_app.py", "."),
         ("jam_mix_pipeline.py", "."),
     ],

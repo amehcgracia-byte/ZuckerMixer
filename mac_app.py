@@ -226,9 +226,9 @@ def main() -> None:
     def on_closing() -> bool:
         if jam_app.has_active_jobs():
             proceed = window.create_confirmation_dialog(
-                "Trabajos en curso",
-                "Hay una mezcla o análisis ejecutándose. Si cierras ahora se cancelará; "
-                "los resultados ya guardados se conservarán. ¿Cerrar?",
+                "Work in progress",
+                "A mix or analysis is still running. Closing now will cancel it; "
+                "results already saved will be kept. Close anyway?",
             )
             if not proceed:
                 return False
