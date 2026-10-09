@@ -6,6 +6,8 @@ numpy
 scipy
 soundfile
 pyloudnorm
+# The updater verifies GitHub over HTTPS with this CA bundle.
+certifi>=2024.2.2
 
 # Reference mastering ships with the desktop app.
 matchering==2.0.6
