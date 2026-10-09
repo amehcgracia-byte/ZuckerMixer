@@ -30,6 +30,7 @@ from dsp_imports import signal as audio_signal
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import soundfile as sf
@@ -347,6 +348,34 @@ request_timings_lock = threading.Lock()
 @app.before_request
 def start_request_timer() -> None:
     g.request_started = time.perf_counter()
+
+
+LOCAL_REQUEST_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
+
+def _local_hostname(value: str) -> str:
+    value = value.strip().lower()
+    if value.startswith("["):
+        return value[: value.find("]") + 1] if "]" in value else value
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+@app.before_request
+def reject_non_local_requests() -> Response | None:
+    """Serve only the app's own window.
+
+    The server listens on loopback, but a web page open in any browser can
+    still reach it: DNS rebinding arrives with a foreign Host header, and a
+    cross-site POST carries the page's Origin. Neither is the desktop window.
+    """
+    if _local_hostname(request.host or "") not in LOCAL_REQUEST_HOSTS:
+        return Response("Forbidden host", status=403)
+    origin = request.headers.get("Origin")
+    if origin is not None:
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"} or _local_hostname(parsed.netloc) not in LOCAL_REQUEST_HOSTS:
+            return Response("Forbidden origin", status=403)
+    return None
 
 
 @app.after_request

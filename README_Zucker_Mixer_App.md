@@ -1,35 +1,105 @@
-# ZuckerMixer
+ZUCKER MIXER — LÉEME PRIMERO / READ ME FIRST
+=============================================
 
-Desktop application for mixing multitrack jam recordings locally. Each song has its own audio analysis, instrument balance, drum-kit control, effects and mastering. Source recordings stay on your computer.
+(English below)
 
-## Downloads
 
-Use [GitHub Releases](https://github.com/amehcgracia-byte/ZuckerMixer/releases) for versioned installers. A passing build artifact is a test package; it becomes a public download only when its release is published.
+ESPAÑOL
+-------
 
-- **macOS:** open `ZuckerMixer-VERSION.dmg` and drag `ZuckerMixer.app` into Applications. Current automated builds target Intel Macs; Apple Silicon can use Rosetta. Packages are locally signed, without Apple notarization. Install FFmpeg with `brew install ffmpeg` if it is not already available.
-- **Windows 10/11, x64:** extract the entire `ZuckerMixer-VERSION-Windows.zip`, then run `ZuckerMixer/ZuckerMixer.exe`. Keep its `_internal` folder beside the executable. Microsoft Edge WebView2 Runtime is required. This package includes FFmpeg; no Python installation is required.
+1. INSTALAR
+   Arrastra ZuckerMixer.app a la carpeta Aplicaciones.
 
-## Use
+2. LA PRIMERA VEZ, macOS LA BLOQUEARÁ (ES NORMAL)
+   Al abrirla verás un aviso parecido a:
+   "No se ha abierto ZuckerMixer. Apple no ha podido verificar que
+   ZuckerMixer no contiene software malicioso..."
 
-1. Choose a folder of aligned instrument WAV exports. Avoid duplicate stereo/full-session exports.
-2. Review detected songs in **Select Cuts**. Existing cuts are retained until you save a change.
-3. Use **Fine-tune** for individual song controls. Exact preview uses the Python render; browser mix preview is approximate.
-4. Choose a mastering reference if desired. **Mix everything** attempts all visible songs except those you explicitly marked **Skip this one**. Boundary warnings do not remove songs or alter saved cuts. An actual failed render is named in **Copy report**, and the batch continues with the remaining songs.
-5. Choose an output folder. Completed MP3 files appear there and in the app. Settings and diagnostic reports are under `~/Music/JamMixes/ZuckerMixerState`.
+   No es un virus ni un fallo. Ocurre porque Zucker Mixer es una app
+   gratuita y no hemos pagado la cuota de desarrollador de Apple
+   (99 €/año), así que Apple no la ha "notarizado". Tus grabaciones no
+   salen de tu ordenador. La app solo se conecta a internet para buscar
+   actualizaciones en GitHub y, la primera vez que detecta canciones,
+   para descargar el modelo de voz Whisper.
 
-Initial analysis of long multitrack songs can take time. Valid analysis and mix plans are cached, so reopening controls is faster. Silent microphones are not automatically boosted.
+   Para abrirla (solo hace falta una vez):
+     a) En el aviso, pulsa "Aceptar" (NO "Trasladar a la papelera").
+     b) Abre  Ajustes del Sistema  >  Privacidad y seguridad.
+     c) Baja hasta la sección "Seguridad". Verás:
+        "Se ha bloqueado ZuckerMixer para proteger tu Mac."
+     d) Pulsa  "Abrir igualmente"  y escribe tu contraseña del Mac.
+     e) En el último aviso, pulsa otra vez "Abrir igualmente".
 
-## Build from source
+   A partir de ahí se abre normalmente, con doble clic.
+   Las actualizaciones automáticas no vuelven a pedir este paso.
 
-Python 3.12 is used for the supported build because the Matchering/Numba versions are pinned for compatibility.
+   En macOS 14 (Sonoma) o anterior también vale:
+   clic derecho sobre ZuckerMixer.app  >  Abrir  >  Abrir.
 
-```sh
-python -m pip install -r requirements_app.txt -r requirements_whisper.txt pytest
-python -m pytest -q
-```
+   Plan B (Terminal), si lo anterior no aparece:
+     xattr -dr com.apple.quarantine /Applications/ZuckerMixer.app
 
-macOS uses a framework Python: `./build_app.sh`. Windows PowerShell: `./build_windows.ps1`. The build records the application version, UTC build time and Git commit. `--self-check` validates frozen Whisper and Matchering imports. GitHub Actions builds and uploads both platform packages; tagged builds prepare a draft release with checksums and source archive.
+3. MAC CON CHIP APPLE (M1, M2, M3...)
+   Si macOS pide instalar Rosetta, acepta. La app está hecha para Intel
+   y Rosetta permite usarla en estos Mac.
 
-## License and notices
+4. FFMPEG (para crear los MP3)
+   Si la app dice que falta ffmpeg, instálalo en Terminal:
+     brew install ffmpeg
 
-The project owner's license decision is pending. See `LICENSE` and `THIRD_PARTY_NOTICES.md`. The integrated Matchering dependency uses GPL-3.0; public distribution must retain its license and matching source information. No recording samples, user settings or personal reference tracks are included in the source or installers.
+5. TUS ARCHIVOS
+   Todo se queda en este Mac. Ajustes e informes de diagnóstico:
+     ~/Music/JamMixes/ZuckerMixerState
+
+Zucker Mixer es software libre bajo la licencia GNU GPL v3.0
+(ver LICENSE.txt). Copyright (C) 2026 José Manuel García.
+
+
+ENGLISH
+-------
+
+1. INSTALL
+   Drag ZuckerMixer.app into the Applications folder.
+
+2. THE FIRST TIME, macOS WILL BLOCK IT (THIS IS EXPECTED)
+   You will see a warning like:
+   "ZuckerMixer Not Opened. Apple could not verify ZuckerMixer is free
+   of malware..."
+
+   This is not a virus or a bug. Zucker Mixer is free and we have not
+   paid Apple's developer fee (99 USD/year), so Apple has not
+   "notarized" it. Your recordings never leave your computer. The app
+   only goes online to check GitHub for updates and, the first time it
+   detects songs, to download the Whisper speech model.
+
+   To open it (only needed once):
+     a) In the warning, click "Done" (NOT "Move to Trash").
+     b) Open  System Settings  >  Privacy & Security.
+     c) Scroll down to "Security". You will see:
+        "ZuckerMixer was blocked to protect your Mac."
+     d) Click  "Open Anyway"  and enter your Mac password.
+     e) In the final prompt, click "Open Anyway" again.
+
+   After that it opens normally with a double-click.
+   Automatic updates do not require this step again.
+
+   On macOS 14 (Sonoma) or earlier you can also:
+   right-click ZuckerMixer.app  >  Open  >  Open.
+
+   Plan B (Terminal), if the option above does not appear:
+     xattr -dr com.apple.quarantine /Applications/ZuckerMixer.app
+
+3. APPLE SILICON MACS (M1, M2, M3...)
+   If macOS asks to install Rosetta, accept. The app is built for Intel
+   and Rosetta runs it on these Macs.
+
+4. FFMPEG (needed to create MP3 files)
+   If the app says ffmpeg is missing, install it in Terminal:
+     brew install ffmpeg
+
+5. YOUR FILES
+   Everything stays on this Mac. Settings and diagnostic reports:
+     ~/Music/JamMixes/ZuckerMixerState
+
+Zucker Mixer is free software licensed under the GNU GPL v3.0
+(see LICENSE.txt). Copyright (C) 2026 José Manuel García.

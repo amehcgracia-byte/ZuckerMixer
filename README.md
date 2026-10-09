@@ -1,12 +1,14 @@
 # ZuckerMixer
 
+Copyright (C) 2026 José Manuel García. Zucker Mixer is free software licensed under the GNU GPL v3.0 (see LICENSE).
+
 Desktop application for mixing multitrack jam recordings locally. Each song has its own audio analysis, instrument balance, drum-kit control, effects and mastering. Source recordings stay on your computer.
 
 ## Downloads
 
 Use [GitHub Releases](https://github.com/amehcgracia-byte/ZuckerMixer/releases) for versioned installers. A passing build artifact is a test package; it becomes a public download only when its release is published.
 
-- **macOS:** open `ZuckerMixer-VERSION.dmg` and drag `ZuckerMixer.app` into Applications. Current automated builds target Intel Macs; Apple Silicon can use Rosetta. Packages are locally signed, without Apple notarization. Install FFmpeg with `brew install ffmpeg` if it is not already available.
+- **macOS:** open `ZuckerMixer-VERSION.dmg` and drag `ZuckerMixer.app` into Applications. Current automated builds target Intel Macs; Apple Silicon can use Rosetta. Packages are locally signed, without Apple notarization (we do not pay for an Apple Developer account), so macOS blocks the first launch. To open it once: click **Done** in the warning, go to **System Settings → Privacy & Security**, and click **Open Anyway** next to "ZuckerMixer was blocked". The DMG includes `LEEME PRIMERO - READ ME FIRST.txt` with step-by-step instructions in Spanish and English. Install FFmpeg with `brew install ffmpeg` if it is not already available.
 - **Windows 10/11, x64:** extract the entire `ZuckerMixer-VERSION-Windows.zip`, then run `ZuckerMixer/ZuckerMixer.exe`. Keep its `_internal` folder beside the executable. Microsoft Edge WebView2 Runtime is required. This package includes FFmpeg; no Python installation is required.
 
 ## Use
@@ -32,4 +34,4 @@ macOS uses a framework Python: `./build_app.sh`. Windows PowerShell: `./build_wi
 
 ## License and notices
 
-The project owner's license decision is pending. See `LICENSE` and `THIRD_PARTY_NOTICES.md`. The integrated Matchering dependency uses GPL-3.0; public distribution must retain its license and matching source information. No recording samples, user settings or personal reference tracks are included in the source or installers.
+ZuckerMixer is licensed under the GNU General Public License v3.0; see `LICENSE` and `THIRD_PARTY_NOTICES.md`. The integrated Matchering dependency uses GPL-3.0; public distribution must retain its license and matching source information. No recording samples, user settings or personal reference tracks are included in the source or installers.

@@ -285,6 +285,39 @@ LOGIC_FRAGMENT_RE = re.compile(r"^.+#\d{2,}$", re.IGNORECASE)
 # unnecessarily slow.  Peak/RMS safety is still measured and applied per
 # block, so this does not change the clipping contract.
 RENDER_CHUNK_SECONDS = 30.0
+
+
+def render_stem_workers(stem_count: int) -> int:
+    """Threads used to process the stems of one render chunk.
+
+    File reads and the NumPy/SciPy filters release the GIL, so independent
+    stems overlap well. ZUCKER_RENDER_STEM_WORKERS=1 restores serial order.
+    """
+    configured = os.environ.get("ZUCKER_RENDER_STEM_WORKERS", "").strip()
+    try:
+        workers = int(configured) if configured else min(4, os.cpu_count() or 1)
+    except ValueError:
+        workers = 1
+    return max(1, min(workers, stem_count))
+
+
+class _StemPool:
+    """Ordered map over stems: a thread pool, or the plain loop for one worker."""
+
+    def __init__(self, workers: int) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="render-stem") if workers > 1 else None
+
+    def map(self, fn, items):
+        return self._executor.map(fn, items) if self._executor else map(fn, items)
+
+    def __enter__(self) -> "_StemPool":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if self._executor:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+
 DETECTION_CACHE = Path(".jam_detection_envelopes.npz")
 DETECTION_CACHE_ROOT: Path | None = None
 LEGACY_DETECTION_CACHE: Path | None = None
@@ -8454,6 +8487,7 @@ def render_segment(
         with sf.SoundFile(str(premaster_path), "w", samplerate=sr, channels=2, subtype="FLOAT") as writer:
             with ExitStack() as stack:
                 handles = {stem.path.name: stack.enter_context(sf.SoundFile(str(stem.path), "r")) for stem in stems}
+                stem_pool = stack.enter_context(_StemPool(render_stem_workers(len(stems))))
                 for chunk_start in range(0, target_frames, chunk_frames):
                     nframes = min(chunk_frames, target_frames - chunk_start)
                     chunk_timing = {"read": 0.0, "filter_compress": 0.0, "sum_bus_write": 0.0}
@@ -8463,14 +8497,18 @@ def render_segment(
                     delay_send = np.zeros((nframes, 2), dtype=np.float32)
                     bass_items: list[np.ndarray] = []
                     kick_control = np.zeros(nframes, dtype=np.float32)
-                    for stem in stems:
+                    def render_stem_chunk(stem: Stem) -> tuple[np.ndarray, dict, str, bool, float, dict[str, float]] | None:
+                        # Each stem reads its own file handle and owns its DSP state keys,
+                        # so stems can be processed concurrently. Summing stays sequential
+                        # in stem order below, keeping the mix bit-identical.
+                        timing = {"read": 0.0, "filter_compress": 0.0, "stem_gain": 0.0}
                         if stem.path.name not in track_settings:
-                            continue
+                            return None
                         t0 = time.perf_counter()
                         chunk = read_stem_chunk(stem, segment, chunk_start, nframes, handles[stem.path.name])
-                        chunk_timing["read"] += time.perf_counter() - t0
+                        timing["read"] += time.perf_counter() - t0
                         if chunk is None:
-                            continue
+                            return None
                         # Some late virtual-tail blocks contain NaN/Inf values
                         # even though the analysis path has already sanitized
                         # them.  Keep render DSP and activity decisions on the
@@ -8583,7 +8621,7 @@ def render_segment(
                                 ]
                             ).astype(np.float32)
                         y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-                        chunk_timing["filter_compress"] += time.perf_counter() - t0
+                        timing["filter_compress"] += time.perf_counter() - t0
                         t0 = time.perf_counter()
                         y *= db_to_amp(level_gain_db)
                         if fx_enabled and bool(settings.get("gate_enabled", False)) and processing_role != "vocal":
@@ -8596,6 +8634,17 @@ def render_segment(
                                     y *= gain
                         stereo = apply_stereo_pan(y, pan)
                         stereo = stereo[:nframes]
+                        timing["stem_gain"] += time.perf_counter() - t0
+                        return stereo, settings, processing_role, fx_enabled, lead_bonus, timing
+
+                    for stem_result in stem_pool.map(render_stem_chunk, stems):
+                        if stem_result is None:
+                            continue
+                        stereo, settings, processing_role, fx_enabled, lead_bonus, stem_timing = stem_result
+                        chunk_timing["read"] += stem_timing["read"]
+                        chunk_timing["filter_compress"] += stem_timing["filter_compress"]
+                        chunk_timing["sum_bus_write"] += stem_timing["stem_gain"]
+                        t0 = time.perf_counter()
                         meter_stage("post_stem_gain", stereo)
                         send_db = reverb_send_level_db(processing_role) if fx_enabled and bool(settings.get("space_enabled", False)) else None
                         if send_db is not None:

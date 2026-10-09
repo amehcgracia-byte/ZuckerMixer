@@ -1,3 +1,9 @@
+## 2.8.9
+
+- Process the stems of each render chunk on up to four threads, then sum them in the original stem order. Exported audio is byte-identical to serial rendering; on a real 12-stem session a 5-minute exact render dropped from 48.6s to 36.0s (-26%). `ZUCKER_RENDER_STEM_WORKERS=1` restores serial processing.
+- The local server now serves only the app's own window: requests with a foreign Host header (DNS rebinding) or a cross-site Origin are rejected before any handler runs.
+- License the project under GPL-3.0. The macOS DMG now includes `LICENSE.txt` and a bilingual `LEEME PRIMERO - READ ME FIRST.txt` explaining how to open the app the first time macOS blocks it (System Settings → Privacy & Security → Open Anyway).
+
 ## 2.8.8
 
 - Preserve manual fader/gain confirmation in both live Fine Tune state and the persisted render snapshot. Previously the preview state overwrote the confirmation marker, causing Render to discard edited levels as untrusted legacy values.
@@ -21,10 +27,10 @@
 
 - Reuse filter coefficients by exact parameters, with independent writable copies and separate per-track DSP state.
 
-- Los controles de preescucha no cierran el vídeo de carga; al ocultarlo se pausa el audio.
-- Los datos de cada proyecto se migran con verificación a ZuckerMixer junto a las sesiones; renders nuevos usan su carpeta de proyecto como destino inicial.
-- El trabajador se detiene si desaparece la aplicación, incluso con escritura del estado bloqueada.
-- Las bibliotecas DSP se cargan al usarse; el actualizador elimina el respaldo antiguo tras confirmar el arranque correcto.
+- Preview listening controls no longer close the loading video; hiding it pauses the audio.
+- Each project's data is migrated, with verification, into a ZuckerMixer folder beside the sessions; new renders default to the project folder.
+- The worker stops if the application disappears, even when status writes are blocked.
+- DSP libraries load on first use; the updater removes the old backup after confirming a successful startup.
 
 - Reuse one independent FFmpeg loudness/true-peak measurement per exact file revision instead of rescanning unchanged exports. Invalidate on trims, rewrites and file replacements.
 - Reduce diagnostic-meter allocations while preserving float64 RMS accumulation and exact peaks.

@@ -60,3 +60,33 @@ def test_diagnostic_meter_preserves_peak_and_double_precision_rms(shape):
     assert meter['peak']==(float(np.max(np.abs(double))) if audio.size else 0.)
     assert meter['sumsq']==pytest.approx(float(np.sum(double*double)),rel=1e-12,abs=1e-12)
     assert meter['count']==audio.size
+
+
+def test_stem_pool_keeps_stem_order_for_sequential_mixing():
+    import threading, time
+    seen = []
+    def work(i):
+        time.sleep(0.02 * (5 - i))  # later stems finish first
+        seen.append(threading.current_thread().name)
+        return i
+    with p._StemPool(4) as pool:
+        assert list(pool.map(work, range(5))) == [0, 1, 2, 3, 4]
+    assert any(name.startswith('render-stem') for name in seen)
+    with p._StemPool(1) as pool:
+        assert list(pool.map(lambda i: i * 2, range(3))) == [0, 2, 4]
+
+
+def test_stem_pool_propagates_stem_errors():
+    def work(i):
+        if i == 2:
+            raise ValueError('bad stem')
+        return i
+    with pytest.raises(ValueError, match='bad stem'):
+        with p._StemPool(3) as pool:
+            list(pool.map(work, range(4)))
+
+
+@pytest.mark.parametrize('configured,stems,expected', [('1', 10, 1), ('8', 3, 3), ('junk', 10, 1), ('0', 10, 1)])
+def test_render_stem_workers_honours_override(monkeypatch, configured, stems, expected):
+    monkeypatch.setenv('ZUCKER_RENDER_STEM_WORKERS', configured)
+    assert p.render_stem_workers(stems) == expected

@@ -253,7 +253,7 @@ except Exception:
 draw.text((190, 55), "ZuckerMixer", fill="#f4ead7", font=title_font)
 lines = [
     "Drag the app to Applications.",
-    "First launch: right-click ZuckerMixer.app, then Open.",
+    "Blocked? System Settings > Privacy & Security > Open Anyway.",
     "If MP3 mixing says ffmpeg is missing:",
     "brew install ffmpeg",
 ]
@@ -297,7 +297,8 @@ fi
 rm -rf "$DMG_ROOT" "$DMG_PATH"
 mkdir -p "$DMG_ROOT"
 cp -R "$APP_BUNDLE" "$DMG_ROOT/${APP_NAME}.app" || die "Could not copy app into DMG staging folder"
-cp "$ROOT/README_Zucker_Mixer_App.md" "$DMG_ROOT/READ ME FIRST.txt" || die "Could not copy README into DMG"
+cp "$ROOT/README_Zucker_Mixer_App.md" "$DMG_ROOT/LEEME PRIMERO - READ ME FIRST.txt" || die "Could not copy README into DMG"
+cp "$ROOT/LICENSE" "$DMG_ROOT/LICENSE.txt" || die "Could not copy LICENSE into DMG"
 cp "$ICNS" "$DMG_ROOT/.VolumeIcon.icns" || die "Could not copy volume icon into DMG"
 mkdir -p "$DMG_ROOT/.background"
 cp "$DMG_BG" "$DMG_ROOT/.background/background.png" || die "Could not copy DMG background"
@@ -320,4 +321,4 @@ echo "  App bundle (project): $APP_BUNDLE"
 echo "  App copy: $APP_BUNDLE"
 echo "  DMG: $DMG_PATH"
 echo
-echo "Unsigned app note: on first launch, right-click ZuckerMixer.app and choose Open."
+echo "Unsigned app note: if macOS blocks the first launch, open System Settings > Privacy & Security > Open Anyway."
