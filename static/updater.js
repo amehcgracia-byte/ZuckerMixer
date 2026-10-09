@@ -52,7 +52,7 @@
         checking = false;
         if (state.status === 'available') { notice(`Update ${state.version} available`); offer(state); }
         else if (state.status === 'current') notice(manual ? 'You have the latest version.' : '');
-        else notice(manual ? 'Could not check for updates. Please try again later.' : '');
+        else notice(manual ? `Could not check for updates${state.error ? `: ${state.error}` : '.'} Please try again later.` : '');
       };
       poll().catch(failed);
     } catch (error) { failed(error); }

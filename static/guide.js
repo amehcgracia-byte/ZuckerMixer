@@ -23,11 +23,12 @@
     if (!response.ok) throw new Error(`guide ${response.status}`);
     return response.json();
   }
+  window.zuckerOpenGuide = () => load().then((guide) => show(guide.text)).catch(() => {});
   function start() {
     const button = document.querySelector('#openGuide');
     if (started || !button) return;
     started = true;
-    button.onclick = () => load().then((guide) => show(guide.text)).catch(() => {});
+    button.onclick = window.zuckerOpenGuide;
     load().then((guide) => { if (guide.unseen) showWhenFree(guide.text); }).catch(() => {});
   }
   document.addEventListener('DOMContentLoaded', start);

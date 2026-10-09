@@ -14,6 +14,7 @@ async function setup(guide, { otherDialogOpen = false } = {}) {
   const button = new Element('button'), body = new Element('body');
   const posts = []; const timers = []; let busy = otherDialogOpen;
   const context = {
+    window: {},
     fetch: async (url, options = {}) => {
       if (options.method === 'POST') { posts.push(url); return { ok: true, json: async () => ({}) }; }
       return { ok: true, json: async () => guide };

@@ -4,7 +4,9 @@ Starting with 2.8.2, the desktop bridge checks the public GitHub latest-release
 endpoint in the background at startup. The footer also offers a manual check.
 Drafts, prereleases, older/equal versions and incomplete releases are excluded.
 No GitHub account, access token or Homebrew is needed. The 2.8.1 package predates
-the updater and must be replaced manually once.
+the updater and must be replaced manually once. The 2.8.9 and 2.8.10 macOS
+packages shipped without a CA bundle and cannot reach GitHub; replace them
+manually once with 2.8.11 or later.
 
 A release must publish `ZuckerMixer-X.Y.Z.dmg`,
 `ZuckerMixer-X.Y.Z-Windows.zip`, and `SHA256SUMS.txt`. Download URLs are restricted
