@@ -1,142 +1,112 @@
-name: Build macOS DMG
-
+name: Build desktop packages
 on:
   push:
-    branches: [master]
+    branches: [master, 'consolidated-*']
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
-
+    inputs:
+      artifact_run:
+        description: Existing successful build run to attach to the draft release
+        required: false
+        type: string
 permissions:
   contents: read
-
 concurrency:
   group: zuckermixer-build-${{ github.ref }}
   cancel-in-progress: true
-
-
 jobs:
-  build-dmg:
-    name: Build ZuckerMixer DMG
+  test-suite:
+    if: inputs.artifact_run == ''
     runs-on: macos-15-intel
-
     steps:
-      - name: Checkout exact source
-        uses: actions/checkout@v4
-
-      - name: Read application version
-        id: version
-        shell: bash
-        run: |
-          version="$(tr -d '[:space:]' < VERSION)"
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Building ZuckerMixer $version from $GITHUB_SHA"
-
-      - name: Build application and versioned DMG
-        shell: bash
-        env:
-          ZUCKER_SOURCE_REVISION_OVERRIDE: ${{ github.sha }}
-        run: |
-          chmod +x build_app.sh
-          ./build_app.sh
-          DMG_PATH="dist/ZuckerMixer-${{ steps.version.outputs.version }}.dmg"
-          test -f "$DMG_PATH"
-          "dist/ZuckerMixer.app/Contents/MacOS/ZuckerMixer" --self-check
-          hdiutil imageinfo "$DMG_PATH" | grep -E 'image-variant|partition-partition' || true
-          VERIFY_MOUNT="$(mktemp -d)"
-          cleanup_verify_mount() {
-            hdiutil detach "$VERIFY_MOUNT" >/dev/null 2>&1 || true
-            rmdir "$VERIFY_MOUNT" >/dev/null 2>&1 || true
-          }
-          trap cleanup_verify_mount EXIT
-          hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$VERIFY_MOUNT" >/dev/null
-          DMG_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$VERIFY_MOUNT/ZuckerMixer.app/Contents/Info.plist" 2>/dev/null || true)"
-          test "$DMG_VERSION" = "${{ steps.version.outputs.version }}"
-          echo "Verified DMG bundle version: $DMG_VERSION"
-
-      - name: Upload versioned DMG
-        uses: actions/upload-artifact@v4
-        with:
-          name: ZuckerMixer-${{ steps.version.outputs.version }}
-          path: dist/ZuckerMixer-${{ steps.version.outputs.version }}.dmg
-          if-no-files-found: error
-          retention-days: 30
-
-  build-windows:
-    name: Build ZuckerMixer Windows EXE
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout exact source
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Read application version
-        id: version
-        shell: pwsh
-        run: |
-          $version = (Get-Content VERSION -Raw).Trim()
-          if ([string]::IsNullOrWhiteSpace($version)) { throw 'VERSION is empty' }
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "Building ZuckerMixer $version from $env:GITHUB_SHA"
-
-      - name: Install Windows build dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyinstaller pywebview Flask numpy scipy soundfile pyloudnorm pillow cffi
-          python -m pip install "numba==0.60.0" "llvmlite==0.43.0" matchering
-
-      - name: Build Windows executable
-        shell: pwsh
+      - run: python -m pip install -r requirements_app.txt -r requirements_whisper.txt pytest
+      - run: python -m pytest -q
+      - run: node test_state_loading.js && node test_render_messages.js && node test_split_time.js && node test_preview_source_gain.js && node test_fader_auto_level.js && node test_fine_tune_render_snapshot.js && node test_vocal_expander.js && node test_preview_normalization.js && node test_preview_gate.js && node test_updater.js && node test_render_listening.js && node test_loading_overlay_dismiss.js && node test_cancel_ui.js && node test_guide.js
+  build-dmg:
+    needs: test-suite
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and verify macOS
         env:
           ZUCKER_SOURCE_REVISION_OVERRIDE: ${{ github.sha }}
         run: |
-          $version = "${{ steps.version.outputs.version }}"
-          New-Item -ItemType Directory -Force -Path build | Out-Null
-          $metadata = @{
-            app_version = $version
-            build_timestamp = (Get-Date).ToUniversalTime().ToString('o')
-            source_revision = $env:ZUCKER_SOURCE_REVISION_OVERRIDE
-          } | ConvertTo-Json
-          $metadata | Set-Content -Path build/build_metadata.json -Encoding utf8
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name ZuckerMixer `
-            --add-data 'templates;templates' `
-            --add-data 'static;static' `
-            --add-data 'build/build_metadata.json;build' `
-            --add-data 'whisper_transcribe.py;.' `
-            --add-data 'jam_app.py;.' `
-            --add-data 'jam_mix_pipeline.py;.' `
-            --hidden-import flask `
-            --hidden-import werkzeug `
-            --hidden-import webview `
-            --hidden-import numpy `
-            --hidden-import scipy `
-            --hidden-import scipy.signal `
-            --hidden-import scipy.ndimage `
-            --hidden-import soundfile `
-            --hidden-import pyloudnorm `
-            --hidden-import cffi `
-            --hidden-import _cffi_backend `
-            --hidden-import jam_app `
-            --hidden-import jam_mix_pipeline `
-            mac_app.py
-          if (-not (Test-Path dist/ZuckerMixer.exe)) { throw 'ZuckerMixer.exe was not created' }
-          & "$PWD/dist/ZuckerMixer.exe" --self-check
-          if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows self-check failed' }
-          New-Item -ItemType Directory -Force -Path dist/package | Out-Null
-          Copy-Item dist/ZuckerMixer.exe dist/package/ZuckerMixer.exe -Force
-          "ZuckerMixer $version" | Set-Content dist/package/VERSION.txt -Encoding utf8
-          Compress-Archive -Path dist/package/* -DestinationPath "dist/ZuckerMixer-$version-Windows.zip" -Force
-          if (-not (Test-Path "dist/ZuckerMixer-$version-Windows.zip")) { throw 'Windows ZIP was not created' }
-
-      - name: Upload Windows executable
-        uses: actions/upload-artifact@v4
+          ./build_app.sh
+          dist/ZuckerMixer.app/Contents/MacOS/ZuckerMixer --update-helper --self-check
+          dist/ZuckerMixer.app/Contents/MacOS/ZuckerMixer --self-check
+          codesign --verify --deep --strict dist/ZuckerMixer.app
+      - uses: actions/upload-artifact@v4
         with:
-          name: ZuckerMixer-${{ steps.version.outputs.version }}-Windows
-          path: dist/ZuckerMixer-${{ steps.version.outputs.version }}-Windows.zip
+          name: ZuckerMixer-macOS
+          path: dist/ZuckerMixer-*.dmg
           if-no-files-found: error
-          retention-days: 30
+  build-windows:
+    needs: test-suite
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and verify Windows
+        shell: pwsh
+        env:
+          ZUCKER_SOURCE_REVISION_OVERRIDE: ${{ github.sha }}
+        run: ./build_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZuckerMixer-Windows
+          path: dist/ZuckerMixer-*-Windows.zip
+          if-no-files-found: error
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-dmg, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Prepare draft with packages and source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git archive --format=zip --prefix=ZuckerMixer/ -o release/ZuckerMixer-${GITHUB_REF_NAME}-source.zip HEAD
+          cd release
+          sha256sum *.dmg *.zip > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "ZuckerMixer $GITHUB_REF_NAME" --notes-file ../CHANGELOG.md ./*
+
+  attach-draft:
+    if: github.event_name == 'workflow_dispatch' && inputs.artifact_run != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.artifact_run }}
+          github-token: ${{ github.token }}
+          path: release
+          merge-multiple: true
+      - name: Attach verified packages, source and checksums to existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(cat VERSION | tr -d '[:space:]')"
+          git archive --format=zip --prefix=ZuckerMixer/ -o "release/ZuckerMixer-$VERSION-source.zip" HEAD
+          cd release
+          sha256sum *.dmg *.zip > SHA256SUMS.txt
+          gh release upload "v$VERSION" --repo "$GITHUB_REPOSITORY" --clobber ./*

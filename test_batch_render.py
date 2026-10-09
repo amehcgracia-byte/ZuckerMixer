@@ -57,7 +57,7 @@ def test_out_of_range_windows_remain_visible_and_renderable_with_warning():
     assert '"render_valid"' in source
     assert 'if not song.get("skipped")' in source
     assert "return visibleSongs();" in frontend
-    assert "needs review" in frontend
+    assert "needs review" in frontend.lower()
 
 
 def test_render_all_exposes_stall_diagnostics_and_keeps_source_stems():

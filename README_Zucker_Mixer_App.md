@@ -1,46 +1,57 @@
-# Zucker Mixer
+ZUCKER MIXER — READ ME FIRST
+============================
 
-Zucker Mixer is a local macOS app for mixing the ZuckerSession jam recordings.
+1. INSTALL
+   Drag ZuckerMixer.app into the Applications folder.
 
-## Install
+2. THE FIRST TIME, macOS WILL BLOCK IT (THIS IS EXPECTED)
+   You will see a warning like:
+   "ZuckerMixer Not Opened. Apple could not verify ZuckerMixer is free
+   of malware..."
 
-Drag `Zucker Mixer.app` into the `Applications` folder.
+   This is not a virus or a bug. Zucker Mixer is free and we have not
+   paid Apple's developer fee (99 USD/year), so Apple has not
+   "notarized" it. Your recordings never leave your computer. The app
+   only goes online to check GitHub for updates and, the first time it
+   detects songs, to download the Whisper speech model.
 
-## First Launch
+   To open it (only needed once):
+     a) In the warning, click "Done" (NOT "Move to Trash").
+     b) Open  System Settings  >  Privacy & Security.
+     c) Scroll down to "Security". You will see:
+        "ZuckerMixer was blocked to protect your Mac."
+     d) Click  "Open Anyway"  and enter your Mac password.
+     e) In the final prompt, click "Open Anyway" again.
 
-This app is unsigned. The first time you open it, macOS Gatekeeper may block a normal double-click.
+   After that it opens normally with a double-click.
+   Automatic updates do not require this step again.
 
-Use:
+   On macOS 14 (Sonoma) or earlier you can also:
+   right-click ZuckerMixer.app  >  Open  >  Open.
 
-1. Right-click `Zucker Mixer.app`
-2. Choose `Open`
-3. Confirm `Open`
+   Plan B (Terminal), if the option above does not appear:
+     xattr -dr com.apple.quarantine /Applications/ZuckerMixer.app
 
-After that, it opens normally.
+3. APPLE SILICON MACS (M1, M2, M3...)
+   If macOS asks to install Rosetta, accept. The app is built for Intel
+   and Rosetta runs it on these Macs.
 
-## ffmpeg
+4. FFMPEG (needed to create MP3 files)
+   If the app says ffmpeg is missing, install it in Terminal:
+     brew install ffmpeg
 
-Zucker Mixer needs `ffmpeg` to make MP3 files. If the app says ffmpeg is missing, install it in Terminal:
+5. WINDOWS
+   Extract the whole ZIP and run ZuckerMixer\ZuckerMixer.exe; keep the
+   _internal folder next to it. If Windows shows "Windows protected your
+   PC", click "More info" and then "Run anyway". The Windows package
+   already includes ffmpeg.
 
-```bash
-brew install ffmpeg
-```
+6. YOUR FILES
+   Everything stays on your computer. Settings and diagnostic reports:
+     ~/Music/JamMixes/ZuckerMixerState
 
-## Local Files
+You can open this guide again at any time with "Read me first" at the
+bottom of the ZuckerMixer window.
 
-Everything stays on this Mac.
-
-The app reads stems from:
-
-```text
-Choose the stem folder with the app's **Change source folder** control. The
-selection is remembered in `app_settings.json`.
-```
-
-Mixes and app settings are stored under:
-
-```text
-~/Music/JamMixes
-```
-
-No cloud services, accounts, or uploads are used.
+Zucker Mixer is free software licensed under the GNU GPL v3.0
+(see LICENSE.txt). Copyright (C) 2026 José Manuel García.

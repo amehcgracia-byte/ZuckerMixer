@@ -14,7 +14,7 @@ class StemLabelTest(unittest.TestCase):
         cases = {
             "2016072026(01_00_00 - 10_59_02)BDJAM.tracks": "kick",
             "2016072026(01_00_00 - 10_59_02)SnareJAM.tracks": "snare",
-            "2016072026(01_00_00 - 10_59_02)OVJAM.tracks": "drums",
+            "2016072026(01_00_00 - 10_59_02)OVJAM.tracks": "overhead",
             "2016072026(01_00_00 - 10_59_02)BassJAM.tracks": "bass",
             "2016072026(01_00_00 - 10_59_02)GuitJAM.tracks": "guitar",
             "2016072026(01_00_00 - 10_59_02)Keys JAM.tracks": "keys",

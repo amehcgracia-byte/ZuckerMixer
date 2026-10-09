@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+import sys
 from pathlib import Path
 
 block_cipher = None
@@ -9,12 +10,15 @@ ROOT = Path.cwd()
 a = Analysis(
     ["mac_app.py"],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=[(os.environ["ZUCKER_FFMPEG_BINARY"], ".")] if os.environ.get("ZUCKER_FFMPEG_BINARY") else [],
     datas=[
         ("templates", "templates"),
+        ("build/third-party-licenses", "third-party-licenses"),
         ("static", "static"),
         ("build/build_metadata.json", "build"),
         ("whisper_transcribe.py", "."),
+        ("update_helper.py", "."),
+        ("README_Zucker_Mixer_App.md", "."),
         ("jam_app.py", "."),
         ("jam_mix_pipeline.py", "."),
     ],
@@ -28,10 +32,18 @@ a = Analysis(
         "scipy.ndimage",
         "soundfile",
         "pyloudnorm",
+        "matchering",
+        "numba",
+        "llvmlite",
         "cffi",
         "_cffi_backend",
         "jam_app",
+        "update_manager",
+        "update_helper",
         "jam_mix_pipeline",
+        "faster_whisper",
+        "ctranslate2",
+        "tokenizers",
     ],
     hookspath=[],
     hooksconfig={},
@@ -55,7 +67,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,
+    console=os.environ.get("ZUCKER_BUILD_CONSOLE") == "1",
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -74,22 +86,23 @@ coll = COLLECT(
     name="ZuckerMixer",
 )
 
-app = BUNDLE(
-    coll,
-    name="ZuckerMixer.app",
-    icon="zucker.icns",
-    bundle_identifier="local.zuckersessions.zuckermixer",
-    info_plist={
-        "CFBundleDisplayName": "ZuckerMixer",
-        "CFBundleName": "ZuckerMixer",
-        "CFBundleShortVersionString": os.environ.get("ZUCKER_APP_VERSION", "development"),
-        "CFBundleVersion": os.environ.get("ZUCKER_APP_VERSION", "development"),
-        "CFBundleGetInfoString": "ZuckerMixer — Built by JM.G (José Manuel García)",
-        "NSHumanReadableCopyright": "© José Manuel García (JM.G). Built by JM.G.",
-        "Author": "José Manuel García (JM.G)",
-        "NSHighResolutionCapable": "True",
-        "LSMinimumSystemVersion": "11.0",
-        "ZuckerBuildTimestamp": os.environ.get("ZUCKER_BUILD_TIMESTAMP", "development build"),
-        "ZuckerSourceRevision": os.environ.get("ZUCKER_SOURCE_REVISION", "unbuilt"),
-    },
-)
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="ZuckerMixer.app",
+        icon="zucker.icns",
+        bundle_identifier="local.zuckersessions.zuckermixer",
+        info_plist={
+            "CFBundleDisplayName": "ZuckerMixer",
+            "CFBundleName": "ZuckerMixer",
+            "CFBundleShortVersionString": os.environ.get("ZUCKER_APP_VERSION", "development"),
+            "CFBundleVersion": os.environ.get("ZUCKER_APP_VERSION", "development"),
+            "CFBundleGetInfoString": "ZuckerMixer — Built by JM.G (José Manuel García)",
+            "NSHumanReadableCopyright": "© José Manuel García (JM.G). Built by JM.G.",
+            "Author": "José Manuel García (JM.G)",
+            "NSHighResolutionCapable": "True",
+            "LSMinimumSystemVersion": "11.0",
+            "ZuckerBuildTimestamp": os.environ.get("ZUCKER_BUILD_TIMESTAMP", "development build"),
+            "ZuckerSourceRevision": os.environ.get("ZUCKER_SOURCE_REVISION", "unbuilt"),
+        },
+    )

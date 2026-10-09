@@ -4,13 +4,12 @@ import jam_mix_pipeline as pipeline
 
 
 class MixInvariantTest(unittest.TestCase):
-    def test_guitar_keys_are_opposite_and_synth_is_centered(self):
-        self.assertLess(pipeline.pan_for_role("guitar", "Guit"), 0)
-        self.assertGreater(pipeline.pan_for_role("keys", "Keys"), 0)
-        self.assertEqual(pipeline.pan_for_role("synth", "Synth"), 0.0)
-        self.assertEqual(pipeline.enforced_pan("guitar", "Guit", 0.8), -0.35)
-        self.assertEqual(pipeline.enforced_pan("keys", "Keys", -0.8), 0.35)
-        self.assertEqual(pipeline.enforced_pan("synth", "Synth", 0.8), 0.0)
+    def test_automatic_pan_assignments_are_stable_across_user_overrides(self):
+        for role, expected in [("guitar", 0.25), ("keys", 0.35), ("synth", 0.15)]:
+            with self.subTest(role=role):
+                self.assertEqual(pipeline.pan_for_role(role, role), expected)
+                self.assertEqual(pipeline.enforced_pan(role, role, -0.8), expected)
+                self.assertEqual(pipeline.enforced_pan(role, role, 0.8), expected)
 
     def test_pre_session_content_gets_song_zero(self):
         segments = [

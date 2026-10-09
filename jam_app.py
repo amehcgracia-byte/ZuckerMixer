@@ -10,7 +10,10 @@ import mimetypes
 import os
 import queue
 import re
-import resource
+try:
+    import resource
+except ImportError:  # Windows has no POSIX resource module.
+    resource = None
 import shutil
 import subprocess
 import sys
@@ -20,23 +23,39 @@ import time
 import traceback
 import webbrowser
 import signal
+import struct
+from functools import wraps
+from collections import OrderedDict
+from dsp_imports import signal as audio_signal
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import soundfile as sf
-from flask import Flask, Response, jsonify, render_template, request, send_file
+from flask import Flask, Response, g, jsonify, render_template, request, send_file
 from werkzeug.serving import make_server
 
 import jam_mix_pipeline as pipeline
 
 
+source_edit_lock = threading.RLock()
+
+
+def source_edit_locked(function):
+    @wraps(function)
+    def serialized(*args, **kwargs):
+        with source_edit_lock:
+            return function(*args, **kwargs)
+    return serialized
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT))
-STATE_ROOT = Path.home() / "Music" / "JamMixes" / "ZuckerMixerState"
+STATE_ROOT = Path(os.environ.get("ZUCKER_MIXER_STATE_ROOT", str(Path.home() / "Music" / "JamMixes" / "ZuckerMixerState"))).expanduser().resolve()
 STATE_ROOT.mkdir(parents=True, exist_ok=True)
-ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "sources" / "default"
+ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "runtime" / "default"
 ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
 OVERRIDES_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_overrides.json"
 HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
@@ -48,6 +67,7 @@ MIX_PLANS_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_plans.json"
 SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
 DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
 EDITOR_HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "editor_history.json"
+MANUAL_EDITOR_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_editor_state.json"
 REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
 REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
 SECOND_PASS_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "whisper_second_pass_candidate.json"
@@ -305,6 +325,103 @@ def load_build_metadata() -> dict[str, str]:
 BUILD_METADATA = load_build_metadata()
 
 
+reference_backend_thread: threading.Thread | None = None
+reference_backend_lock = threading.Lock()
+
+
+def reference_mastering_status(settings: dict[str, Any]) -> dict[str, Any]:
+    global reference_backend_thread
+    reference = settings.get("matchering_reference", "")
+    if reference and pipeline.matchering_api is None and not pipeline.MATCHERING_IMPORT_ERROR:
+        with reference_backend_lock:
+            if reference_backend_thread is None:
+                reference_backend_thread = threading.Thread(target=pipeline.ensure_matchering_available, daemon=True, name="reference-backend-load")
+                reference_backend_thread.start()
+    loading = bool(reference_backend_thread and reference_backend_thread.is_alive())
+    return {"available": pipeline.matchering_api is not None, "loading": loading, "import_error": pipeline.MATCHERING_IMPORT_ERROR, "reference": reference}
+
+
+request_timings: dict[str, list[float]] = {}
+request_timings_lock = threading.Lock()
+
+
+@app.before_request
+def start_request_timer() -> None:
+    g.request_started = time.perf_counter()
+
+
+LOCAL_REQUEST_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
+
+def _local_hostname(value: str) -> str:
+    value = value.strip().lower()
+    if value.startswith("["):
+        return value[: value.find("]") + 1] if "]" in value else value
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+@app.before_request
+def reject_non_local_requests() -> Response | None:
+    """Serve only the app's own window.
+
+    The server listens on loopback, but a web page open in any browser can
+    still reach it: DNS rebinding arrives with a foreign Host header, and a
+    cross-site POST carries the page's Origin. Neither is the desktop window.
+    """
+    if _local_hostname(request.host or "") not in LOCAL_REQUEST_HOSTS:
+        return Response("Forbidden host", status=403)
+    origin = request.headers.get("Origin")
+    if origin is not None:
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"} or _local_hostname(parsed.netloc) not in LOCAL_REQUEST_HOSTS:
+            return Response("Forbidden origin", status=403)
+    return None
+
+
+@app.after_request
+def finish_request_timer(response: Response) -> Response:
+    duration = (time.perf_counter() - g.request_started) * 1000
+    response.headers["Server-Timing"] = f"app;dur={duration:.2f}"
+    if request.path.startswith("/api/"):
+        key = request.url_rule.rule if request.url_rule else request.path
+        with request_timings_lock:
+            values = request_timings.setdefault(key, [])
+            values.append(round(duration, 2))
+            del values[:-100]
+    return response
+
+
+GUIDE_PATH = RESOURCE_ROOT / "README_Zucker_Mixer_App.md"
+GUIDE_SEEN_PATH = STATE_ROOT / "guide_seen.json"
+
+
+@app.get("/api/guide")
+def api_guide() -> Response:
+    # The DMG carries this guide, but in-app updates never show the DMG, so
+    # the app opens it once for each newly installed version.
+    version = BUILD_METADATA["app_version"]
+    try:
+        text = GUIDE_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return jsonify({"text": "", "version": version, "unseen": False})
+    seen = load_json(GUIDE_SEEN_PATH, {})
+    seen_version = seen.get("version") if isinstance(seen, dict) else None
+    return jsonify({"text": text, "version": version, "unseen": seen_version != version})
+
+
+@app.post("/api/guide/seen")
+def api_guide_seen() -> Response:
+    version = BUILD_METADATA["app_version"]
+    save_json_atomic(GUIDE_SEEN_PATH, {"version": version, "seen_at": time.time()})
+    return jsonify({"version": version})
+
+
+@app.get("/api/performance")
+def api_performance() -> Response:
+    with request_timings_lock:
+        return jsonify({key: {"requests": len(values), "last_ms": values[-1], "mean_ms": round(sum(values) / len(values), 2), "max_ms": max(values)} for key, values in request_timings.items() if values})
+
+
 def runtime_build_metadata() -> dict[str, str]:
     """Identify the exact frozen resources serving the current WebView."""
     payload = dict(BUILD_METADATA)
@@ -362,17 +479,20 @@ def active_stems_for_segment(stems: list[pipeline.Stem], segment: pipeline.Segme
     return [stem.path.name for stem in stems]
 
 
-MIX_PLAN_VERSION = 4
+MIX_PLAN_VERSION = 13
 
 
 def mix_plan_signature(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any]) -> str:
+    identity = detection_state_signature()
     payload = {
         "version": MIX_PLAN_VERSION,
         "song_id": int(segment_id),
         "start_sec": round(float(segment.start), 6),
         "end_sec": round(float(segment.end), 6),
         "overrides": song_overrides,
-        "dsp_revision": BUILD_METADATA.get("source_revision", "development"),
+        "dsp_revision": MIX_PLAN_VERSION,
+        "source_identity": (identity[0], identity[2]),
+        "source_config": load_source_config(),
         "auto_mix_profile": getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -404,7 +524,25 @@ def load_mix_plan(
     if entry.get("signature") != expected:
         return None
     plan = entry.get("plan")
-    return plan if isinstance(plan, dict) else None
+    if isinstance(plan, dict):
+        try:
+            analysis = pipeline.load_analysis_cache(Path(str(plan["analysis_cache_path"])))
+            segment = state["segments"][segment_id - 1]
+            if int(analysis.get("version", 0)) != 2 or analysis.get("input_signature") != mix_plan_signature(segment_id, segment, {}):
+                return None
+            pipeline.analysis_window_offset(analysis, segment, segment_id)
+        except Exception:
+            # Missing/stale/corrupt derived caches are rebuilt before mixing;
+            # original WAVs and the saved human timeline remain authoritative.
+            return None
+        profile = plan.get("auto_mix_balance", {}).get("effect_profile", {})
+        if not profile:
+            profile = pipeline.per_song_effect_profile({name: params.get("role", "") for name, params in plan.get("stems", {}).items()}, {}, 0.0, 0.0, {})
+        for name, params in plan.get("stems", {}).items():
+            if isinstance(params, dict):
+                params.update(pipeline.resolved_effect_settings(song_overrides.get("stems", {}).get(name, {}), str(params.get("role", "")), profile))
+        return plan
+    return None
 
 
 def save_mix_plan(segment_id: int, segment: pipeline.Segment, song_overrides: dict[str, Any], plan: dict[str, Any]) -> None:
@@ -421,6 +559,7 @@ def save_mix_plan(segment_id: int, segment: pipeline.Segment, song_overrides: di
     save_json_atomic(MIX_PLANS_PATH, payload)
 
 
+@source_edit_locked
 def load_render_state() -> dict[str, Any]:
     """Load Analyze output for a worker without running detection again."""
     settings = load_settings()
@@ -430,9 +569,8 @@ def load_render_state() -> dict[str, Any]:
     if not isinstance(snapshot, dict):
         raise RuntimeError("Analyze required: no current detection snapshot exists for this source.")
     segments = list(snapshot.get("segments", []))
-    # Manual Select Cuts is authoritative and is applied to the persisted
-    # detection state without invoking Whisper, thresholds, or stem scans.
-    snapshot["segments"] = apply_saved_segment_selections(segments)
+    # Select Cuts already persists the exact editor segments in this snapshot.
+    # Reapplying older ordinal-only selections can move newer confirmed cuts.
     return snapshot
 
 
@@ -468,17 +606,69 @@ def persisted_fader_values(stem_ov: dict[str, Any]) -> tuple[float, float, bool]
     return (raw if trusted else 0.0, raw if not trusted else 0.0, trusted)
 
 
-def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
-    state = ensure_pipeline_state()
+analysis_snapshot_lock = threading.RLock()
+analysis_snapshot_memory = OrderedDict()
+
+
+def song_analysis_snapshot(state: dict, segment: pipeline.Segment, segment_id: int) -> dict:
+    signature = mix_plan_signature(segment_id, segment, {})
+    path = ACTIVE_SOURCE_STATE_ROOT / f"song_analysis_{segment_id}_{signature}.npz"
+    with analysis_snapshot_lock:
+        if path.is_file():
+            metadata = path.stat()
+            memory_key = (str(path), metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+            if memory_key in analysis_snapshot_memory:
+                analysis_snapshot_memory.move_to_end(memory_key)
+                return analysis_snapshot_memory[memory_key]
+            try:
+                cached = pipeline.load_analysis_cache(path)
+            except Exception:
+                cached = None
+            if isinstance(cached, dict) and cached.get("input_signature") == signature:
+                analysis_snapshot_memory[memory_key] = cached
+                while len(analysis_snapshot_memory) > 4:
+                    analysis_snapshot_memory.popitem(last=False)
+                return cached
+        sr = state["stems"][0].samplerate
+        chunks = max(1, math.ceil(segment.duration / pipeline.RENDER_CHUNK_SECONDS))
+        def scan_progress(update):
+            ratio = min(1.0, (((int(update["chunk_index"]) - 1) * len(state["stems"])) + int(update["stem_index"])) / max(1, chunks * len(state["stems"])))
+            app_progress({"current_stage": "analyzing", "song_progress": round(ratio * 15), "heartbeat": time.time(),
+                "stage_detail": f"Analyzing this song: {update['stem']} ({update['stem_index']}/{len(state['stems'])}), block {update['chunk_index']}/{chunks}"})
+        rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr, progress_callback=scan_progress)
+        app_progress({"current_stage": "analyzing", "song_progress": 15, "heartbeat": time.time(), "stage_detail": "Preparing this song’s balance, gates and effects"})
+        role_norms_db = pipeline.role_norms_from_detection_cache(state["stems"])
+        mix_controls = pipeline.analyze_song_mix_controls(state["stems"], segment, sr, rms_values_db, role_norms_db, active_levels_db={name: pipeline.active_level_db(rms_values_db.get(name, -120.0), env) for name, env in segment_envelopes.items()}, segment_envelopes=segment_envelopes)
+        result = {
+            "version": 2, "song_id": int(segment_id), "input_signature": signature,
+            "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
+            "rms_values_db": rms_values_db, "energies": energies, "has_audio": has_audio,
+            "dynamic_spread_db": dynamic_spread_db, "segment_envelopes": segment_envelopes,
+            "segment_peaks_db": segment_peaks, "role_norms_db": role_norms_db, "mix_controls": mix_controls,
+            "mix_profile_version": getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1),
+            "noise_diagnostics": pipeline.classify_noise_stems(state["stems"], segment, sr),
+            "flattening": pipeline.build_per_song_flattening(segment_envelopes),
+            "drum_bpm": pipeline.estimate_segment_drum_bpm(state["stems"], segment, sr),
+        }
+        pipeline.save_analysis_cache(path, result)
+        return result
+
+
+def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | None = None, overrides_snapshot: dict | None = None) -> dict[str, Any]:
+    state = state_snapshot if isinstance(state_snapshot, dict) else ensure_pipeline_state()
     if segment_id < 1 or segment_id > len(state["segments"]):
         raise IndexError("song not found")
     if state.get("active_stems_detection_version") != ACTIVE_STEM_DETECTION_VERSION:
         state["active_stems_by_song"] = {}
         state["active_stems_detection_version"] = ACTIVE_STEM_DETECTION_VERSION
+    current_plan = load_mix_plan(segment_id, state_snapshot=state, overrides_snapshot=overrides_snapshot)
+    if isinstance(current_plan, dict):
+        state.setdefault("active_stems_by_song", {})[str(segment_id)] = current_plan["active_stems"]
+        return current_plan
     cache = state.setdefault("active_stems_by_song", {})
     key = str(segment_id)
     active_files: set[str] = set()
-    overrides = normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}}))
+    overrides = normalize_overrides(overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}}))
     songs_payload = overrides.setdefault("songs", {})
     stale_song_ids = []
     for raw_id in list(songs_payload):
@@ -493,7 +683,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         print(f"STALE OVERRIDES DROPPED: source={pipeline.SOURCE_DIR} song_ids={stale_song_ids}", flush=True)
         append_log("system", f"Ignored stale per-song overrides after re-detection: {', '.join(stale_song_ids)}")
         overrides["_write_trace"] = override_write_trace(overrides)
-        save_json(OVERRIDES_PATH, overrides)
+        if overrides_snapshot is None:
+            save_json(OVERRIDES_PATH, overrides)
     song_overrides = songs_payload.setdefault(str(segment_id), {})
     changed = False
     stems_overrides = song_overrides.get("stems", {}) if isinstance(song_overrides, dict) else {}
@@ -504,20 +695,15 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     segment = state["segments"][segment_id - 1]
     musician_labels = dict(segment.musician_labels)
     sr = state["stems"][0].samplerate
-    rms_values_db, energies, has_audio, dynamic_spread_db, segment_envelopes, segment_peaks = pipeline.scan_segment_activity(state["stems"], segment, sr)
-    role_norms_db = pipeline.role_norms_from_detection_cache(state["stems"])
-    mix_controls = pipeline.analyze_song_mix_controls(
-        state["stems"],
-        segment,
-        sr,
-        rms_values_db,
-        role_norms_db,
-        active_levels_db={
-            name: pipeline.active_level_db(rms_values_db.get(name, -120.0), segment_envelopes.get(name))
-            for name in segment_envelopes
-        },
-        segment_envelopes=segment_envelopes,
-    )
+    analysis_cache = song_analysis_snapshot(state, segment, segment_id)
+    rms_values_db = analysis_cache["rms_values_db"]
+    energies = analysis_cache["energies"]
+    has_audio = analysis_cache["has_audio"]
+    dynamic_spread_db = analysis_cache["dynamic_spread_db"]
+    segment_envelopes = analysis_cache["segment_envelopes"]
+    segment_peaks = analysis_cache["segment_peaks_db"]
+    role_norms_db = analysis_cache["role_norms_db"]
+    mix_controls = analysis_cache["mix_controls"]
     effective_roles = mix_controls["effective_roles"]
     rhythm_controls = mix_controls["rhythm"]
     vocal_priority = mix_controls["vocal_priority"]
@@ -526,10 +712,16 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     role_corrections = role_balance.get("role_corrections_db", {}) if isinstance(role_balance, dict) else {}
     vocal_pair_corrections = role_balance.get("vocal_pair_corrections_db", {}) if isinstance(role_balance, dict) else {}
     role_balance_reasons = role_balance.get("role_reasons", {}) if isinstance(role_balance, dict) else {}
+    vocal_pair_diagnostics = role_balance.get("vocal_pair_diagnostics", {}) if isinstance(role_balance, dict) else {}
+    automatic_mix_profile = mix_controls.get("automatic_mix_profile", {}) if isinstance(mix_controls, dict) else {}
+    effect_profile = mix_controls.get("effect_profile", {}) if isinstance(mix_controls, dict) else {}
+    effect_space_roles = effect_profile.get("role_space_enabled", {}) if isinstance(effect_profile, dict) else {}
+    effect_echo_roles = effect_profile.get("role_echo_enabled", {}) if isinstance(effect_profile, dict) else {}
+    effect_role_offsets = effect_profile.get("role_offsets_db", {}) if isinstance(effect_profile, dict) else {}
     loudest_db = max(rms_values_db.values()) if rms_values_db else -120.0
-    # All successfully decoded stems enter every song plan. Explicit mute and
-    # solo overrides are applied later; low energy must not hide a track.
-    active_names = {stem.path.name for stem in state["stems"]}
+    # Preview and export must exclude the same empty/noisy inputs.
+    excluded_noise = pipeline.empty_noise_stem_names(analysis_cache)
+    active_names = {stem.path.name for stem in state["stems"] if stem.path.name not in excluded_noise}
     active_files = set(active_names)
     cache[key] = sorted(active_files)
     active_energies = [energies[name] for name in active_names]
@@ -547,22 +739,6 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     # The expensive Analyze-only products are persisted as one immutable
     # per-song snapshot. Render consumes this snapshot and never recomputes
     # thresholds, Whisper, activity, or Auto-Mix from the source files.
-    analysis_cache = {
-        "version": 2,
-        "song_id": int(segment_id),
-        "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
-        "rms_values_db": rms_values_db,
-        "energies": energies,
-        "has_audio": has_audio,
-        "dynamic_spread_db": dynamic_spread_db,
-        "segment_envelopes": segment_envelopes,
-        "segment_peaks_db": segment_peaks,
-        "role_norms_db": role_norms_db,
-        "mix_controls": mix_controls,
-        "noise_diagnostics": pipeline.classify_noise_stems(state["stems"], segment, sr),
-        "flattening": pipeline.build_per_song_flattening(segment_envelopes),
-        "drum_bpm": pipeline.estimate_segment_drum_bpm(state["stems"], segment, sr),
-    }
     initialized_makeup_names: set[str] = set()
     solo_files = {
         stem.path.name
@@ -597,6 +773,8 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             pipeline.AUTO_MIX_MAX_ATTENUATION_DB,
             pipeline.AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, pipeline.AUTO_MIX_MAX_BOOST_DB),
         ))
+        computed_gain_db = float(mix_controls.get("rhythm_harmonic_balance", {}).get("gains_db", {}).get(stem.path.name, computed_gain_db))
+        computed_gain_db = pipeline.automatic_drum_peak_guard_gain_db(mix_role, computed_gain_db, segment_peaks.get(stem.path.name, -120.0))
         lead_bonus = 1.5 if energies.get(stem.path.name, 0.0) > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
         if "makeup_gain_db" not in stem_ov and "gain_db" in stem_ov and fader_trusted:
             stem_ov["makeup_gain_db"] = user_gain_db
@@ -625,9 +803,28 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         if "solo" not in stem_ov:
             stem_ov["solo"] = False
             changed = True
-        for effect_key in ("gate_enabled", "space_enabled", "echo_enabled"):
-            if effect_key not in stem_ov:
-                stem_ov[effect_key] = False
+        resolved_gate = pipeline.resolved_instrument_gate(stem_ov, mix_role, analysis_cache.get("noise_diagnostics", {}).get(stem.path.name, {}))
+        if stem_ov.get("gate_enabled") != resolved_gate:
+            stem_ov["gate_enabled"] = resolved_gate
+            changed = True
+        # Automatic effects are content-aware by song. Once the user toggles
+        # an effect in the editor, the explicit marker keeps that choice.
+        effects_user_confirmed = bool(stem_ov.get("effects_user_confirmed", False))
+        if not effects_user_confirmed:
+            auto_space = bool(effect_space_roles.get(mix_role, False))
+            auto_echo = bool(effect_echo_roles.get(mix_role, False))
+            if stem_ov.get("space_enabled") != auto_space:
+                stem_ov["space_enabled"] = auto_space
+                changed = True
+            if stem_ov.get("echo_enabled") != auto_echo:
+                stem_ov["echo_enabled"] = auto_echo
+                changed = True
+        else:
+            if "space_enabled" not in stem_ov:
+                stem_ov["space_enabled"] = False
+                changed = True
+            if "echo_enabled" not in stem_ov:
+                stem_ov["echo_enabled"] = False
                 changed = True
         if "pan" not in stem_ov:
             stem_ov["pan"] = pipeline.enforced_pan(stem.role, stem.name)
@@ -650,6 +847,9 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         solo = bool(stem_ov.get("solo", False))
         base_reverb = pipeline.reverb_send_level_db(mix_role)
         base_delay = pipeline.delay_send_level_db(mix_role, lead_bonus)
+        effect_offsets = effect_role_offsets.get(mix_role, {}) if isinstance(effect_role_offsets, dict) else {}
+        reverb_scene_offset_db = float(effect_offsets.get("reverb_db", 0.0) or 0.0)
+        delay_scene_offset_db = float(effect_offsets.get("delay_db", 0.0) or 0.0)
         stem_params[stem.path.name] = {
             "file": stem.path.name,
             "label": f"{musician_labels.get(stem.role)} — {stem_display_label(stem)}" if musician_labels.get(stem.role) else stem_display_label(stem),
@@ -677,7 +877,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "computed_gain_db": computed_gain_db,
             "active_level_db": active_level,
             "accompaniment_reference_db": accompaniment_reference_db,
-            "automatic_gain_reason": "per-song active-envelope balance",
+            "automatic_gain_reason": "per-song kit and guitar balance" if stem.path.name in mix_controls.get("rhythm_harmonic_balance", {}).get("gains_db", {}) else "per-song active-envelope balance",
             "automatic_fader_db": computed_gain_db,
             "automatic_gain_before_vocal_mic_lift_db": computed_gain_before_lift_db,
             "automatic_vocal_mic_lift_db": pipeline.AUTOMATIC_VOCAL_MIC_LIFT_DB if mix_role == "vocal" else 0.0,
@@ -692,8 +892,13 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "solo": solo,
             "fx_enabled": bool(stem_ov.get("fx_enabled", True)),
             "gate_enabled": bool(stem_ov.get("gate_enabled", False)),
+            "gate_points": pipeline.section_gate_points(segment_envelopes.get(stem.path.name, np.array([], dtype=np.float32)), pipeline.section_gate_noise_floor(mix_role, analysis_cache.get("noise_diagnostics", {}).get(stem.path.name, {}), segment_envelopes.get(stem.path.name, np.array([], dtype=np.float32)))) if mix_role != "vocal" else [],
             "space_enabled": bool(stem_ov.get("space_enabled", False)),
             "echo_enabled": bool(stem_ov.get("echo_enabled", False)),
+            "effects_user_confirmed": bool(stem_ov.get("effects_user_confirmed", False)),
+            "effect_scene": effect_profile.get("scene") if isinstance(effect_profile, dict) else None,
+            "reverb_scene_offset_db": reverb_scene_offset_db,
+            "delay_scene_offset_db": delay_scene_offset_db,
             "muted_by_solo": bool(solo_files and stem.path.name not in solo_files),
             "pan": pipeline.enforced_pan(mix_role, stem.name, stem_ov.get("pan")),
             "eq_low_cut_hz": float(stem_ov.get("eq_low_cut_hz", eq_defaults["eq_low_cut_hz"])),
@@ -701,10 +906,10 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
             "eq_air_gain_db": float(stem_ov.get("eq_air_gain_db", eq_defaults["eq_air_gain_db"])),
             "reverb_base_db": base_reverb,
             "reverb_send_db": float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
-            "reverb_total_db": None if base_reverb is None else base_reverb + float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
+            "reverb_total_db": None if base_reverb is None else base_reverb + reverb_scene_offset_db + float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
             "delay_base_db": base_delay,
             "delay_send_db": float(stem_ov.get("delay_send_db", 0.0) or 0.0),
-            "delay_total_db": None if base_delay is None else base_delay + float(stem_ov.get("delay_send_db", 0.0) or 0.0),
+            "delay_total_db": None if base_delay is None else base_delay + delay_scene_offset_db + float(stem_ov.get("delay_send_db", 0.0) or 0.0),
         }
     active_vocal_names = [
         stem.path.name
@@ -736,7 +941,7 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
     if "master_db" not in song_overrides:
         song_overrides["master_db"] = 0.0
         changed = True
-    if changed:
+    if changed and overrides_snapshot is None:
         overrides["_write_trace"] = override_write_trace(overrides)
         save_json(OVERRIDES_PATH, overrides)
     plan = {
@@ -750,19 +955,23 @@ def canonical_mix_params_for_song(segment_id: int) -> dict[str, Any]:
         "auto_mix_balance": {
             **(mix_controls.get("balance", {}) if isinstance(mix_controls.get("balance", {}), dict) else {}),
             "role_balance": role_balance,
+            "vocal_pair_diagnostics": vocal_pair_diagnostics,
+            "automatic_mix_profile": automatic_mix_profile,
+            "effect_profile": effect_profile,
             "guitar_original_level_db": role_balance.get("guitar_original_level_db"),
-            "guitar_reduction_db": role_balance.get("guitar_reduction_db", 0.0),
-            "guitar_reduction_reason": role_balance.get("guitar_reduction_reason", "no reliable vocal overlap evidence"),
+            "rhythm_harmonic_balance": mix_controls.get("rhythm_harmonic_balance", {}),
+            "guitar_reduction_db": min((float(value) for name, value in mix_controls.get("rhythm_harmonic_balance", {}).get("gains_db", {}).items() if effective_roles.get(name) == "guitar"), default=float(role_balance.get("guitar_reduction_db", 0.0))),
+            "guitar_reduction_reason": "individual song balance against musical reference" if mix_controls.get("rhythm_harmonic_balance") else role_balance.get("guitar_reduction_reason", "no reliable vocal overlap evidence"),
         },
-        "auto_mix_method": "per-song active-envelope RMS power groups with vocal/harmonic overlap",
+        "auto_mix_method": "independent song analysis, combined kit power balance and guitar recovery; confirmed controls applied last",
         "stems": stem_params,
     }
     plan_signature = mix_plan_signature(segment_id, segment, song_overrides)
-    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"mix_analysis_{segment_id}_{plan_signature}.npz"
-    pipeline.save_analysis_cache(cache_path, analysis_cache)
+    cache_path = ACTIVE_SOURCE_STATE_ROOT / f"song_analysis_{segment_id}_{analysis_cache['input_signature']}.npz"
     plan["analysis_cache_path"] = str(cache_path)
     plan["analysis_cache_signature"] = plan_signature
     plan["analysis_cache_version"] = 2
+    plan["mix_profile_version"] = getattr(pipeline, "AUTO_MIX_PROFILE_VERSION", 1)
     plan["effective_dsp_plan_hash"] = plan_signature
     save_mix_plan(segment_id, segment, song_overrides, plan)
     return plan
@@ -795,6 +1004,9 @@ def override_write_trace(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def out_dir() -> Path:
+    if pipeline.SOURCE_DIR.is_dir():
+        from project_storage import project_directory
+        return project_directory(pipeline.SOURCE_DIR) / "renders"
     return pipeline.OUTPUT_ROOT / pipeline.SESSION_DATE
 
 
@@ -840,6 +1052,8 @@ def load_settings() -> dict[str, Any]:
     settings["skipped_segments"] = sorted(load_skipped_segments())
     settings.setdefault("last_render_dir", "")
     settings.setdefault("source_folder", str(pipeline.SOURCE_DIR))
+    if child_status_snapshot and child_status_snapshot.get("source_folder"):
+        settings["source_folder"] = child_status_snapshot["source_folder"]
     settings.setdefault("audio_scan_mode", "auto")
     settings.setdefault("known_song_count", None)
     settings.setdefault("matchering_reference", "")
@@ -850,15 +1064,9 @@ def load_settings() -> dict[str, Any]:
 def load_skipped_segments() -> set[int]:
     payload = load_json(SKIPPED_SEGMENTS_PATH, None)
     if payload is None:
-        # One-time migration only when the legacy setting belongs to this
-        # exact source. Never carry skipped IDs across sessions.
-        legacy = load_json(SETTINGS_PATH, {})
-        legacy_source = str(legacy.get("source_folder") or "").strip() if isinstance(legacy, dict) else ""
-        current_source = Path(pipeline.SOURCE_DIR).expanduser().resolve()
-        if legacy_source and Path(legacy_source).expanduser().resolve() == current_source:
-            payload = {"segments": legacy.get("skipped_segments", [])}
-        else:
-            payload = {"segments": []}
+        # A global legacy list has no reliable source identity after project
+        # switching. Only explicit source-scoped skip decisions may hide songs.
+        payload = {"segments": []}
     values = payload.get("segments", []) if isinstance(payload, dict) else payload
     result: set[int] = set()
     for value in values if isinstance(values, list) else []:
@@ -879,6 +1087,11 @@ def save_skipped_segments(values: Any) -> None:
     save_json_atomic(SKIPPED_SEGMENTS_PATH, {"version": 1, "segments": sorted(result)})
 
 def save_settings(settings: dict[str, Any]) -> None:
+    if settings.get("source_folder") == str(pipeline.SOURCE_DIR) and settings.get("last_render_dir"):
+        project_settings_path = ACTIVE_SOURCE_STATE_ROOT / "project_settings.json"
+        config = load_json(project_settings_path, {})
+        config["last_render_dir"] = str(settings["last_render_dir"])
+        save_json(project_settings_path, config)
     save_json(SETTINGS_PATH, settings)
 
 
@@ -886,12 +1099,12 @@ def default_source_config() -> dict[str, Any]:
     return {
         "config_version": 1,
         "expected_song_count": None,
-        "min_song_seconds": 90.0,
-        "max_song_seconds": 4 * 3600.0,
+        "min_song_seconds": 480.0,
+        "max_song_seconds": 780.0,
         "structural_min_song_seconds": 90.0,
-        "structural_max_song_seconds": 4 * 3600.0,
+        "structural_max_song_seconds": 780.0,
         "structural_close_song_seconds": 90.0,
-        "min_final_song_seconds": 90.0,
+        "min_final_song_seconds": 480.0,
         "suspicious_short_song_seconds": 5 * 60.0,
         "suspicious_long_song_seconds": 20 * 60.0,
         "whisper_model": os.environ.get("ZUCKER_WHISPER_MODEL", "tiny"),
@@ -941,8 +1154,9 @@ def save_manual_splits(values: list[float]) -> None:
     save_json(MANUAL_SPLITS_PATH, {"splits": sorted(set(float(v) for v in values))})
 
 
+@source_edit_locked
 def configure_source_folder(source_folder: str | Path) -> Path:
-    global ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, EDITOR_HISTORY_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, SECOND_PASS_CANDIDATE_PATH, PREVIEW_DIR, SOURCE_CONFIG_PATH, SKIPPED_SEGMENTS_PATH
+    global MANUAL_EDITOR_STATE_PATH, ACTIVE_SOURCE_STATE_ROOT, OVERRIDES_PATH, HISTORY_PATH, MANUAL_SPLITS_PATH, SEGMENT_SELECTIONS_PATH, WAVEFORM_CACHE_PATH, MIX_PLANS_PATH, SONG_NAMES_PATH, DETECTION_STATE_PATH, EDITOR_HISTORY_PATH, REDETECTION_CANDIDATE_PATH, REDETECTION_BACKUP_PATH, SECOND_PASS_CANDIDATE_PATH, PREVIEW_DIR, SOURCE_CONFIG_PATH, SKIPPED_SEGMENTS_PATH
     source = Path(source_folder).expanduser().resolve()
     pipeline.SOURCE_DIR = source
     pipeline.AUDIO_SCAN_REPORT = {
@@ -953,10 +1167,29 @@ def configure_source_folder(source_folder: str | Path) -> Path:
         "status": "Scanning folder",
         "error": "",
     }
-    pipeline.configure_detection_cache(source, STATE_ROOT)
     source_key = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:20]
-    ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "sources" / source_key
-    ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    legacy_state = STATE_ROOT / "sources" / source_key
+    if source.is_dir():
+        from project_storage import migrate_source_state
+        ACTIVE_SOURCE_STATE_ROOT = migrate_source_state(source, legacy_state)
+        (ACTIVE_SOURCE_STATE_ROOT.parent / "renders").mkdir(exist_ok=True)
+    else:
+        # The external project volume may be disconnected. Keep startup
+        # independent of it; never recreate or overwrite its saved project.
+        ACTIVE_SOURCE_STATE_ROOT = STATE_ROOT / "offline" / source_key
+        ACTIVE_SOURCE_STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    cache_root = ACTIVE_SOURCE_STATE_ROOT / "cache"
+    old_detection = STATE_ROOT / f"jam_detection_envelopes_{source_key[:16]}.npz"
+    if old_detection.is_file() and not (cache_root / old_detection.name).exists():
+        # Keep the validated envelopes so migration does not force a full scan.
+        cache_root.mkdir(parents=True, exist_ok=True)
+        copied = cache_root / old_detection.name
+        shutil.copy2(old_detection, copied)
+        if hashlib.sha256(copied.read_bytes()).digest() != hashlib.sha256(old_detection.read_bytes()).digest():
+            copied.unlink()
+            raise RuntimeError("Detection cache migration verification failed")
+        old_detection.unlink()
+    pipeline.configure_detection_cache(source, cache_root)
     OVERRIDES_PATH = ACTIVE_SOURCE_STATE_ROOT / "mix_overrides.json"
     HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "render_history.json"
     MANUAL_SPLITS_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_splits.json"
@@ -966,6 +1199,7 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     SONG_NAMES_PATH = ACTIVE_SOURCE_STATE_ROOT / "song_names.json"
     DETECTION_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "detection_state.json"
     EDITOR_HISTORY_PATH = ACTIVE_SOURCE_STATE_ROOT / "editor_history.json"
+    MANUAL_EDITOR_STATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "manual_editor_state.json"
     REDETECTION_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_candidate.json"
     REDETECTION_BACKUP_PATH = ACTIVE_SOURCE_STATE_ROOT / "redetect_backup.json"
     SECOND_PASS_CANDIDATE_PATH = ACTIVE_SOURCE_STATE_ROOT / "whisper_second_pass_candidate.json"
@@ -976,14 +1210,89 @@ def configure_source_folder(source_folder: str | Path) -> Path:
     return source
 
 
+def restore_missing_saved_opening(state: dict[str, Any]) -> bool:
+    """Recover source-scoped human cuts omitted by a later automatic snapshot."""
+    segments = state.get("segments", [])
+    if not segments or segments[0].start <= 0.1:
+        return False
+    saved = load_json(SEGMENT_SELECTIONS_PATH, {}).get("segments", {})
+    candidates = []
+    for value in saved.values():
+        try:
+            start, end = float(value["start_sec"]), float(value["end_sec"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if 0 <= start < end <= segments[0].start and value.get("source") == "manual":
+            candidates.append((start, end, value))
+    candidates.sort(key=lambda item: item[0])
+    prefix, rows = [], []
+    for start, end, value in candidates:
+        if prefix and start < prefix[-1].end:
+            continue
+        seg = pipeline.Segment(start, end, core_start=start, core_end=end, nominal_end=end,
+            boundary_source="manual-recovered", boundary_validation="manual-selection",
+            boundary_validation_reason="recovered saved human cut from this source")
+        prefix.append(seg)
+        rows.append({"slot_id": value.get("slot_id"), "session_id": value.get("session_id"),
+                     "source_start": value.get("source_start", start), "source_end": value.get("source_end", end)})
+    if not prefix:
+        return False
+    # Recover other human selections by time overlap, never by their old
+    # ordinal. Recent manual split/move operations remain authoritative.
+    proposed = list(segments)
+    used = set()
+    for value in saved.values():
+        try:
+            start, end = float(value["start_sec"]), float(value["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if value.get("source") != "manual" or end <= segments[0].start or start >= end:
+            continue
+        scores = [(overlap_ratio(start,end,seg.start,seg.end), i) for i,seg in enumerate(segments)
+                  if i not in used and not seg.boundary_source.startswith("manual")]
+        if not scores:
+            continue
+        score, index = max(scores)
+        if score < 0.7:
+            continue
+        proposed[index] = replace(segments[index],start=start,end=end,core_start=start,core_end=end,
+            nominal_end=end,boundary_source="manual-recovered",boundary_validation="manual-selection",
+            boundary_validation_reason="recovered saved human selection from this source")
+        used.add(index)
+    if all(left.end <= right.start for left,right in zip(proposed,proposed[1:])):
+        segments = proposed
+    # A saved opening before the commentator's known first introduction is song 0.
+    history = load_json(EDITOR_HISTORY_PATH, {})
+    introductions = [seg for snap in history.get("undo", []) for seg in snap.get("segments", [])
+                     if seg.get("spoken_song_number") == 1]
+    zero = any(prefix[0].end <= float(seg.get("speech_intro_start") or seg["start"]) < (prefix[1].end if len(prefix)>1 else segments[0].start) for seg in introductions)
+    state["segments"] = prefix + segments
+    state["raw_songs"] = rows + state.get("raw_songs", [])
+    for ordinal, (row, seg) in enumerate(zip(state["raw_songs"],state["segments"]), 1):
+        number = ordinal - 1 if zero else ordinal
+        seg = replace(seg, assigned_song_number=number)
+        state["segments"][ordinal - 1] = seg
+        row.update(id=ordinal, start=seg.start, end=seg.end, render_end=seg.end,
+                   duration=seg.duration, duration_text=fmt_time(seg.duration),
+                   assigned_song_number=number, segment=asdict(seg))
+    return True
+
+
 def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> dict[str, Any] | None:
     payload = load_json(DETECTION_STATE_PATH, None)
+    manual = load_json(MANUAL_EDITOR_STATE_PATH, None)
+    manual_matches = isinstance(manual, dict) and manual.get("fingerprint") == source_job_identity(signature)["fingerprint"] and not pipeline.DETECTION_RESCAN_MODE
+    if manual_matches:
+        payload = dict(manual)
+        payload["source_signature"] = [signature[0], list(signature[1]) if isinstance(signature[1], tuple) else signature[1], [list(item) for item in signature[2]]]
     expected_signature = [
         signature[0],
         [signature[1][0], signature[1][1]] if isinstance(signature[1], tuple) else signature[1],
         [list(item) for item in signature[2]],
     ]
     if not isinstance(payload, dict) or payload.get("source_signature") != expected_signature:
+        return None
+    if not manual_matches and legacy_single_slot_snapshot_reason(payload):
         return None
     try:
         stems = [pipeline.Stem(path=Path(item["path"]), **{key: item[key] for key in ("name", "role", "samplerate", "channels", "frames", "duration", "timeline_frames", "offset_seconds", "offset_source")}) for item in payload["stems"]]
@@ -994,17 +1303,56 @@ def load_detection_snapshot(signature: tuple[str, float | None, tuple[tuple[str,
             segments.append(pipeline.Segment(**value))
         if not stems or not segments:
             return None
-        return {
+        state = {
             "stems": stems,
             "segments": segments,
             "raw_songs": payload["raw_songs"],
             "stem_info": payload["stem_info"],
             "active_stems_by_song": {},
+            "manual_editor_authoritative": bool(manual_matches),
+            "candidate_pending": bool(payload.get("candidate_pending")),
+            "segmentation_status": payload.get("segmentation_status"),
             "audio_scan": payload.get("audio_scan", {}),
             "detection_calibration": payload.get("detection_calibration", {}),
         }
+        if not isinstance(manual, dict) and restore_missing_saved_opening(state):
+            backup = DETECTION_STATE_PATH.with_name("detection_state.before-opening-recovery.json")
+            if not backup.exists():
+                save_json_atomic(backup, payload)
+            persist_manual_editor_state(state)
+        return state
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def legacy_single_slot_snapshot_reason(snapshot: dict[str, Any] | None) -> str:
+    """Explain why a one-window multi-stem snapshot cannot be a session."""
+    if not isinstance(snapshot, dict):
+        return ""
+    slots = snapshot.get("raw_songs", [])
+    stems = snapshot.get("stems", [])
+    if not isinstance(slots, list) or not isinstance(stems, list):
+        return ""
+    if len(slots) != 1 or len(stems) <= 1:
+        return ""
+    if slots[0].get("proposal_status") == "manual":
+        return ""
+    duration = max(
+        (
+            float(item.get("offset_seconds", 0.0))
+            + float(item.get("timeline_duration", item.get("duration", 0.0)))
+            if isinstance(item, dict)
+            else float(item.offset_seconds) + float(item.timeline_duration)
+            for item in stems
+        ),
+        default=0.0,
+    )
+    if duration <= pipeline.HARD_MAX_SONG_SECONDS:
+        return ""
+    return (
+        f"Rejected legacy one-slot snapshot: {len(stems)} parallel stems span "
+        f"{duration:.1f}s. It is a diagnostic candidate, not a song session."
+    )
 
 
 def snapshot_has_valid_segment_windows(snapshot: dict[str, Any]) -> bool:
@@ -1057,6 +1405,10 @@ def _ensure_snapshot_scan_report(snapshot: dict[str, Any]) -> dict[str, Any]:
 def save_detection_snapshot(state: dict[str, Any], signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> None:
     payload = {
         "version": 1,
+        "job_id": (child_status_snapshot or {}).get("id"),
+        **source_job_identity(signature),
+        "candidate_pending": bool(state.get("candidate_pending")),
+        "segmentation_status": state.get("segmentation_status"),
         "source_signature": [signature[0], signature[1], [list(item) for item in signature[2]]],
         "stems": [{**asdict(stem), "path": str(stem.path)} for stem in state["stems"]],
         "segments": [asdict(segment) for segment in state["segments"]],
@@ -1065,11 +1417,21 @@ def save_detection_snapshot(state: dict[str, Any], signature: tuple[str, float |
         "audio_scan": state.get("audio_scan", {}),
         "detection_calibration": state.get("detection_calibration", {}),
     }
-    save_json_atomic(DETECTION_STATE_PATH, payload)
+    target = REDETECTION_CANDIDATE_PATH if pipeline.DETECTION_RESCAN_MODE else DETECTION_STATE_PATH
+    save_json_atomic(target, payload)
 
 
 def session_id_for_signature(signature: tuple[str, float | None, tuple[tuple[str, int, int], ...]]) -> str:
     return hashlib.sha256(json.dumps(signature, sort_keys=True, default=str).encode()).hexdigest()[:20]
+
+
+def source_job_identity(signature: tuple) -> dict[str, str]:
+    source = str(Path(pipeline.SOURCE_DIR).expanduser().resolve())
+    return {
+        "source_id": hashlib.sha256(source.encode()).hexdigest()[:20],
+        "fingerprint": hashlib.sha256(json.dumps([source, signature[2]], default=str).encode()).hexdigest(),
+        "session_id": session_id_for_signature(signature),
+    }
 
 
 def detection_state_signature() -> tuple[str, float | None, tuple[tuple[str, int, int], ...]]:
@@ -1112,7 +1474,7 @@ def apply_saved_segment_selections(segments: list[pipeline.Segment], raw_songs: 
             continue
         if not 0 <= index < len(result):
             continue
-        if not pipeline.HARD_MIN_SONG_SECONDS <= end - start <= pipeline.HARD_MAX_SONG_SECONDS:
+        if not math.isfinite(start) or not math.isfinite(end) or end - start < 0.1:
             continue
         original = result[index]
         result[index] = replace(
@@ -1163,24 +1525,37 @@ def slot_waveform(start_sec: float, end_sec: float, points: int = 1400) -> dict[
     end_sec = max(start_sec, float(end_sec))
     duration = end_sec - start_sec
     envelope = np.zeros(points, dtype=np.float32)
-    # Read only the selected source range. This cache is presentation-only and
-    # never participates in detection or DSP.
-    for stem in stems:
-        try:
-            with sf.SoundFile(str(stem.path)) as audio_file:
-                sr = float(audio_file.samplerate)
-                local_start = max(0, int(round((start_sec - float(stem.offset_seconds)) * sr)))
-                local_end = min(int(audio_file.frames), max(local_start, int(round((end_sec - float(stem.offset_seconds)) * sr))))
-                if local_end <= local_start:
-                    continue
-                audio_file.seek(local_start)
-                block = audio_file.read(local_end - local_start, dtype="float32", always_2d=True)
-                mono = np.max(np.abs(block), axis=1) if len(block) else np.zeros(0, dtype=np.float32)
-                for index, chunk in enumerate(np.array_split(mono, points)):
-                    if len(chunk):
-                        envelope[index] = max(envelope[index], float(np.max(chunk)))
-        except (OSError, RuntimeError, ValueError):
-            continue
+    activity = pipeline.load_detection_cache(stems)
+    if activity:
+        frame_seconds = pipeline.DETECTION_FRAME_SECONDS
+        sampled_bins = np.zeros(points, dtype=bool)
+        for stem in stems:
+            values = activity.get(stem.path.name, np.array([], dtype=np.float32))
+            positions = min(float(item.offset_seconds) for item in stems) + (np.arange(len(values)) + 0.5) * frame_seconds
+            mask = (positions >= start_sec) & (positions <= end_sec)
+            bins = np.clip(((positions[mask] - start_sec) / max(duration, 1e-9) * points).astype(int), 0, points - 1)
+            np.maximum.at(envelope, bins, values[mask])
+            sampled_bins[bins] = True
+        # Retain true silent bins while interpolating presentation gaps.
+        occupied = np.flatnonzero(sampled_bins)
+        if len(occupied):
+            envelope = np.interp(np.arange(points), occupied, envelope[occupied], left=0, right=0).astype(np.float32)
+    else:
+        # Bounded visual sampling on a cache miss, without allocating a whole song.
+        for stem in stems:
+            try:
+                with sf.SoundFile(str(stem.path)) as audio_file:
+                    for index in range(points):
+                        seconds = start_sec + (index + 0.5) / points * duration - float(stem.offset_seconds)
+                        frame = int(seconds * audio_file.samplerate)
+                        if not 0 <= frame < audio_file.frames:
+                            continue
+                        audio_file.seek(frame)
+                        block = audio_file.read(256, dtype="float32", always_2d=True)
+                        if block.size:
+                            envelope[index] = max(envelope[index], float(np.max(np.abs(block))))
+            except (OSError, RuntimeError, ValueError):
+                continue
     peak = float(np.max(envelope)) if len(envelope) else 0.0
     values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
     result = {"window_start_sec": start_sec, "window_end_sec": end_sec, "duration_sec": duration, "peaks": values, "cached": False}
@@ -1195,32 +1570,18 @@ def full_session_waveform(points: int = 1800) -> dict[str, Any]:
     cache = load_json(WAVEFORM_CACHE_PATH, {})
     if not isinstance(cache, dict) or cache.get("identity") != identity:
         cache = {"identity": identity, "version": 2, "slots": {}}
-    existing = cache.get("global")
-    if isinstance(existing, dict) and len(existing.get("peaks", [])):
-        return {**existing, "cached": True}
     state = ensure_pipeline_state()
     end_sec = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in state["stems"]), default=0.0)
-    envelope = np.zeros(points, dtype=np.float32)
-    # The global editor's visual envelope is presentation-only. Use the
-    # shortest available original stem as a representative timeline so
-    # opening the editor never scans tens of gigabytes from every channel.
-    # Detection and rendering still use every stem.
-    visual_stems = sorted(state["stems"], key=lambda item: float(item.timeline_duration))[:1]
-    for stem in visual_stems:
-        try:
-            with sf.SoundFile(str(stem.path)) as audio_file:
-                total = max(1, int(audio_file.frames))
-                for index in range(points):
-                    frame = min(total - 1, int(index / max(1, points - 1) * total))
-                    audio_file.seek(frame)
-                    block = audio_file.read(min(512, total - frame), dtype="float32", always_2d=True)
-                    if len(block):
-                        envelope[index] = max(envelope[index], float(np.max(np.abs(block))))
-        except (OSError, RuntimeError, ValueError):
-            continue
-    peak = float(np.max(envelope)) if len(envelope) else 0.0
-    values = (envelope / peak).round(6).tolist() if peak > 0 else envelope.tolist()
-    result = {"window_start_sec": 0.0, "window_end_sec": end_sec, "duration_sec": end_sec, "peaks": values, "cached": False}
+    existing = cache.get("global")
+    if isinstance(existing, dict) and len(existing.get("peaks", [])) >= points and abs(float(existing.get("window_end_sec", 0)) - end_sec) < 0.01:
+        return {**existing, "cached": True}
+    activity = pipeline.load_detection_cache(state["stems"])
+    detail_points = min(60000, max(points, int(math.ceil(end_sec / pipeline.DETECTION_FRAME_SECONDS)))) if activity else min(points, 512)
+    existing = cache.get("global")
+    if isinstance(existing, dict) and len(existing.get("peaks", [])) >= detail_points:
+        return {**existing, "cached": True}
+    result = slot_waveform(0.0, end_sec, detail_points)
+    cache = load_json(WAVEFORM_CACHE_PATH, {})
     cache["global"] = result
     save_json_atomic(WAVEFORM_CACHE_PATH, cache)
     return result
@@ -1344,6 +1705,29 @@ def disk_versions() -> dict[int, list[dict[str, Any]]]:
                     if isinstance(entry, dict) and entry.get("path"):
                         metadata_by_path[str(Path(str(entry["path"])).resolve())] = entry
     seen: set[Path] = set()
+    # Registered renders can live in any user-selected destination. Include
+    # those exact files without recursively scanning external drives.
+    if isinstance(history, dict):
+        for raw_song, entries in history.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or not entry.get("path"):
+                    continue
+                try:
+                    path = Path(str(entry["path"])).resolve()
+                    song_no = int(entry.get("song_id") or raw_song)
+                    if path in seen or path.suffix.lower() != ".mp3" or not path.is_file():
+                        continue
+                    registered = dict(entry)
+                    registered.update(path=str(path), size=path.stat().st_size)
+                    registered.setdefault("version", 1)
+                    registered.setdefault("created", "")
+                    registered.setdefault("title", path.stem)
+                except (OSError, TypeError, ValueError):
+                    continue
+                seen.add(path)
+                versions.setdefault(song_no, []).append(registered)
     for root in render_roots:
         if not root.exists():
             continue
@@ -1434,45 +1818,48 @@ def ffmpeg_status() -> dict[str, str | bool]:
 def request_cancel() -> None:
     global cancel_requested
     cancel_requested = True
-    lifecycle_log("cancel_requested", reason="explicit_cancel_or_shutdown")
-    to_stop: list[tuple[str, subprocess.Popen[str]]] = []
-    with state_lock:
-        for job in jobs:
-            if job.get("status") in {"queued", "running"}:
-                lifecycle_log("job_cancel_mark", str(job.get("id")), previous_status=job.get("status"))
-                job["status"] = "stopping" if job.get("status") == "running" else "cancelled"
-                job["heartbeat"] = time.time()
-                write_job_status(job)
-        for job_id, proc in child_processes.items():
-            if proc.poll() is None:
-                to_stop.append((job_id, proc))
+    for job in list(jobs):
+        if job.get("status") in {"queued", "running", "stopping"}:
+            job["cancel_requested"] = True
+    # Signal owned workers before status/log I/O: an external disk or a
+    # concurrent status write must not postpone stopping audio processes.
+    to_stop = [(job_id, proc) for job_id, proc in list(child_processes.items()) if proc.poll() is None]
     for job_id, proc in to_stop:
         # Workers are isolated in their own process group so a render and any
         # helper it spawned stop together. Escalate after two seconds: the UI
         # must never wait for a multi-minute DSP checkpoint.
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
-            lifecycle_log("child_group_sigterm", job_id, child_pid=proc.pid)
+            signal_owned_process_group(proc)
         except ProcessLookupError:
             pass
-        except OSError as exc:
-            lifecycle_log("child_group_sigterm_failed", job_id, child_pid=proc.pid, error=str(exc))
+        except (OSError, subprocess.SubprocessError) as exc:
             try:
                 proc.terminate()
             except OSError:
                 pass
 
         def escalate(target: subprocess.Popen[str] = proc, target_job_id: str = job_id) -> None:
-            if target.poll() is None:
+            # The group may still contain ffmpeg/helpers after its leader exits.
+            if os.name != "nt" or target.poll() is None:
                 try:
-                    os.killpg(target.pid, signal.SIGKILL)
+                    signal_owned_process_group(target, force=True)
                     lifecycle_log("child_group_sigkill", target_job_id, child_pid=target.pid)
                 except ProcessLookupError:
                     pass
                 except OSError as exc:
                     lifecycle_log("child_group_sigkill_failed", target_job_id, child_pid=target.pid, error=str(exc))
 
-        threading.Timer(2.0, escalate).start()
+        timer = threading.Timer(2.0, escalate)
+        timer.daemon = True
+        timer.start()
+    with state_lock:
+        for job in jobs:
+            if job.get("status") in {"queued", "running", "stopping"}:
+                job["cancel_requested"] = True
+                job["status"] = "stopping" if job.get("status") != "queued" else "cancelled"
+                job["heartbeat"] = time.time()
+                write_job_status(job)
+    lifecycle_log("cancel_requested", reason="explicit_cancel_or_shutdown")
     append_log("system", "Stop requested. The current mix process is being terminated.")
 
 
@@ -1485,9 +1872,18 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
     pipeline.configure_detection_profile(source_config)
     signature = detection_state_signature()
     with state_lock:
-        if pipeline_state is not None and pipeline_state_signature == signature:
+        if not pipeline.DETECTION_RESCAN_MODE and pipeline_state is not None and pipeline_state_signature == signature:
             return pipeline_state
     snapshot = None if pipeline.DETECTION_RESCAN_MODE else load_detection_snapshot(signature)
+    legacy_snapshot_reason = legacy_single_slot_snapshot_reason(snapshot)
+    if legacy_snapshot_reason:
+        lifecycle_log(
+            "legacy_one_slot_snapshot_ignored",
+            source_folder=str(pipeline.SOURCE_DIR),
+            reason=legacy_snapshot_reason,
+        )
+        print("DETECTION SNAPSHOT IGNORED: " + legacy_snapshot_reason, flush=True)
+        snapshot = None
     if snapshot is not None:
         snapshot_segments = snapshot.get("segments", []) if isinstance(snapshot, dict) else []
         invalid_snapshot_durations = []
@@ -1718,6 +2114,7 @@ def _ensure_pipeline_state_impl() -> dict[str, Any]:
         return pipeline_state
 
 
+@source_edit_locked
 def ensure_pipeline_state() -> dict[str, Any]:
     """Build detection once, even when multiple UI requests arrive together."""
     with pipeline_state_build_lock:
@@ -1727,6 +2124,8 @@ def ensure_pipeline_state() -> dict[str, Any]:
 def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
     global pipeline_state, pipeline_state_signature
     is_redetect = job_id != "detect"
+    settings = load_settings()
+    configure_source_folder(settings.get("source_folder") or pipeline.SOURCE_DIR)
     had_previous_snapshot = DETECTION_STATE_PATH.exists()
     previous_count = 0
     if is_redetect and had_previous_snapshot:
@@ -1734,6 +2133,9 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
         if isinstance(previous_snapshot, dict):
             previous_count = len(previous_snapshot.get("raw_songs", []) or [])
         shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_BACKUP_PATH)
+        archive = STATE_ROOT / "migrations" / ACTIVE_SOURCE_STATE_ROOT.name
+        archive.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(DETECTION_STATE_PATH, archive / f"detection_state-{time.time_ns()}.json")
     append_log(job_id, "Searching again from a clean deterministic detection pass; suspicious regions will be rescanned.")
     app_progress({
         "current_stage": "preparing session",
@@ -1753,18 +2155,17 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
         state = ensure_pipeline_state()
         candidate_count = len(state.get("raw_songs", []))
         if is_redetect:
-            if candidate_count < 2:
+            if candidate_count < 2 or state.get("candidate_pending"):
                 incomplete_reason = (
-                    f"Fresh detection produced only {candidate_count} slot(s); "
+                    f"Fresh detection is incomplete ({candidate_count} candidate slot(s)); "
                     f"the current session with {previous_count} slot(s) was preserved."
                 )
                 # Keep the one-slot result as a diagnostic candidate, but never
                 # let it replace the usable session or turn a recoverable
                 # Whisper miss into a worker crash.
-                if DETECTION_STATE_PATH.exists():
-                    shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
-                if REDETECTION_BACKUP_PATH.exists():
-                    shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
+                with state_lock:
+                    pipeline_state = None
+                    pipeline_state_signature = None
                 append_log(job_id, "INCOMPLETE REDetect: " + incomplete_reason)
                 app_progress({
                     "status": "pending_review",
@@ -1783,9 +2184,6 @@ def rebuild_detection_state(job_id: str = "detect") -> dict[str, Any]:
                 incomplete_state["_redetect_previous_count"] = previous_count
                 incomplete_state["_redetect_warning"] = incomplete_reason
                 return incomplete_state
-            shutil.copyfile(DETECTION_STATE_PATH, REDETECTION_CANDIDATE_PATH)
-            if REDETECTION_BACKUP_PATH.exists():
-                shutil.copyfile(REDETECTION_BACKUP_PATH, DETECTION_STATE_PATH)
             with state_lock:
                 pipeline_state = None
                 pipeline_state_signature = None
@@ -1841,8 +2239,7 @@ def visible_songs(
         item["needs_review"] = bool(boundary_review)
         item["render_valid"] = (
             not user_skipped
-            and pipeline.HARD_MIN_SONG_SECONDS <= duration <= pipeline.HARD_MAX_SONG_SECONDS
-            and not boundary_review
+            and math.isfinite(duration) and duration >= 0.1
         )
         item["render_validation"] = (
             "valid"
@@ -1870,7 +2267,7 @@ def visible_songs(
     return songs
 
 
-def _loading_state(error: str = "") -> dict[str, Any]:
+def _loading_state(error: str = "", detection_job: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a useful state even when detection has not completed."""
     settings = load_settings()
     source = str(pipeline.SOURCE_DIR)
@@ -1903,6 +2300,7 @@ def _loading_state(error: str = "") -> dict[str, Any]:
         "settings": settings,
         "source_config": load_source_config(),
         "jobs": current_jobs(),
+        "detection_job": detection_job,
         "output_dir": str(out_dir()),
         "average_render_seconds": 180.0,
         "ffmpeg": ffmpeg_status(),
@@ -1916,6 +2314,7 @@ def _loading_state(error: str = "") -> dict[str, Any]:
     }
 
 
+@source_edit_locked
 def public_state() -> dict[str, Any]:
     global last_load_error
     try:
@@ -1947,12 +2346,12 @@ def public_state() -> dict[str, Any]:
         "backend_slot_count": len(songs),
         "slot_ids": [item.get("slot_id") for item in raw_slots],
         "visible_slot_count": len(songs),
-        "integrity_warning": "Persisted state contains only one slot; full-session re-detection is required before replacement." if len(raw_slots) == 1 else "",
+        "integrity_warning": "Persisted state contains only one slot; full-session re-detection is required before replacement." if len(raw_slots) == 1 and not state.get("manual_editor_authoritative") else "",
     }
     source_stems = state.get("stems", [])
     source_duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in source_stems), default=0.0)
-    expected_slot_count = pipeline.EXPECTED_SLOT_COUNT
-    incomplete_source = len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS
+    expected_slot_count = len(raw_slots) if state.get("manual_editor_authoritative") else (pipeline.KNOWN_SONG_COUNT or pipeline.EXPECTED_SLOT_COUNT)
+    incomplete_source = not state.get("manual_editor_authoritative") and len(raw_slots) == 1 and len(source_stems) > 1 and source_duration > pipeline.HARD_MAX_SONG_SECONDS
     count_mismatch = expected_slot_count is not None and len(raw_slots) != expected_slot_count
     candidate_pending = bool(
         state.get("candidate_pending")
@@ -1978,7 +2377,7 @@ def public_state() -> dict[str, Any]:
     transitions = [
         {
             "id": int(song["id"]),
-            "label": f"Song {str(song['index']).zfill(2)}" if song.get("index") else f"Skipped {song['id']}",
+            "label": f"Song {str(song['index']).zfill(2)}" if song.get("index") is not None else f"Skipped {song['id']}",
             "start": song["segment"].get("mc_start"),
             "end": song["segment"].get("mc_end"),
             "duration": (
@@ -2025,11 +2424,7 @@ def public_state() -> dict[str, Any]:
         "detection_calibration": state.get("detection_calibration", {}),
         "slot_audit": slot_audit,
         "source_integrity": source_integrity,
-        "matchering": {
-            "available": pipeline.matchering_api is not None,
-            "import_error": pipeline.MATCHERING_IMPORT_ERROR,
-            "reference": settings.get("matchering_reference", ""),
-        },
+        "matchering": reference_mastering_status(settings),
         "build": runtime_build_metadata(),
     }
 
@@ -2042,29 +2437,31 @@ def current_jobs() -> list[dict[str, Any]]:
         live_job_ids = {str(job.get("id", "")) for job in source}
     for job in source:
         status = read_job_status_for_job(job)
-        print(
-            "JOB_STATUS_API_READ "
-            + json.dumps(
-                {
-                    "source": "memory-job",
-                    "job_id": job.get("id"),
-                    "memory": job_status_debug_payload(job),
-                    "status_file": job_status_debug_payload(status),
-                    "status_path": job.get("status_path") or str(job_status_path(str(job.get("id", "")))),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
+        if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+            print(
+                "JOB_STATUS_API_READ "
+                + json.dumps(
+                    {
+                        "source": "memory-job",
+                        "job_id": job.get("id"),
+                        "memory": job_status_debug_payload(job),
+                        "status_file": job_status_debug_payload(status),
+                        "status_path": job.get("status_path") or str(job_status_path(str(job.get("id", "")))),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         if status:
             job.update(status)
         reconciled = reconcile_completed_job_from_disk(job)
         if reconciled:
-            print(
-                "JOB_STATUS_RECONCILE "
-                + json.dumps({"job_id": job.get("id"), "before": job_status_debug_payload(job), "reconciled": reconciled}, sort_keys=True),
-                flush=True,
-            )
+            if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+                print(
+                    "JOB_STATUS_RECONCILE "
+                    + json.dumps({"job_id": job.get("id"), "before": job_status_debug_payload(job), "reconciled": reconciled}, sort_keys=True),
+                    flush=True,
+                )
             job.update(reconciled)
             write_job_status(job)
         seen.add(str(job.get("id", "")))
@@ -2077,19 +2474,20 @@ def current_jobs() -> list[dict[str, Any]]:
         job_id = str(status.get("id", ""))
         if not job_id or job_id in seen:
             continue
-        print(
-            "JOB_STATUS_API_READ "
-            + json.dumps(
-                {
-                    "source": "status-file-only",
-                    "job_id": job_id,
-                    "status_file": job_status_debug_payload(status),
-                    "status_path": str(path),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
+        if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+            print(
+                "JOB_STATUS_API_READ "
+                + json.dumps(
+                    {
+                        "source": "status-file-only",
+                        "job_id": job_id,
+                        "status_file": job_status_debug_payload(status),
+                        "status_path": str(path),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         if status.get("status") in {"queued", "running", "stopping"} and job_id not in live_job_ids:
             last_seen = float(status.get("heartbeat") or status.get("updated_at") or path.stat().st_mtime)
             if time.time() - last_seen > ORPHANED_ACTIVE_JOB_SECONDS:
@@ -2105,21 +2503,23 @@ def current_jobs() -> list[dict[str, Any]]:
                 save_json_atomic(path, status)
         reconciled = reconcile_completed_job_from_disk(status)
         if reconciled:
-            print(
-                "JOB_STATUS_RECONCILE "
-                + json.dumps({"job_id": job_id, "before": job_status_debug_payload(status), "reconciled": reconciled}, sort_keys=True),
-                flush=True,
-            )
+            if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+                print(
+                    "JOB_STATUS_RECONCILE "
+                    + json.dumps({"job_id": job_id, "before": job_status_debug_payload(status), "reconciled": reconciled}, sort_keys=True),
+                    flush=True,
+                )
             status.update(reconciled)
             save_json_atomic(path, status)
         merged.append(status)
         seen.add(job_id)
     merged.sort(key=lambda item: float(item.get("created") or item.get("updated_at") or 0.0))
-    print(
-        "JOB_STATUS_API_RETURN "
-        + json.dumps([job_status_debug_payload(item) for item in merged[-30:]], sort_keys=True),
-        flush=True,
-    )
+    if os.environ.get("ZUCKER_DEBUG_JOBS") == "1":
+        print(
+            "JOB_STATUS_API_RETURN "
+            + json.dumps([job_status_debug_payload(item) for item in merged[-30:]], sort_keys=True),
+            flush=True,
+        )
     return merged[-30:]
 
 
@@ -2164,6 +2564,14 @@ def job_status_debug_payload(payload: dict[str, Any] | None) -> dict[str, Any] |
 def reconcile_completed_job_from_disk(job: dict[str, Any]) -> dict[str, Any] | None:
     if job.get("kind") not in {"render", "mix"}:
         return None
+    if job.get("status") == "pending_review":
+        summary = job.get("batch_summary", {})
+        requested = int(summary.get("requested", 0) or 0)
+        rows = summary.get("songs", [])
+        complete = requested > 0 and int(summary.get("completed", 0) or 0) == requested and int(summary.get("failed", 0) or 0) == 0 and len(rows) == requested
+        if not complete or not all(Path(str(row.get("file", ""))).is_file() and Path(str(row["file"])).stat().st_size > 0 for row in rows):
+            return None
+        return {"status":"done", "current":None, "progress":100, "song_progress":100, "current_stage":"finished", "stage_detail":"All requested renders saved", "done_count":requested, "total_count":requested}
     if job.get("status") not in {"queued", "running", "stopping"}:
         return None
     songs = [int(song) for song in job.get("songs", []) if str(song).isdigit()]
@@ -2311,6 +2719,20 @@ def compact_batch_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{key: row.get(key) for key in keys if key in row} for row in rows]
 
 
+def render_batch_summary(requested: int, rows: list[dict], errors: list[dict], reviews: list[dict]) -> dict:
+    completed = [row for row in rows if not row.get("error")]
+    return {
+        "requested": requested,
+        "started": len(rows),
+        "completed": len(completed),
+        "failed": len(errors),
+        "needs_review": len(reviews),
+        "review_songs": [row.get("song") for row in reviews],
+        "songs": compact_batch_rows(completed),
+        "errors": errors,
+    }
+
+
 def enqueue(
     kind: str,
     songs: list[int],
@@ -2455,6 +2877,8 @@ def record_render(
     artifact_paths: dict[str, str] = {"mp3": str(dest.resolve())}
     for key, suffix in (("premaster_wav", "_premaster.wav"), ("master_wav", "_master.wav")):
         source_artifact = Path(str(preserved.get(key, ""))) if preserved.get(key) else None
+        if source_artifact is None and row.get("diagnostic_audio_retained") is False:
+            continue
         if source_artifact is None or not source_artifact.exists():
             raise RuntimeError(f"Missing {key} artifact for song {song_index}.")
         artifact_dest = diagnostic_root / f"{dest.stem}{suffix}"
@@ -2528,7 +2952,7 @@ def visible_index_for_segment(segment_id: int, state_snapshot: dict[str, Any] | 
     songs = visible_songs(state, load_settings(), load_json(HISTORY_PATH, {}))
     for song in songs:
         if int(song["id"]) == int(segment_id):
-            return int(song["index"] or segment_id)
+            return int(song["index"] if song["index"] is not None else segment_id)
     return segment_id
 
 
@@ -2553,7 +2977,7 @@ def resolve_segment_for_split(state: dict[str, Any], segment_id: int, payload: d
         return segment_id, state["segments"][segment_id - 1]
     songs = visible_songs(state, load_settings(), load_json(HISTORY_PATH, {}))
     for song in songs:
-        if int(song.get("index") or -1) == int(segment_id):
+        if int(song.get("index") if song.get("index") is not None else -1) == int(segment_id):
             raw_id = int(song["id"])
             return raw_id, state["segments"][raw_id - 1]
     return None
@@ -2597,21 +3021,24 @@ def apply_overrides_for_song(
     state_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = state_snapshot if isinstance(state_snapshot, dict) else load_render_state()
-    prepared_mix = load_mix_plan(segment_id, overrides_snapshot=overrides_snapshot, state_snapshot=state)
-    authoritative_payload = None
-    if prepared_mix is None and isinstance(overrides_snapshot, dict):
-        # A batch snapshot may omit automatic stem fields for a song that was
-        # never open in the UI. Do not recalculate anything in Render: fall
-        # back only to the frozen plan and persisted overrides validated by
-        # Analyze. A stale persisted plan still fails below.
-        authoritative_payload = normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}}))
-        prepared_mix = load_mix_plan(segment_id, state_snapshot=state)
+    disk_payload = overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}})
+    selected_payload = disk_payload if use_saved_mixes else {"songs": {}}
+    prepared_mix = load_mix_plan(segment_id, overrides_snapshot=selected_payload, state_snapshot=state)
     if not isinstance(prepared_mix, dict):
-        # Render uses the current controls immediately when an optional heavy
-        # Analyze snapshot is absent or stale. Analyze remains explicit and is
-        # never started implicitly from a Render click.
-        prepared_mix = {"lightweight_render": True, "song": int(segment_id)}
-    disk_payload = authoritative_payload or (overrides_snapshot if isinstance(overrides_snapshot, dict) else load_json(OVERRIDES_PATH, {"songs": {}}))
+        app_progress({"current_stage": "analyzing", "stage_detail": "Preparing the selected song’s independent mix", "heartbeat": time.time()})
+        analysis_finished = threading.Event()
+        def analysis_heartbeat() -> None:
+            while not analysis_finished.wait(2.0):
+                app_progress({"heartbeat": time.time()})
+        heartbeat_thread = threading.Thread(target=analysis_heartbeat, daemon=True, name="song-analysis-heartbeat")
+        heartbeat_thread.start()
+        try:
+            prepared_mix = canonical_mix_params_for_song(segment_id, state_snapshot=state, overrides_snapshot=selected_payload)
+        finally:
+            analysis_finished.set()
+            heartbeat_thread.join(timeout=0.2)
+    prepared_mix = dict(prepared_mix)
+    prepared_mix["analysis_song_id"] = int(segment_id)
     write_trace = disk_payload.get("_write_trace", {}) if isinstance(disk_payload, dict) else {}
     overrides = normalize_overrides(disk_payload)
     source_song = overrides.get("songs", {}).get(str(segment_id), {}) if use_saved_mixes else {}
@@ -2628,7 +3055,17 @@ def apply_overrides_for_song(
     verify_trace: dict[str, Any] = {}
     write_song_trace = write_trace.get(str(segment_id), {}) if isinstance(write_trace, dict) else {}
     changed = []
-    stems = source_song.get("stems", {}) if isinstance(source_song, dict) else {}
+    stems = source_song.setdefault("stems", {}) if isinstance(source_song, dict) else {}
+    for stem_name, prepared_stem in prepared_mix.get("stems", {}).items():
+        settings = stems.setdefault(stem_name, {})
+        for key in ("pan", "eq_low_cut_hz", "eq_mid_gain_db", "eq_air_gain_db", "space_enabled", "echo_enabled", "gate_enabled", "fx_enabled", "reverb_send_db", "delay_send_db"):
+            settings.setdefault(key, prepared_stem.get(key))
+        if not bool(settings.get("effects_user_confirmed", False)):
+            for effect in ("space_enabled", "echo_enabled"):
+                if effect in prepared_stem:
+                    settings[effect] = prepared_stem[effect]
+        settings["fader_db"] = prepared_stem.get("user_fader_db", 0.0)
+        settings["gain_db"] = prepared_stem.get("user_gain_db", 0.0)
     if isinstance(stems, dict):
         for stem_name, settings in stems.items():
             if not isinstance(settings, dict):
@@ -2691,11 +3128,7 @@ def apply_overrides_for_song(
     pipeline.MASTERING_INTENSITY = str(song.get("mastering_intensity", "natural")).lower() if isinstance(song, dict) else "natural"
     reference = str(load_settings().get("matchering_reference") or "").strip()
     pipeline.MATCHERING_REFERENCE = Path(reference).expanduser() if reference else None
-    if pipeline.MATCHERING_REFERENCE is not None and pipeline.matchering_api is None:
-        app_progress({
-            "warning": "Matchering reference is configured but unavailable; render will fail rather than silently use fallback.",
-            "heartbeat": time.time(),
-        })
+    pipeline.validate_mastering_reference(pipeline.MATCHERING_REFERENCE)
     return prepared_mix
 
 
@@ -2742,7 +3175,7 @@ def normalize_overrides(payload: Any) -> dict[str, Any]:
                             clean_stem[key] = float(stem_payload[key])
                         except (TypeError, ValueError):
                             continue
-                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "manual_makeup_gain_db"):
+                for key in ("mute", "solo", "fx_enabled", "gate_enabled", "space_enabled", "echo_enabled", "effects_user_confirmed", "gate_user_confirmed", "manual_makeup_gain_db", "user_confirmed", "user_fader_confirmed"):
                     if isinstance(stem_payload.get(key), bool):
                         clean_stem[key] = stem_payload[key]
                 if clean_stem:
@@ -2805,6 +3238,15 @@ def app_progress(payload: dict[str, Any]) -> None:
 
 def run_child_job(job_path: Path) -> int:
     payload = load_json(job_path, {})
+    from worker_lifecycle import start_parent_watch
+    def parent_exited():
+        status_path = Path(str(payload.get("status_path") or job_status_path(str(payload.get("id", "child")))))
+        latest = load_json(status_path, payload)
+        latest.update(status="cancelled", current=None, error=None,
+                      current_stage="cancelled", stage_detail="Application closed; stopped worker",
+                      cancel_requested=True, finished_at=time.time(), heartbeat=time.time())
+        save_json_atomic(status_path, latest)
+    parent_watch = start_parent_watch(payload.get("launch_pid"), parent_exited)
     job_id = str(payload.get("id", "child"))
     lifecycle_log("child_run_enter", job_id, argv=sys.argv, job_path=str(job_path))
     try:
@@ -2815,6 +3257,55 @@ def run_child_job(job_path: Path) -> int:
     try:
         return _run_child_job(job_path)
     except BaseException as exc:
+        # Compatibility guard for bundles built from the pre-2.1.34 detector.
+        # That code raised after producing a diagnostic one-slot candidate;
+        # this is an incomplete detection, not a worker crash.
+        legacy_incomplete = (
+            payload.get("kind") == "redetect"
+            and isinstance(exc, RuntimeError)
+            and "re-detect produced only" in str(exc).lower()
+            and "slot" in str(exc).lower()
+        )
+        if legacy_incomplete:
+            status_path = Path(str(payload.get("status_path") or job_status_path(str(payload.get("id", "child")))))
+            now = time.time()
+            match = re.search(r"onlys+(d+)s+slot", str(exc), re.IGNORECASE)
+            candidate_count = int(match.group(1)) if match else 0
+            snapshot = load_json(DETECTION_STATE_PATH, {})
+            previous_count = len(snapshot.get("raw_songs", []) or []) if isinstance(snapshot, dict) else 0
+            warning = (
+                f"Fresh detection is incomplete ({candidate_count} candidate slot(s)); "
+                f"the current session with {previous_count} slot(s) was preserved."
+            )
+            recovery = {
+                **payload,
+                "status": "pending_review",
+                "error": None,
+                "warning": warning,
+                "candidate_count": candidate_count,
+                "previous_count": previous_count,
+                "current_stage": "pending_review",
+                "stage_detail": warning,
+                "progress": 100,
+                "song_progress": 100,
+                "done_count": 1,
+                "total_count": 1,
+                "exit_code": 0,
+                "finished_at": now,
+                "heartbeat": now,
+                "updated_at": now,
+                "termination": "recovered incomplete detection",
+            }
+            save_json_atomic(status_path, recovery)
+            print("APP_PROGRESS " + json.dumps(recovery, sort_keys=True), flush=True)
+            lifecycle_log(
+                "legacy_incomplete_redetect_recovered",
+                job_id,
+                candidate_count=candidate_count,
+                previous_count=previous_count,
+                original_error=str(exc),
+            )
+            return 0
         status_path = Path(str(payload.get("status_path") or job_status_path(str(payload.get("id", "child")))))
         signal_code = exc.code if isinstance(exc, SystemExit) else None
         cancelled = isinstance(signal_code, int) and signal_code in {130, 143, 145, 146}
@@ -2838,6 +3329,9 @@ def run_child_job(job_path: Path) -> int:
             traceback.print_exc()
         lifecycle_log("child_exception", job_id, exception_type=type(exc).__name__, error=str(exc), traceback=traceback.format_exc())
         return 1
+    finally:
+        if parent_watch is not None:
+            parent_watch.set()
 
 
 def _run_child_job(job_path: Path) -> int:
@@ -2872,6 +3366,8 @@ def _run_child_job(job_path: Path) -> int:
     # the already-registered WAV metadata and persisted plan.
     pipeline.WHISPER_ALLOWED = bool(payload.get("allow_whisper", False))
     kind = payload.get("kind")
+    if kind in {"mix", "render", "real-preview"}:
+        pipeline.validate_mastering_reference(load_settings().get("matchering_reference"))
     songs = [int(x) for x in payload.get("songs", [])]
     job_id = str(payload.get("id", "child"))
     lifecycle_log("child_started", job_id, argv=sys.argv, job_path=str(job_path), status_path=str(child_status_path))
@@ -2893,6 +3389,7 @@ def _run_child_job(job_path: Path) -> int:
             "heartbeat": time.time(),
         })
         prepared_plan = apply_overrides_for_song(song_id, song_id, state_snapshot=state)
+        prepared_plan = {**prepared_plan, "preview_window": {"start_sec": preview_segment.start, "end_sec": preview_segment.end}}
         render_started = time.perf_counter()
         pipeline.render_segment(
             state["stems"],
@@ -2920,6 +3417,10 @@ def _run_child_job(job_path: Path) -> int:
         })
         return 0
     if kind == "redetect":
+        configure_source_folder(payload.get("source_folder") or pipeline.SOURCE_DIR)
+        actual = source_job_identity(detection_state_signature())
+        if payload.get("fingerprint") and payload["fingerprint"] != actual["fingerprint"]:
+            raise RuntimeError("Source fingerprint changed after the job was queued; run Detect Songs again.")
         app_progress(
             {
                 "status": "running",
@@ -2961,41 +3462,33 @@ def _run_child_job(job_path: Path) -> int:
         return 0
 
     state = load_render_state()
-    # Last safety gate: validate every selected cut against the same cached,
-    # offset-aware timeline used by detection. A rejection blocks only that
-    # song; it never aborts the batch or creates a fake output.
+    # Audit warnings are diagnostic. Render the exact selected windows for
+    # every requested song; never silently rewrite cuts or omit a song.
     selected_segments = [state["segments"][segment_id - 1] for segment_id in songs]
     selected_numbers = [visible_index_for_segment(segment_id, state) for segment_id in songs]
-    final_timelines = pipeline.load_cached_timelines_or_die(state["stems"], "Final cut gate")
-    final_cut_audit = pipeline.validate_final_render_boundaries(
-        state["stems"], selected_segments, selected_numbers, final_timelines
-    )
+    try:
+        final_timelines = pipeline.load_cached_timelines_or_die(state["stems"], "Final cut audit")
+        final_cut_audit = pipeline.validate_final_render_boundaries(
+            state["stems"], selected_segments, selected_numbers, final_timelines
+        )
+    except Exception as exc:
+        final_cut_audit = [{"song": number, "safe": False, "needs_review": True,
+                            "reason": f"Boundary audit unavailable: {type(exc).__name__}: {exc}"}
+                           for number in selected_numbers]
     pipeline.DETECTION_STRATEGY["final_render_boundary_audit"] = final_cut_audit
-    review_rows = [row for row in final_cut_audit if row.get("needs_review")]
+    review_rows = [row for row in final_cut_audit if row.get("needs_review") or not row.get("safe")]
     accepted_rows = [row for row in final_cut_audit if row.get("safe")]
     corrected_segments = list(selected_segments)
-    for index, row in enumerate(final_cut_audit):
-        accepted = row.get("accepted_cut_seconds")
-        if not row.get("safe") or accepted is None:
-            continue
-        accepted = float(accepted)
-        if abs(accepted - corrected_segments[index].end) <= 1e-9:
-            continue
-        corrected_segments[index] = replace(corrected_segments[index], end=accepted, nominal_end=accepted, core_end=accepted)
-        if index + 1 < len(corrected_segments):
-            corrected_segments[index + 1] = replace(corrected_segments[index + 1], start=accepted, core_start=accepted)
-        row["applied_cut_seconds"] = accepted
-    approved_positions = {index for index, row in enumerate(final_cut_audit) if row.get("safe")}
-    append_log(job_id, f"Final cut gate: {len(accepted_rows)} approved, {len(review_rows)} needs review")
+    append_log(job_id, f"Final cut audit: {len(accepted_rows)} clear, {len(review_rows)} warnings; rendering all {len(songs)} selected songs unchanged")
     for row in review_rows:
-        append_log(job_id, f"Needs review: song {row.get('song')} — {row.get('reason')}; stems={row.get('active_instruments')}")
+        append_log(job_id, f"Rendering with warning: song {row.get('song')} — {row.get('reason')}")
     out_dir().mkdir(parents=True, exist_ok=True)
     diagnostic_job_dir = render_diagnostics_dir(job_id)
     append_log(job_id, "RENDER DIAGNOSTICS directory=" + str(diagnostic_job_dir))
     rows = []
     batch_errors: list[dict[str, Any]] = []
     for pos, (original_position, segment_id) in enumerate(
-        ((index, song_id) for index, song_id in enumerate(songs) if index in approved_positions), 1
+        enumerate(songs), 1
     ):
         child_job_id = f"{job_id}-song-{pos:02d}"
         render_index = visible_index_for_segment(segment_id, state)
@@ -3049,6 +3542,7 @@ def _run_child_job(job_path: Path) -> int:
                 output_path=render_tmp_path,
                 prepared_plan=prepared_plan,
                 artifact_dir=artifact_tmp_dir,
+                retain_diagnostic_audio=False,
             )
             elapsed = time.time() - started
             entry = record_render(
@@ -3102,7 +3596,7 @@ def _run_child_job(job_path: Path) -> int:
                 "batch_summary": {
                     "requested": len(songs),
                     "started": pos,
-                    "completed": pos,
+                    "completed": sum(not row.get("error") for row in rows),
                     "failed": len(batch_errors),
                     "needs_review": len(review_rows),
                     "safe_songs": len(accepted_rows),
@@ -3131,14 +3625,7 @@ def _run_child_job(job_path: Path) -> int:
         partial_summary = {
             "job_id": job_id,
             "status": "partial_failed",
-            "batch_summary": {
-                "requested": len(songs),
-                "started": len(rows) + len(batch_errors),
-                "completed": len(successful_rows),
-                "failed": len(batch_errors),
-                "songs": compact_batch_rows(successful_rows),
-                "errors": batch_errors,
-            },
+            "batch_summary": render_batch_summary(len(songs), rows, batch_errors, review_rows),
             "commit": BUILD_METADATA.get("commit"),
         }
         summary_path = diagnostic_job_dir / f"ZuckerMixer_batch_{job_id}_summary.json"
@@ -3154,58 +3641,12 @@ def _run_child_job(job_path: Path) -> int:
                 "error": failure_text,
                 "batch_errors": batch_errors,
                 "heartbeat": time.time(),
-                "done_count": len(rows),
+                "done_count": sum(not row.get("error") for row in rows),
                 "total_count": len(songs),
-                "batch_summary": {
-                    "requested": len(songs),
-                    "started": len(rows) + len(batch_errors),
-                    "completed": len(successful_rows),
-                    "failed": len(batch_errors),
-                    "songs": compact_batch_rows(successful_rows),
-                },
+                "batch_summary": render_batch_summary(len(songs), rows, batch_errors, review_rows),
             }
         )
         return 1
-    if review_rows:
-        summary = {
-            "requested": len(songs),
-            "started": len(rows),
-            "completed": len(rows),
-            "failed": 0,
-            "needs_review": len(review_rows),
-            "safe_songs": len(accepted_rows),
-            "review_songs": [row.get("song") for row in review_rows],
-            "songs": compact_batch_rows(rows),
-            "errors": [],
-        }
-        summary_path = diagnostic_job_dir / f"ZuckerMixer_batch_{job_id}_summary.json"
-        save_json_atomic(summary_path, {
-            "job_id": job_id,
-            "status": "pending_review",
-            "batch_summary": summary,
-            "final_cut_audit": final_cut_audit,
-            "commit": BUILD_METADATA.get("commit"),
-        })
-        app_progress({
-            "status": "pending_review",
-            "current": None,
-            "progress": 100,
-            "song_progress": 100,
-            "current_stage": "pending_review",
-            "stage_detail": "Rendered approved songs; pending review: " + ", ".join(str(row.get("song")) for row in review_rows),
-            "heartbeat": time.time(),
-            "done_count": len(rows),
-            "total_count": len(songs),
-            "safe_count": len(accepted_rows),
-            "needs_review_count": len(review_rows),
-            "needs_review_songs": [row.get("song") for row in review_rows],
-            "needs_review_details": [
-                {"song": row.get("song"), "reason": row.get("reason"), "stems": row.get("active_instruments", [])}
-                for row in review_rows
-            ],
-            "batch_summary": summary,
-        })
-        return 0
     if len(rows) != len(songs):
         error_text = f"Render completed without all requested outputs ({len(rows)}/{len(songs)})."
         lifecycle_log("render_failed", job_id, error=error_text, stage="artifact_validation")
@@ -3216,18 +3657,12 @@ def _run_child_job(job_path: Path) -> int:
             "stage_detail": error_text,
             "error": error_text,
             "heartbeat": time.time(),
-            "done_count": len(rows),
+            "done_count": sum(not row.get("error") for row in rows),
             "total_count": len(songs),
         })
         return 1
     lifecycle_log("render_completed", job_id, songs=len(rows), stage="artifact_validation")
-    batch_summary = {
-        "requested": len(songs),
-        "started": len(songs),
-        "completed": len(rows),
-        "failed": 0,
-        "songs": compact_batch_rows(rows),
-    }
+    batch_summary = render_batch_summary(len(songs), rows, batch_errors, review_rows)
     summary_path = diagnostic_job_dir / f"ZuckerMixer_batch_{job_id}_summary.json"
     save_json_atomic(summary_path, {"job_id": job_id, "status": "done", "batch_summary": batch_summary, "commit": BUILD_METADATA.get("commit")})
     app_progress(
@@ -3251,6 +3686,8 @@ def _run_child_job(job_path: Path) -> int:
 
 def handle_child_line(job: dict[str, Any], line: str) -> None:
     if line.startswith("APP_PROGRESS "):
+        if cancel_requested or job.get("cancel_requested"):
+            return
         try:
             updates = json.loads(line[len("APP_PROGRESS "):])
         except json.JSONDecodeError:
@@ -3265,7 +3702,9 @@ def worker() -> None:
     while True:
         job = job_queue.get()
         try:
-            if job.get("status") == "cancelled":
+            if job.get("cancel_requested") or job.get("status") in {"cancelled", "error"}:
+                if job.get("cancel_requested"):
+                    set_job(job, status="cancelled", current_stage="cancelled", stage_detail="Cancelled before starting")
                 lifecycle_log("queued_job_skipped_cancelled", str(job.get("id")))
                 continue
             set_job(job, status="running", progress=0, started=time.time(), heartbeat=time.time())
@@ -3295,6 +3734,9 @@ def worker() -> None:
                 lifecycle_log("spawned", job["id"], child_pid=proc.pid, argv=command)
                 with state_lock:
                     child_processes[job["id"]] = proc
+                # Cancellation may arrive between dequeuing and registration.
+                if cancel_requested or job.get("cancel_requested") or job.get("status") in {"stopping", "cancelled"}:
+                    request_cancel()
                 if proc.stdout:
                     for line in proc.stdout:
                         handle_child_line(job, line.rstrip("\n"))
@@ -3313,7 +3755,7 @@ def worker() -> None:
                     pipeline_state = None
                     pipeline_state_signature = None
                 append_log(job["id"], "Fresh detection completed; invalidated the parent song list and boundaries.")
-            cancelled = cancel_requested or job.get("status") in {"stopping", "cancelled"} or code in {130, 143, 145, 146}
+            cancelled = cancel_requested or job.get("cancel_requested") or job.get("status") in {"stopping", "cancelled"} or code in {130, 143, 145, 146}
             if cancelled:
                 set_job(job, status="cancelled", error=None, current=None, current_stage="cancelled", stage_detail="Cancelled by user", progress=job.get("progress", 0))
                 append_log(job["id"], "Mixing stopped.")
@@ -3333,7 +3775,7 @@ def worker() -> None:
                 append_log(job["id"], "New detection is pending confirmation; current slot list was preserved.")
             elif code == 0:
                 song_count = len(job.get("songs", []))
-                pending_review = job.get("status") == "pending_review" or int(job.get("needs_review_count", 0) or 0) > 0
+                pending_review = job.get("kind") not in {"render", "mix"} and (job.get("status") == "pending_review" or int(job.get("needs_review_count", 0) or 0) > 0)
                 terminal_status = "pending_review" if pending_review else "done"
                 lifecycle_log("render_completed", job["id"], parent_pid=os.getpid(), child_pid=proc.pid, songs=song_count, pending_review=pending_review)
                 set_job(
@@ -3392,6 +3834,7 @@ def index() -> str:
     return render_template(
         "index.html",
         static_version=f"{build.get('app_version', 'dev')}-{build.get('source_revision', 'unbuilt')}-{build.get('app_js_sha256', '')[:16]}",
+        build_version=build.get("app_version", "development"),
     )
 
 
@@ -3401,6 +3844,7 @@ def favicon() -> Response:
 
 
 @app.get("/api/state")
+@source_edit_locked
 def api_state() -> Response:
     global pipeline_state, pipeline_state_signature
     # Loading/detection failures are application state, not a server crash.
@@ -3408,21 +3852,36 @@ def api_state() -> Response:
     # the files found before the failure.
     with state_lock:
         state_ready = pipeline_state is not None
-        detection_active = any(
-            job.get("kind") == "redetect" and job.get("status") in {"queued", "running", "stopping"}
-            for job in jobs
-        )
+    settings = load_settings()
+    source = Path(settings.get("source_folder") or pipeline.SOURCE_DIR).expanduser().resolve()
+    current_source = Path(pipeline.SOURCE_DIR).expanduser().resolve()
+    # The first /api/state must initialize the same source-scoped paths as
+    # Change Folder. Without this, a stale/default pipeline source can scan
+    # one folder while the settings and cache belong to another.
+    if source != current_source or str(pipeline.audio_scan_report().get("source") or "") != str(source):
+        configure_source_folder(source)
+        with state_lock:
+            # Settings may point at a new source while the process still holds
+            # the previous source's in-memory snapshot.
+            pipeline_state = None
+            pipeline_state_signature = None
+        state_ready = False
     if not state_ready:
-        settings = load_settings()
-        source = Path(settings.get("source_folder") or pipeline.SOURCE_DIR).expanduser().resolve()
-        if source != Path(pipeline.SOURCE_DIR).resolve():
-            configure_source_folder(source)
-        # A valid snapshot can be hydrated synchronously and cheaply.  Only
+        # A valid snapshot can be hydrated synchronously and cheaply. Only
         # a cache miss starts the expensive detection worker; this keeps the
         # file list visible instead of making /api/state wait for Whisper.
         try:
             signature = detection_state_signature()
             snapshot = None if pipeline.DETECTION_RESCAN_MODE else load_detection_snapshot(signature)
+            legacy_snapshot_reason = legacy_single_slot_snapshot_reason(snapshot)
+            if legacy_snapshot_reason:
+                lifecycle_log(
+                    "legacy_one_slot_snapshot_ignored",
+                    source_folder=str(source),
+                    reason=legacy_snapshot_reason,
+                )
+                print("API STATE: ignoring legacy one-slot snapshot: " + legacy_snapshot_reason, flush=True)
+                snapshot = None
         except Exception as exc:
             snapshot = None
             lifecycle_log("source_scan_signature_failed", error=f"{type(exc).__name__}: {exc}")
@@ -3439,28 +3898,53 @@ def api_state() -> Response:
                 pipeline.AUDIO_SCAN_REPORT = report
             except Exception as exc:
                 return jsonify(_loading_state(f"{type(exc).__name__}: {exc}")), 200
-        if not detection_active:
-            # A cache miss must perform the real song detection. The lightweight
-            # scan is useful for diagnostics, but it cannot produce usable slots
-            # without Whisper and otherwise leaves a misleading one-block session.
-            api_redetect(True)
-        return jsonify(_loading_state()), 200
+        detection_job = _active_redetect_job(source)
+        if detection_job is None:
+            recent_incomplete = None
+            for candidate in reversed(current_jobs()):
+                if (
+                    candidate.get("kind") == "redetect"
+                    and str(Path(candidate.get("source_folder") or "").expanduser().resolve()) == str(source)
+                    and candidate.get("status") in {"pending_review", "pending_confirmation"}
+                    and candidate.get("fingerprint") == source_job_identity(signature)["fingerprint"]
+                ):
+                    recent_incomplete = candidate
+                    break
+            if recent_incomplete is not None:
+                warning = str(
+                    recent_incomplete.get("warning")
+                    or recent_incomplete.get("stage_detail")
+                    or "Detection produced no usable multi-song session."
+                )
+                return jsonify(_loading_state(warning, recent_incomplete)), 200
+            # Initial loading uses acoustic detection. Optional Whisper analysis
+            # is a separate explicit UI action and cannot block registration.
+            detection_job = _queue_redetect_job(False)
+        return jsonify(_loading_state(detection_job=detection_job)), 200
     return jsonify(public_state()), 200
 
-
 @app.get("/api/cuts/<int:song_id>")
+@source_edit_locked
 def api_cuts(song_id: int) -> Response:
     """Return cached waveform plus automatic boundary evidence for Select Cuts."""
     state = ensure_pipeline_state()
     if song_id < 1 or song_id > len(state["segments"]):
         return jsonify({"error": "song not found"}), 404
     selected = state["segments"][song_id - 1]
-    waveform = slot_waveform(float(selected.start), float(selected.end))
-    global_waveform = full_session_waveform()
+    waveform_key = hashlib.sha256(json.dumps(_waveform_identity(), sort_keys=True).encode()).hexdigest()
+    global_waveform = full_session_waveform() if request.args.get("waveform_key") != waveform_key else None
+    # The canvas draws the global curve. Building an unused per-slot waveform
+    # incurred thousands of random disk reads on every edited interval.
+    duration = float(selected.end - selected.start)
+    peaks = (global_waveform or {}).get("peaks", [])
+    positions = np.linspace(float((global_waveform or {}).get("window_start_sec", 0)), float((global_waveform or {}).get("window_end_sec", 0)), len(peaks))
+    selected_peaks = np.interp(np.linspace(float(selected.start), float(selected.end), min(1400, max(2, len(peaks)))), positions, peaks).tolist() if peaks else []
+    waveform = {"window_start_sec": float(selected.start), "window_end_sec": float(selected.end), "duration_sec": duration, "peaks": selected_peaks, "cached": bool((global_waveform or {}).get("cached"))}
     markers = []
     for index, segment in enumerate(state["segments"], 1):
         markers.append({
             "song_id": index,
+            "display_number": segment.assigned_song_number if segment.assigned_song_number is not None else index,
             "start_sec": float(segment.start),
             "end_sec": float(segment.end),
             "duration_sec": float(segment.duration),
@@ -3475,6 +3959,7 @@ def api_cuts(song_id: int) -> Response:
         "song_id": song_id,
         "waveform": waveform,
         "global_waveform": global_waveform,
+        "waveform_key": waveform_key,
         "selection": {"start_sec": float(selected.start), "end_sec": float(selected.end)},
         "markers": markers,
         "bounds": {"min_sec": pipeline.HARD_MIN_SONG_SECONDS, "max_sec": pipeline.HARD_MAX_SONG_SECONDS},
@@ -3488,71 +3973,135 @@ def api_cuts(song_id: int) -> Response:
     })
 
 
+def cut_source_audio_blocks(stems: list, sample_rate: int, first_frame: int, frames: int):
+    """Downmix requested timeline frames only; never decode/cache a complete song."""
+    with contextlib.ExitStack() as stack:
+        sources = []
+        for stem in stems:
+            try:
+                sources.append((stem, stack.enter_context(sf.SoundFile(str(stem.path)))))
+            except (OSError, RuntimeError):
+                continue
+        cursor = first_frame
+        remaining = frames
+        while remaining > 0:
+            count = min(sample_rate, remaining)
+            mix = np.zeros(count, dtype=np.float32)
+            for stem, audio in sources:
+                start_sec = cursor / sample_rate
+                end_sec = (cursor + count) / sample_rate
+                offset = float(stem.offset_seconds)
+                lo = max(start_sec, offset)
+                hi = min(end_sec, offset + audio.frames / audio.samplerate)
+                if hi <= lo:
+                    continue
+                divisor = math.gcd(audio.samplerate, sample_rate)
+                down = audio.samplerate // divisor
+                margin = max(down, audio.samplerate // 50)
+                first_native = max(0, int((lo - offset) * audio.samplerate) - margin)
+                first_native -= first_native % down
+                last_native = min(audio.frames, int(math.ceil((hi - offset) * audio.samplerate)) + margin)
+                audio.seek(first_native)
+                values = audio.read(last_native - first_native, dtype="float32", always_2d=True)
+                if not len(values):
+                    continue
+                mono = audio_signal.resample_poly(np.mean(values, axis=1), sample_rate // divisor, down)
+                at = int(round((offset + first_native / audio.samplerate - start_sec) * sample_rate))
+                if at < 0:
+                    mono = mono[-at:]; at = 0
+                used = min(len(mono), count - at)
+                if used > 0:
+                    mix[at:at + used] += mono[:used]
+            mix /= max(1.0, math.sqrt(len(sources)))
+            yield (np.clip(mix, -1, 1) * 32767).astype("<i2").tobytes()
+            cursor += count; remaining -= count
+
+
 @app.get("/api/cuts/audio/<int:song_id>")
+@source_edit_locked
 def api_cut_audio(song_id: int) -> Response:
-    """Provide a temporary downmix of only the selected source slot for playback."""
     state = ensure_pipeline_state()
     if song_id < 1 or song_id > len(state["segments"]):
         return Response(status=404)
-    segment = state["segments"][song_id - 1]
-    start, end = float(segment.start), float(segment.end)
-    signature = hashlib.sha256(f"{Path(pipeline.SOURCE_DIR).resolve()}:{start:.3f}:{end:.3f}".encode()).hexdigest()[:24]
-    CUT_AUDIO_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    path = CUT_AUDIO_CACHE_ROOT / f"{signature}.wav"
-    if not path.exists():
-        stems = state.get("stems", [])
-        if not stems:
-            return jsonify({"error": "No source stems available for playback."}), 404
-        sample_rate = int(round(float(stems[0].samplerate)))
-        frame_count = max(1, int(round((end - start) * sample_rate)))
-        mix = np.zeros(frame_count, dtype=np.float32)
-        used = 0
-        for stem in stems:
-            try:
-                with sf.SoundFile(str(stem.path)) as audio_file:
-                    sr = float(audio_file.samplerate)
-                    local_start = max(0, int(round((start - float(stem.offset_seconds)) * sr)))
-                    audio_file.seek(local_start)
-                    remaining = frame_count
-                    cursor = 0
-                    while remaining > 0:
-                        block = audio_file.read(min(262144, remaining), dtype="float32", always_2d=True)
-                        if len(block) == 0:
-                            break
-                        mix[cursor:cursor + len(block)] += np.mean(block, axis=1).astype(np.float32)
-                        cursor += len(block)
-                        remaining -= len(block)
-                used += 1
-            except (OSError, RuntimeError, ValueError):
-                continue
-        if used == 0:
-            return jsonify({"error": "Source stems could not be read for playback."}), 404
-        mix /= max(1, used)
-        peak = float(np.max(np.abs(mix))) if len(mix) else 0.0
-        if peak > 0.95:
-            mix *= 0.95 / peak
-        sf.write(path, mix, sample_rate, subtype="PCM_16")
-    return ranged_file_response(path, mimetype="audio/wav")
+    stems = list(state.get("stems", []))
+    if not stems:
+        return jsonify({"error": "No source stems available for playback."}), 404
+    rate = 16000
+    duration = max(float(stem.offset_seconds) + float(stem.timeline_duration) for stem in stems)
+    frames = int(math.ceil(duration * rate)); data_size = frames * 2
+    header = struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + data_size, b"WAVE", b"fmt ", 16, 1, 1, rate, rate * 2, 2, 16, b"data", data_size)
+    total = len(header) + data_size
+    first, last = 0, total - 1
+    value = request.headers.get("Range")
+    if value:
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+        if not match or not any(match.groups()):
+            return Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+        lo, hi = match.groups()
+        if lo:
+            first = int(lo); last = min(int(hi), last) if hi else last
+        else:
+            first = max(0, total - int(hi))
+        if first > last or first >= total:
+            return Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+    def stream():
+        if first < 44:
+            yield header[first:min(44, last + 1)]
+        low = max(first, 44) - 44
+        high = last - 44 + 1
+        if high <= low:
+            return
+        frame = low // 2; byte_offset = low % 2
+        remaining = high - low
+        for block in cut_source_audio_blocks(stems, rate, frame, math.ceil((byte_offset + remaining) / 2)):
+            block = block[byte_offset:]; byte_offset = 0
+            chunk = block[:remaining]
+            yield chunk
+            remaining -= len(chunk)
+            if remaining <= 0:
+                break
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(last - first + 1), "Cache-Control": "no-store"}
+    if value:
+        headers["Content-Range"] = f"bytes {first}-{last}/{total}"
+    return Response(stream(), status=206 if value else 200, mimetype="audio/wav", headers=headers)
 
 
 @app.post("/api/segment-selection/<int:song_id>")
+@source_edit_locked
 def api_segment_selection(song_id: int) -> Response:
     """Persist the human selection; automatic detection remains untouched."""
     state = ensure_pipeline_state()
     if song_id < 1 or song_id > len(state["segments"]):
         return jsonify({"error": "song not found"}), 404
     payload = request.get_json(force=True, silent=True) or {}
+    if payload.get("source_folder") and Path(payload["source_folder"]).resolve() != Path(pipeline.SOURCE_DIR).resolve():
+        return jsonify({"error": "Project changed; reopen Edit Cuts."}), 409
     try:
         start = float(payload["start_sec"])
         end = float(payload["end_sec"])
     except (KeyError, TypeError, ValueError):
         return jsonify({"error": "start_sec and end_sec must be numbers"}), 400
     duration = end - start
-    if not pipeline.HARD_MIN_SONG_SECONDS <= duration <= pipeline.HARD_MAX_SONG_SECONDS:
-        return jsonify({"error": f"Selection must be between 8:00 and 13:00 (received {duration:.2f}s)."}), 400
+    if not math.isfinite(start) or not math.isfinite(end) or duration < 0.1:
+        return jsonify({"error": "Selection must have a positive duration."}), 400
     source_duration = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in state["stems"]), default=0.0)
     if start < 0 or end > source_duration:
         return jsonify({"error": "Selection is outside the source duration."}), 400
+    history = load_json(EDITOR_HISTORY_PATH, {"undo": [], "redo": []})
+    history.setdefault("undo", []).append(_editor_snapshot(state))
+    history["undo"] = history["undo"][-20:]
+    history["redo"] = []
+    previous = state["segments"][song_id - 1]
+    if song_id > 1:
+        left = state["segments"][song_id - 2]
+        shared = abs(left.end - previous.start) < 0.01
+        if (shared and start <= left.start) or (not shared and start < left.end):
+            return jsonify({"error": "Start overlaps the previous song."}), 400
+    if song_id < len(state["segments"]):
+        right = state["segments"][song_id]
+        shared = abs(right.start - previous.end) < 0.01
+        if (shared and end >= right.end) or (not shared and end > right.start):
+            return jsonify({"error": "End overlaps the next song."}), 400
     saved = load_json(SEGMENT_SELECTIONS_PATH, {"version": 1, "segments": {}})
     if not isinstance(saved, dict):
         saved = {"version": 1, "segments": {}}
@@ -3584,6 +4133,10 @@ def api_segment_selection(song_id: int) -> Response:
         boundary_validation="manual-selection",
         boundary_validation_reason="user timeline selection",
     )
+    if song_id > 1 and abs(state["segments"][song_id - 2].end - previous.start) < 0.01:
+        state["segments"][song_id - 2] = replace(state["segments"][song_id - 2], end=start, core_end=start, nominal_end=start)
+    if song_id < len(state["segments"]) and abs(state["segments"][song_id].start - previous.end) < 0.01:
+        state["segments"][song_id] = replace(state["segments"][song_id], start=end, core_start=end)
     state["segments"][song_id - 1] = updated
     if song_id <= len(state.get("raw_songs", [])):
         row = state["raw_songs"][song_id - 1]
@@ -3596,26 +4149,57 @@ def api_segment_selection(song_id: int) -> Response:
         global pipeline_state, pipeline_state_signature
         pipeline_state = state
         pipeline_state_signature = detection_state_signature()
-        if state.get("raw_songs") and all(hasattr(stem, "path") for stem in state.get("stems", [])):
-            save_detection_snapshot(state, pipeline_state_signature)
+    persist_manual_editor_state(state)
+    save_json_atomic(EDITOR_HISTORY_PATH, history)
     append_log("ui", f"Saved manual cut for song {song_id}: {start:.3f}-{end:.3f}s")
-    return jsonify({"ok": True, "song_id": song_id, "start_sec": start, "end_sec": end, "duration_sec": duration, "source": "manual"})
+    return jsonify({"ok": True, "song_id": song_id, "start_sec": start, "end_sec": end, "duration_sec": duration, "source": "manual", **editor_result_state(state)})
 
 
 def _editor_snapshot(state: dict[str, Any]) -> dict[str, Any]:
-    return {"segments": [asdict(segment) for segment in state.get("segments", [])], "raw_songs": state.get("raw_songs", [])}
+    return json.loads(json.dumps({"segments": [asdict(segment) for segment in state.get("segments", [])], "raw_songs": state.get("raw_songs", []),
+        "overrides": load_json(OVERRIDES_PATH, {"songs": {}}),
+        "names": load_json(SONG_NAMES_PATH, {"songs": {}}),
+        "skipped": sorted(load_skipped_segments())}))
 
 
 def _restore_editor_snapshot(state: dict[str, Any], snapshot: dict[str, Any]) -> None:
     segments = [pipeline.Segment(**item) for item in snapshot.get("segments", [])]
     state["segments"] = segments
     state["raw_songs"] = snapshot.get("raw_songs", [])
+    if "overrides" in snapshot: save_json_atomic(OVERRIDES_PATH, snapshot["overrides"])
+    if "names" in snapshot: save_json_atomic(SONG_NAMES_PATH, snapshot["names"])
+    if "skipped" in snapshot: save_skipped_segments(snapshot["skipped"])
+
+
+def editor_result_state(state: dict[str, Any]) -> dict[str, Any]:
+    """The persisted timeline is authoritative immediately after every edit."""
+    return {"slot_count": len(state["segments"]), "songs": visible_songs(state, load_settings(), load_json(HISTORY_PATH, {})),
+            "overrides": load_json(OVERRIDES_PATH, {"songs": {}}),
+            "segments": [{"start": s.start, "end": s.end} for s in state["segments"]]}
+
+
+def persist_manual_editor_state(state: dict[str, Any]) -> None:
+    state["manual_editor_authoritative"] = True
+    state["candidate_pending"] = False
+    state["segmentation_status"] = "ready"
+    state.setdefault("detection_calibration", {}).update(count=len(state["segments"]), expected_target=len(state["segments"]), candidate_pending=False, session_segmentation_usable=True)
+    # Raw rows must reflect all shared-boundary edits, including neighbouring slots.
+    for row, segment in zip(state.get("raw_songs", []), state["segments"]):
+        row.update(start=segment.start, end=segment.end, render_end=segment.end,
+                   duration=segment.duration, duration_text=fmt_time(segment.duration),
+                   segment=asdict(segment), assigned_song_number=segment.assigned_song_number)
+    if state.get("raw_songs") and all(hasattr(stem, "path") for stem in state.get("stems", [])):
+        save_detection_snapshot(state, detection_state_signature())
+        save_json_atomic(MANUAL_EDITOR_STATE_PATH, load_json(DETECTION_STATE_PATH, {}))
 
 
 @app.post("/api/editor-cut-operation")
+@source_edit_locked
 def api_editor_cut_operation() -> Response:
     """Apply one explicit global-editor operation without running detection."""
     payload = request.get_json(force=True, silent=True) or {}
+    if payload.get("source_folder") and Path(payload["source_folder"]).resolve() != Path(pipeline.SOURCE_DIR).resolve():
+        return jsonify({"error": "Project changed; reopen Edit Cuts."}), 409
     operation = str(payload.get("operation") or "").strip().lower()
     state = ensure_pipeline_state()
     history = load_json(EDITOR_HISTORY_PATH, {"undo": [], "redo": []})
@@ -3624,7 +4208,14 @@ def api_editor_cut_operation() -> Response:
     history.setdefault("undo", []); history.setdefault("redo", [])
     current = _editor_snapshot(state)
     row_hints: list[dict[str, Any] | None] | None = None
-    if operation in {"undo", "redo"}:
+    if operation == "numbering":
+        first = payload.get("first_song_number")
+        if first not in (0, 1):
+            return jsonify({"error": "first_song_number must be 0 or 1"}), 400
+        history["undo"].append(current); history["redo"] = []
+        state["segments"] = [replace(seg, assigned_song_number=i + first) for i, seg in enumerate(state["segments"])]
+        row_hints = list(state.get("raw_songs", []))
+    elif operation in {"undo", "redo"}:
         source = history["undo"] if operation == "undo" else history["redo"]
         target = history["redo"] if operation == "undo" else history["undo"]
         if not source:
@@ -3638,8 +4229,17 @@ def api_editor_cut_operation() -> Response:
             return jsonify({"error": "at_sec is required for this editor operation."}), 400
         index = next((i for i, segment in enumerate(state["segments"]) if segment.start < at < segment.end), None)
         if operation == "add":
+            source_end = max((float(stem.offset_seconds) + float(stem.timeline_duration) for stem in state["stems"]), default=0.0)
+            if not math.isfinite(at) or at <= 0 or at >= source_end:
+                return jsonify({"error": "Cut is outside the recording."}), 400
+            if any(abs(at - edge) < 0.1 for seg in state["segments"] for edge in (seg.start, seg.end)):
+                return jsonify({"error": "A cut already exists here."}), 409
             if index is None:
-                return jsonify({"error": "Playhead is not inside a slot."}), 400
+                index = next((i for i, seg in enumerate(state["segments"]) if seg.start > at), len(state["segments"]))
+                low = state["segments"][index - 1].end if index else 0.0
+                high = state["segments"][index].start if index < len(state["segments"]) else source_end
+                state["segments"].insert(index, pipeline.Segment(low, high, boundary_source="manual-uncovered-region"))
+                rows = list(state.get("raw_songs", [])); rows.insert(index, {}); state["raw_songs"] = rows
             segment = state["segments"][index]
             left = replace(segment, end=at, core_end=at, nominal_end=at, boundary_source="manual-add-cut", boundary_validation="manual-selection", boundary_validation_reason="user added cut")
             right = replace(segment, start=at, core_start=at, boundary_source="manual-add-cut", boundary_validation="manual-selection", boundary_validation_reason="user added cut")
@@ -3656,8 +4256,8 @@ def api_editor_cut_operation() -> Response:
             if pair is None:
                 return jsonify({"error": "No slot boundary near the selected marker."}), 400
             left, right = state["segments"][pair], state["segments"][pair + 1]
-            if not left.start + pipeline.HARD_MIN_SONG_SECONDS <= new_boundary <= right.end - pipeline.HARD_MIN_SONG_SECONDS:
-                return jsonify({"error": "The moved cut would create a slot outside the 8–13 minute safety range."}), 400
+            if not left.start + 0.1 <= new_boundary <= right.end - 0.1:
+                return jsonify({"error": "The moved cut would create an empty slot."}), 400
             state["segments"][pair:pair + 2] = [
                 replace(left, end=new_boundary, core_end=new_boundary, nominal_end=new_boundary, boundary_source="manual-move-cut", boundary_validation="manual-selection", boundary_validation_reason="user moved shared cut"),
                 replace(right, start=new_boundary, core_start=new_boundary, boundary_source="manual-move-cut", boundary_validation="manual-selection", boundary_validation_reason="user moved shared cut"),
@@ -3683,24 +4283,38 @@ def api_editor_cut_operation() -> Response:
     session_id = next((row.get("session_id") for row in old_rows if row.get("session_id")), session_id_for_signature(detection_state_signature()))
     rows = []
     for ordinal, segment in enumerate(state["segments"], 1):
-        old = row_hints[ordinal - 1] if row_hints is not None and ordinal - 1 < len(row_hints) else next((candidate for candidate in old_rows if abs(float(candidate.get("source_start", candidate.get("start", -999999))) - segment.start) <= 0.01 and abs(float(candidate.get("source_end", candidate.get("end", -999999))) - segment.end) <= 0.01), None)
+        old = row_hints[ordinal - 1] if row_hints is not None and ordinal - 1 < len(row_hints) else next((candidate for candidate in old_rows if abs(float(candidate.get("start", -999999)) - segment.start) <= 0.01 and abs(float(candidate.get("end", -999999)) - segment.end) <= 0.01), None)
         row = dict(old or {})
-        row.update({"id": ordinal, "session_id": row.get("session_id") or session_id, "slot_id": row.get("slot_id") or f"{session_id}:manual-slot-{ordinal:03d}", "start": segment.start, "end": segment.end, "source_start": row.get("source_start", segment.start), "source_end": row.get("source_end", segment.end), "duration": segment.duration, "duration_text": fmt_time(segment.duration), "render_end": segment.end, "segment": asdict(segment), "proposal_status": "manual", "revision": int(row.get("revision", 0) or 0) + 1})
+        row.update({"id": ordinal, "session_id": row.get("session_id") or session_id, "slot_id": row.get("slot_id") or f"{session_id}:manual-{hashlib.sha256(f'{segment.start:.6f}:{segment.end:.6f}:{time.time_ns()}'.encode()).hexdigest()[:16]}", "start": segment.start, "end": segment.end, "source_start": row.get("source_start", segment.start), "source_end": row.get("source_end", segment.end), "duration": segment.duration, "duration_text": fmt_time(segment.duration), "render_end": segment.end, "segment": asdict(segment), "proposal_status": "manual", "revision": int(row.get("revision", 0) or 0) + 1})
         rows.append(row)
+    if operation not in {"undo", "redo", "numbering"}:
+        new_ids = {row.get("slot_id"): str(row["id"]) for row in rows if row.get("slot_id")}
+        mapping = {str(row.get("id")): new_ids[row["slot_id"]] for row in current.get("raw_songs", []) if row.get("slot_id") in new_ids}
+        for path, key in ((OVERRIDES_PATH, "overrides"), (SONG_NAMES_PATH, "names")):
+            stored = json.loads(json.dumps(current.get(key, {"songs": {}})))
+            stored["songs"] = {mapping[old]: value for old, value in stored.get("songs", {}).items() if old in mapping}
+            save_json_atomic(path, stored)
+        save_skipped_segments([int(mapping[str(old)]) for old in current.get("skipped", []) if str(old) in mapping])
+    if operation in {"add", "delete", "merge", "move"}:
+        first_number = 0 if current.get("segments", [{}])[0].get("assigned_song_number") == 0 else 1
+        state["segments"] = [replace(seg, assigned_song_number=i + first_number) for i, seg in enumerate(state["segments"])]
     state["raw_songs"] = rows
     with state_lock:
         global pipeline_state, pipeline_state_signature
         pipeline_state = state
         pipeline_state_signature = detection_state_signature()
-        save_detection_snapshot(state, pipeline_state_signature)
+    persist_manual_editor_state(state)
     save_json_atomic(EDITOR_HISTORY_PATH, history)
     append_log("ui", f"Global editor operation {operation} applied at {payload.get('at_sec')}")
-    return jsonify({"ok": True, "operation": operation, "slot_count": len(state["segments"]), "segments": [{"start": s.start, "end": s.end} for s in state["segments"]]})
+    return jsonify({"ok": True, "operation": operation, **editor_result_state(state)})
 
 
 @app.post("/api/overrides")
+@source_edit_locked
 def api_overrides() -> Response:
     payload = request.get_json(force=True, silent=True) or {"songs": {}}
+    if payload.get("source_folder") and Path(payload["source_folder"]).resolve() != Path(pipeline.SOURCE_DIR).resolve():
+        return jsonify({"error": "Project changed; reopen Fine Tune."}), 409
     payload = normalize_overrides(payload)
     current = normalize_overrides(load_json(OVERRIDES_PATH, {"songs": {}}))
     current_songs = current.setdefault("songs", {})
@@ -3781,7 +4395,7 @@ def api_mix_plan_status(segment_id: int) -> Response:
     """Report whether the frozen per-song DSP plan is usable for Render.
 
     This is deliberately read-only: Render may ask whether preparation is
-    required, but it must never start Analyze implicitly in the worker.
+    required. A worker prepares a missing per-song analysis before mixing.
     """
     try:
         state = load_render_state()
@@ -3804,6 +4418,7 @@ def api_mix_plan_status(segment_id: int) -> Response:
 
 
 @app.post("/api/settings")
+@source_edit_locked
 def api_settings() -> Response:
     global pipeline_state, pipeline_state_signature, last_load_error
     payload = request.get_json(force=True, silent=True) or {}
@@ -3825,6 +4440,8 @@ def api_settings() -> Response:
             return jsonify({"error": "source folder not found"}), 400
         configure_source_folder(source)
         last_load_error = ""
+        if settings.get("source_folder") != str(source):
+            settings["last_render_dir"] = str(load_json(ACTIVE_SOURCE_STATE_ROOT / "project_settings.json", {}).get("last_render_dir") or out_dir())
         settings["source_folder"] = str(source)
         with state_lock:
             pipeline_state = None
@@ -3925,11 +4542,148 @@ def api_song_name(segment_id: int) -> Response:
     return jsonify({"ok": True, "name": name})
 
 
-@app.post("/api/redetect")
-def api_redetect(allow_whisper: bool = True) -> Response:
-    payload = request.get_json(force=True, silent=True) or {}
-    if "allow_whisper" in payload:
-        allow_whisper = bool(payload.get("allow_whisper"))
+def _pid_is_alive(value: Any) -> bool:
+    """Return whether a recorded worker PID still exists."""
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _active_redetect_job(source: str | Path | None = None) -> dict[str, Any] | None:
+    """Return a genuinely live detection job for the selected source.
+
+    A stale in-memory job used to block both initial loading and Redetect
+    Songs forever. The status file is authoritative when available, and an
+    active job is only retained while its worker is alive or its heartbeat is
+    still fresh.
+    """
+    expected = str(Path(source or pipeline.SOURCE_DIR).expanduser().resolve())
+    active_statuses = {"queued", "running", "stopping"}
+    terminal_statuses = {
+        "done",
+        "pending_review",
+        "pending_confirmation",
+        "error",
+        "cancelled",
+        "finished",
+    }
+    with state_lock:
+        candidates = [
+            job for job in jobs
+            if job.get("kind") == "redetect"
+            and str(Path(job.get("source_folder") or "").expanduser().resolve()) == expected
+            and job.get("status") in active_statuses
+        ]
+
+    live: list[dict[str, Any]] = []
+    now = time.time()
+    for job in candidates:
+        status = read_job_status_for_job(job)
+        if isinstance(status, dict):
+            with state_lock:
+                job.update(status)
+
+        current_status = str(job.get("status") or "")
+        if current_status in terminal_statuses or current_status not in active_statuses:
+            continue
+
+        child_pid = job.get("child_pid") or job.get("pid")
+        heartbeat_raw = (
+            job.get("heartbeat")
+            or job.get("progress_updated_at")
+            or job.get("updated_at")
+            or job.get("created")
+            or 0
+        )
+        try:
+            heartbeat = float(heartbeat_raw)
+        except (TypeError, ValueError):
+            heartbeat = 0.0
+
+        orphaned = False
+        orphan_reason = ""
+        if job.get("fingerprint") != source_job_identity(detection_state_signature())["fingerprint"]:
+            orphaned = True
+            orphan_reason = "source fingerprint changed or is missing"
+        elif heartbeat and now - heartbeat > ORPHANED_ACTIVE_JOB_SECONDS:
+            orphaned = True
+            orphan_reason = "worker heartbeat expired"
+        elif child_pid not in (None, ""):
+            if not _pid_is_alive(child_pid):
+                orphaned = True
+                orphan_reason = f"recorded worker PID {child_pid} is no longer alive"
+        elif heartbeat and now - heartbeat > ORPHANED_ACTIVE_JOB_SECONDS:
+            orphaned = True
+            orphan_reason = "no worker PID or fresh heartbeat was recorded"
+
+        if orphaned:
+            # Signal only a child owned by this process, never an arbitrary
+            # persisted PID that could have been reused by macOS.
+            owned_child = child_processes.get(str(job.get("id")))
+            if owned_child is not None and owned_child.poll() is None:
+                try:
+                    signal_owned_process_group(owned_child)
+                except ProcessLookupError:
+                    pass
+            finished_at = time.time()
+            recovered = {
+                "status": "error",
+                "error": (
+                    "Redetect job was recovered as orphaned; its worker is no longer running. "
+                    "Start Redetect Songs again."
+                ),
+                "current_stage": "error",
+                "stage_detail": "stale/orphaned detection recovered",
+                "finished_at": finished_at,
+                "updated_at": finished_at,
+                "heartbeat": finished_at,
+                "termination": "orphaned redetect recovered",
+                "orphan_reason": orphan_reason,
+            }
+            with state_lock:
+                job.update(recovered)
+            write_job_status(job)
+            lifecycle_log(
+                "redetect_orphaned_recovered",
+                str(job.get("id") or ""),
+                source_folder=expected,
+                reason=orphan_reason,
+            )
+            continue
+
+        live.append(job)
+
+    return dict(live[-1]) if live else None
+
+
+@source_edit_locked
+def _queue_redetect_job(allow_whisper: bool = True) -> dict[str, Any]:
+    """Serialize simultaneous requests so double clicks cannot queue duplicates."""
+    with state_lock:
+        return _queue_redetect_job_locked(allow_whisper)
+
+
+def _queue_redetect_job_locked(allow_whisper: bool) -> dict[str, Any]:
+    """Queue exactly one source-scoped detection job and return its snapshot."""
+    source = str(Path(load_settings().get("source_folder") or pipeline.SOURCE_DIR).expanduser().resolve())
+    configure_source_folder(source)
+    signature = detection_state_signature()
+    identity = source_job_identity(signature)
+    existing = _active_redetect_job(source)
+    if existing:
+        return existing
     job_id = f"{int(time.time())}-{len(jobs) + 1}"
     job = {
         "id": job_id,
@@ -3941,14 +4695,18 @@ def api_redetect(allow_whisper: bool = True) -> Response:
         "song_progress": 0,
         "created": time.time(),
         "current": None,
-        "current_stage": "waiting",
-        "stage_detail": "",
+        "current_stage": "scanning folder",
+        "stage_detail": "Scanning source folder before detection",
         "started": None,
         "heartbeat": None,
         "done_count": 0,
         "total_count": 1,
         "lifecycle_log_path": str(LIFECYCLE_LOG_PATH),
         "allow_whisper": bool(allow_whisper),
+        "source_folder": source,
+        **identity,
+        "detection_mode": "fresh",
+        "build": runtime_build_metadata(),
     }
     with state_lock:
         jobs.append(job)
@@ -3956,15 +4714,22 @@ def api_redetect(allow_whisper: bool = True) -> Response:
     lifecycle_log(
         "redetect_queued",
         job_id,
-        source_folder=str(pipeline.SOURCE_DIR),
+        source_folder=source,
         audio_scan_mode=str(load_settings().get("audio_scan_mode") or "auto"),
         cache_path=str(pipeline.detection_cache_path()),
+        allow_whisper=bool(allow_whisper),
     )
     job_queue.put(job)
     append_log(job["id"], "Queued song search.")
-    return jsonify(job)
+    return dict(job)
 
 
+@app.post("/api/redetect")
+def api_redetect(allow_whisper: bool = True) -> Response:
+    payload = request.get_json(force=True, silent=True) or {}
+    if "allow_whisper" in payload:
+        allow_whisper = bool(payload.get("allow_whisper"))
+    return jsonify(_queue_redetect_job(allow_whisper))
 def configured_slot_target() -> int | None:
     raw = getattr(pipeline, "EXPECTED_SLOT_COUNT", None)
     if raw in (None, ""):
@@ -3980,6 +4745,9 @@ def api_redetect_candidate() -> Response:
     candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
     if not isinstance(candidate, dict):
         return jsonify({"available": False})
+    requested_job = request.args.get("job_id")
+    if requested_job and candidate.get("job_id") != requested_job:
+        return jsonify({"available": False, "error": "Candidate belongs to another detection job."}), 409
     current = load_json(DETECTION_STATE_PATH, {})
     old_count = len(current.get("raw_songs", [])) if isinstance(current, dict) else 0
     new_count = len(candidate.get("raw_songs", []))
@@ -3996,14 +4764,29 @@ def api_redetect_candidate() -> Response:
 
 
 @app.post("/api/redetect/commit")
+@source_edit_locked
 def api_redetect_commit() -> Response:
     candidate = load_json(REDETECTION_CANDIDATE_PATH, None)
     if not isinstance(candidate, dict):
         return jsonify({"error": "No pending full-session detection is available."}), 409
+    requested_job = (request.get_json(silent=True) or {}).get("job_id")
+    if requested_job and candidate.get("job_id") != requested_job:
+        return jsonify({"error": "Candidate belongs to another detection job."}), 409
     count = len(candidate.get("raw_songs", []))
     if count < 2:
         return jsonify({"error": f"Refusing to replace the current session with only {count} detected slot(s)."}), 409
+    if candidate.get("candidate_pending") or legacy_single_slot_snapshot_reason(candidate):
+        return jsonify({"error": "Detection is incomplete; current session preserved."}), 409
+    expected = detection_state_signature()
+    if candidate.get("source_signature") != [expected[0], list(expected[1]), [list(item) for item in expected[2]]]:
+        return jsonify({"error": "Source changed since detection; run Detect Songs again."}), 409
+    candidate["fingerprint"] = source_job_identity(expected)["fingerprint"]
+    previous_manual = load_json(MANUAL_EDITOR_STATE_PATH, None)
+    if isinstance(previous_manual, dict):
+        save_json_atomic(ACTIVE_SOURCE_STATE_ROOT / f"manual-editor-before-redetect-{time.time_ns()}.json", previous_manual)
     save_json_atomic(DETECTION_STATE_PATH, candidate)
+    # Only explicit confirmation may replace the authoritative human timeline.
+    save_json_atomic(MANUAL_EDITOR_STATE_PATH, candidate)
     try:
         REDETECTION_CANDIDATE_PATH.unlink()
     except FileNotFoundError:
@@ -4254,8 +5037,15 @@ def api_render_many() -> Response:
 
 @app.post("/api/cancel")
 def api_cancel() -> Response:
-    request_cancel()
-    return jsonify({"ok": True})
+    # Do not make the browser wait for filesystem writes or process cleanup.
+    # The cancellation routine marks the job and signals its process group in
+    # the background; the UI can close its loading surface immediately.
+    threading.Thread(
+        target=request_cancel,
+        name="zucker-cancel",
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True, "status": "stopping"}), 202
 
 
 @app.get("/api/jobs")
@@ -4347,42 +5137,124 @@ def stem_full_preview(segment_id: int, stem_index: int) -> Response:
     start_ms = int(round(segment.start * 1000))
     end_ms = int(round(segment.end * 1000))
     channels = 1 if stem.channels == 1 else 2
-    bitrate = "64k" if channels == 1 else "96k"
-    path = PREVIEW_DIR / f"song_{segment_id:03d}_full_stem_{stem_index:02d}_{start_ms}_{end_ms}_{safe_stem}.mp3"
+    bitrate = "128k" if channels == 1 else "192k"
+    # Encode quiet sources near full scale, then restore their original level
+    # in the browser. PCM16 before makeup adds audible quantization hiss.
+    analysis = song_analysis_snapshot(state, segment, segment_id)
+    source_peak_db = float(analysis.get("segment_peaks_db", {}).get(stem.path.name, 0.0))
+    encoding_gain_db = float(np.clip(-6.0 - source_peak_db, 0.0, 60.0))
+    if not np.isfinite(encoding_gain_db):
+        encoding_gain_db = 0.0
+    encoding_gain = pipeline.db_to_amp(encoding_gain_db)
+    path = PREVIEW_DIR / f"song_{segment_id:03d}_full_v4_stem_{stem_index:02d}_{start_ms}_{end_ms}_{encoding_gain_db:.2f}_{safe_stem}.mp3"
     if not path.exists():
         chunk_frames = int(round(30.0 * sr))
-        with tempfile.TemporaryDirectory(prefix=f"zucker_preview_{segment_id:03d}_{stem_index:02d}_") as tmp:
-            wav_path = Path(tmp) / "stem.wav"
-            with sf.SoundFile(str(wav_path), "w", samplerate=sr, channels=channels, subtype="PCM_16") as writer:
-                for chunk_start in range(0, target_frames, chunk_frames):
-                    nframes = min(chunk_frames, target_frames - chunk_start)
-                    chunk = pipeline.read_stem_chunk(stem, segment, chunk_start, nframes)
-                    if chunk is None:
-                        chunk = np.zeros((nframes, channels), dtype=np.float32) if channels > 1 else np.zeros(nframes, dtype=np.float32)
-                    if channels == 1 and chunk.ndim == 2:
-                        chunk = np.mean(chunk, axis=1).astype(np.float32)
-                    elif channels == 2 and chunk.ndim == 1:
-                        chunk = np.column_stack((chunk, chunk)).astype(np.float32)
-                    writer.write(chunk[:nframes])
-            cmd = [
-                ffmpeg,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(wav_path),
-                "-vn",
-                "-codec:a",
-                "libmp3lame",
-                "-b:a",
-                bitrate,
-                str(path),
-            ]
-            subprocess.run(cmd, check=True)
+        noise_info = analysis.get("noise_diagnostics", {}).get(stem.path.name, {})
+        noise_state = {}
+        def chunks():
+            for chunk_start in range(0, target_frames, chunk_frames):
+                nframes = min(chunk_frames, target_frames - chunk_start)
+                chunk = pipeline.read_stem_chunk(stem, segment, chunk_start, nframes)
+                if chunk is None:
+                    chunk = np.zeros((nframes, channels), dtype=np.float32) if channels > 1 else np.zeros(nframes, dtype=np.float32)
+                if channels == 1 and chunk.ndim == 2:
+                    chunk = np.mean(chunk, axis=1).astype(np.float32)
+                elif channels == 2 and chunk.ndim == 1:
+                    chunk = np.column_stack((chunk, chunk)).astype(np.float32)
+                if noise_info.get("case") in {"A", "hum"}:
+                    if chunk.ndim == 2:
+                        chunk = np.column_stack([
+                            pipeline.apply_noise_watchdog_streaming(chunk[:, channel], sr, noise_info,
+                                noise_state, f"preview:{stem.path.name}:{channel}")[0]
+                            for channel in range(chunk.shape[1])])
+                    else:
+                        chunk, _ = pipeline.apply_noise_watchdog_streaming(
+                            chunk, sr, noise_info, noise_state, f"preview:{stem.path.name}")
+                yield np.clip(np.nan_to_num(chunk[:nframes]) * encoding_gain, -1.0, 1.0)
+        from preview_encoding import encode_float_chunks
+        encode_float_chunks(ffmpeg, chunks(), sr, channels, bitrate, path)
     response = ranged_file_response(path, mimetype="audio/mpeg")
     response.headers["X-Preview-Cache-Bytes"] = str(path.stat().st_size)
+    response.headers["X-Preview-Source-Gain-Db"] = str(encoding_gain_db)
     return response
+
+
+def render_preview_key(entry: dict) -> str:
+    return hashlib.sha256(str(entry.get("path", "")).encode()).hexdigest()[:24]
+
+
+def registered_render_previews() -> list[dict]:
+    history = load_json(HISTORY_PATH, {})
+    items = []
+    if not isinstance(history, dict):
+        return items
+    for number, entries in history.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in reversed(entries):
+            try:
+                path = Path(entry["path"])
+                if not path.is_file() or path.stat().st_size == 0:
+                    continue
+                index = int(number)
+                items.append({"index": index, "key": render_preview_key(entry),
+                              "version": entry.get("version"), "created": entry.get("created", ""),
+                              "job_id": entry.get("job_id"),
+                              "url": f"/audio/rendered/{index}/{render_preview_key(entry)}"})
+                break
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+    return items
+
+
+@app.get("/api/render-previews")
+@source_edit_locked
+def api_render_previews() -> Response:
+    # Read only promoted render registrations, never trigger analysis or scan WAVs.
+    return jsonify({"source_folder": str(pipeline.SOURCE_DIR), "platform": sys.platform, "items": registered_render_previews()})
+
+
+@app.get("/audio/rendered/<int:song_index>/<render_key>")
+@source_edit_locked
+def rendered_audio(song_index: int, render_key: str) -> Response:
+    entries = load_json(HISTORY_PATH, {}).get(str(song_index), [])
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and render_preview_key(entry) == render_key:
+            path = Path(str(entry.get("path", "")))
+            if path.is_file() and path.stat().st_size:
+                return ranged_file_response(path, mimetype="audio/mpeg")
+    return Response(status=404)
+
+
+@app.post("/api/open-render-folder")
+@source_edit_locked
+def api_open_render_folder() -> Response:
+    history = load_json(HISTORY_PATH, {})
+    entries = [entry for versions in (history.values() if isinstance(history, dict) else []) if isinstance(versions, list)
+               for entry in versions if isinstance(entry, dict) and entry.get("path")]
+    entries.sort(key=lambda entry: str(entry.get("created", "")), reverse=True)
+    folder = None
+    for entry in entries:
+        try:
+            path = Path(entry['path'])
+            if path.is_file() and path.stat().st_size > 0:
+                folder = path.parent
+                break
+        except (OSError, TypeError, ValueError):
+            continue
+    if folder is None:
+        return jsonify({"error": "No completed renders yet"}), 404
+    open_render_location(folder)
+    return jsonify({"ok": True})
+
+
+def open_render_location(path: Path) -> None:
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)] if path.is_file() else ["open", str(path)])
+    elif sys.platform == "win32":
+        os.startfile(str(path.parent if path.is_file() else path))
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent if path.is_file() else path)])
 
 
 @app.get("/audio/<int:song_index>/<int:slot>")
@@ -4409,7 +5281,7 @@ def api_open(song_index: int) -> Response:
     path = Path(selected["path"]) if selected else out_dir()
     import subprocess
 
-    subprocess.Popen(["open", "-R", str(path)])
+    open_render_location(path)
     return jsonify({"ok": True})
 
 
@@ -4432,15 +5304,32 @@ def start_server(port: int | None = None) -> tuple[str, Any]:
     return f"http://{HOST}:{actual_port}", server
 
 
+def signal_owned_process_group(proc: subprocess.Popen, force: bool = False) -> None:
+    """Stop only an owned worker and its helpers on either desktop platform."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
+    else:
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
 def stop_server() -> None:
+    # Signal workers synchronously so closing the native window cannot leave a
+    # render orphaned. Shutdown of the WSGI loop is deliberately asynchronous:
+    # Werkzeug may wait for an in-flight request and must never block app exit.
     request_cancel()
-    if server_ref is not None:
-        server_ref.shutdown()
+    server = server_ref
+    if server is not None:
+        threading.Thread(
+            target=server.shutdown,
+            name="zucker-server-shutdown",
+            daemon=True,
+        ).start()
 
 
 def has_active_jobs() -> bool:
-    with state_lock:
-        return any(job.get("status") in {"queued", "running", "stopping"} for job in jobs)
+    # Native close/update checks must not wait behind a disk-backed status write.
+    return any(job.get("status") in {"queued", "running", "stopping"} for job in list(jobs))
 
 
 def wait_for_jobs_to_stop(timeout_seconds: float | None = None) -> None:

@@ -1,0 +1,10 @@
+const assert = require('assert');
+const { renderResultSummary, jobReportText } = require('./static/app.js');
+const job = { id:'failed-render',status:'partial_failed',error:'Traceback: No space left on device\n'+ 'technical detail '.repeat(500)};
+assert.strictEqual(renderResultSummary(job),'Not enough disk space. Free some space and try again.');
+assert(!renderResultSummary(job).includes('Traceback'));
+assert(jobReportText(job).includes(job.error));
+assert.strictEqual(renderResultSummary({kind:'render',status:'done'}),'All done. Your renders are ready.');
+assert.strictEqual(renderResultSummary({status:'cancelled'}),'Render cancelled.');
+assert.strictEqual(renderResultSummary({status:'pending_review'}),'Some songs need review.');
+console.log('Render messages and full report verified');

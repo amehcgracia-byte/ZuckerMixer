@@ -18,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 import time
@@ -25,22 +26,96 @@ import hashlib
 import io
 import queue
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
-import pyloudnorm as pyln
+from dsp_imports import pyloudnorm as pyln
 import soundfile as sf
-from scipy import ndimage, signal
-try:
-    import matchering as matchering_api
-except Exception as _matchering_import_error:
-    matchering_api = None
-    MATCHERING_IMPORT_ERROR = f"{type(_matchering_import_error).__name__}: {_matchering_import_error}"
-else:
-    MATCHERING_IMPORT_ERROR = ""
+from dsp_imports import ndimage, signal
+matchering_api = None
+MATCHERING_IMPORT_ERROR = ""
+_MATCHERING_IMPORT_ATTEMPTED = False
+
+
+def ensure_matchering_available() -> None:
+    """Load optional reference mastering only when rendering requests it."""
+    global matchering_api, MATCHERING_IMPORT_ERROR, _MATCHERING_IMPORT_ATTEMPTED
+    if matchering_api is not None or _MATCHERING_IMPORT_ATTEMPTED:
+        return
+    _MATCHERING_IMPORT_ATTEMPTED = True
+    try:
+        import matchering
+        matchering_api = matchering
+    except Exception as exc:
+        MATCHERING_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+_REFERENCE_EQ_LOCK = threading.RLock()
+
+
+def bound_reference_eq_fir(fir: np.ndarray, sample_rate: float, channel: str) -> np.ndarray:
+    """Keep reference EQ from amplifying recording noise or inventing stereo width.
+
+    Retain the FIR phase and all cuts. Positive mid boosts taper from 12 dB
+    at 3 kHz to unity at 6 kHz; side boosts also stay below 6 dB.
+    """
+    response = np.fft.rfft(np.fft.ifftshift(fir))
+    frequencies = np.fft.rfftfreq(len(fir), 1.0 / sample_rate)
+    limit_db = np.interp(
+        frequencies, [0.0, 3000.0, 6000.0, sample_rate / 2.0],
+        [12.0, 12.0, 0.0, 0.0],
+    )
+    if channel == "side":
+        limit_db = np.minimum(limit_db, 6.0)
+    magnitude = np.abs(response)
+    attenuation = np.minimum(
+        1.0, np.power(10.0, limit_db / 20.0) / np.maximum(magnitude, 1e-12)
+    )
+    return np.fft.fftshift(np.fft.irfft(response * attenuation, n=len(fir)))
+
+
+@contextmanager
+def bounded_reference_eq():
+    # Matchering 2.0.6 calls this module alias for each mid/side FIR. Serialize
+    # the temporary hook and always restore it, including failed renders.
+    import matchering.stages as stages
+    with _REFERENCE_EQ_LOCK:
+        original = stages.get_fir
+
+        def safe_fir(target, reference, name, config):
+            return bound_reference_eq_fir(
+                original(target, reference, name, config),
+                config.internal_sample_rate, name,
+            )
+
+        stages.get_fir = safe_fir
+        try:
+            yield
+        finally:
+            stages.get_fir = original
+
+
+def validate_mastering_reference(reference: str | Path | None) -> None:
+    """Fail before mixing when a configured reference cannot be used."""
+    if not reference:
+        return
+    ensure_matchering_available()
+    if matchering_api is None:
+        raise RuntimeError("Reference mastering is unavailable: " + MATCHERING_IMPORT_ERROR)
+    path = Path(reference).expanduser()
+    if not path.is_file():
+        raise RuntimeError(f"Mastering reference file not found: {path}")
+    try:
+        info = sf.info(str(path))
+        if info.frames <= 0:
+            raise ValueError("empty audio")
+    except Exception as exc:
+        raise RuntimeError(f"Cannot read mastering reference: {path}: {exc}") from exc
 
 
 # ------------------------- configurable defaults -------------------------
@@ -51,7 +126,7 @@ SESSION_DATE = date.today().isoformat()
 
 SILENCE_GAP_SECONDS = 8.0
 DEFAULT_SILENCE_GAP_SECONDS = SILENCE_GAP_SECONDS
-MIN_SONG_SECONDS = 90.0
+MIN_SONG_SECONDS = 480.0
 DETECTION_FRAME_SECONDS = 1.0
 DETECTION_SMOOTH_SECONDS = 9.0
 SILENCE_THRESHOLD_DB = -25.0
@@ -88,8 +163,8 @@ MC_SANITY_ANCHORS = []
 SUSPICIOUS_SHORT_SONG_SECONDS = 5 * 60.0
 SUSPICIOUS_LONG_SONG_SECONDS = 20 * 60.0
 # Permissive defaults. Each source can define its own review policy.
-HARD_MIN_SONG_SECONDS = 90.0
-HARD_MAX_SONG_SECONDS = 4 * 3600.0
+HARD_MIN_SONG_SECONDS = 480.0
+HARD_MAX_SONG_SECONDS = 780.0
 EXPECTED_SONG_COUNT = None
 EXPECTED_SLOT_COUNT = None
 RHYTHM_ANALYSIS_MAX_SECONDS = 300.0
@@ -98,13 +173,17 @@ RHYTHM_ONSET_TOLERANCE_BEATS = 0.16
 RHYTHM_INCONSISTENT_ATTENUATION_DB = -3.0
 RHYTHM_SPARSE_ATTENUATION_DB = -2.0
 VOCAL_PRIORITY_MARGIN_DB = 2.0
+HARMONIC_BELOW_DRUM_REFERENCE_DB = 2.0
+EMPTY_STEM_RMS_DBFS = -72.0
+EMPTY_STEM_SPREAD_DB = 8.0
+MIC_PAIR_MAX_CORRECTION_DB = 4.5
 VOICE_WIND_EXPLICIT_TERMS = ("flute", "trumpet", "trombone", "sax", "horn", "brass", "woodwind")
 SYNTH_BELOW_MELODIC_MARGIN_DB = 3.0
 NOISE_ANALYSIS_MAX_SECONDS = 300.0
 NOISE_BROADBAND_FLATNESS_THRESHOLD = 0.38
 NOISE_SUSTAINED_FRACTION_THRESHOLD = 0.70
 NOISE_EMPTY_RMS_THRESHOLD_DBFS = -43.0
-NOISE_FLOOR_MIN_DBFS = -72.0
+NOISE_FLOOR_MIN_DBFS = -110.0
 NOISE_REDUCTION_STRENGTH = 0.85
 NOISE_REDUCTION_FLOOR = 0.22
 HUM_PEAK_RATIO_THRESHOLD = 7.0
@@ -128,18 +207,32 @@ STEM_ACTIVITY_ROLE_OVERRIDES = {
 }
 MAX_TRACK_MAKEUP_GAIN_DB = 30.0
 MAX_DRUM_MAKEUP_GAIN_DB = 36.0
-# Automatic mixing establishes relative balance only. It may attenuate a
-# stem, but it must never boost a source without an explicit user value.
+# Automatic corrections are per song. Quiet guitar and kit recovery is bounded;
+# inactive inputs never receive the recovery or set the musical reference.
 AUTO_MIX_MAX_BOOST_DB = 0.0
-# Auto-Mix may make a small, explicit correction only for roles where a quiet
-# capture would otherwise disappear. All other roles can only be attenuated
-# automatically. These limits are per song, never session-global.
-AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0}
-# Deliberate first-pass guitar trim: guitars were repeatedly masking vocals
-# in the user's real sessions. This is applied before per-song caps and is
-# included in the analysis signature so old plans cannot survive unnoticed.
-AUTO_MIX_ROLE_TRIMS_DB = {"guitar": -3.0}
-AUTO_MIX_PROFILE_VERSION = 2
+AUTO_MIX_ROLE_BOOST_LIMITS_DB = {"vocal": 3.0, "bass": 3.0, "flute": 2.0, "horn": 1.5, "sax": 1.5, "guitar": 4.0, "kick": 3.0, "snare": 3.0, "hh": 3.0, "overhead": 3.0, "drums": 3.0}
+AUTO_MIX_ROLE_TRIMS_DB = {}
+# Versioned role profiles keep EQ, dynamics, hierarchy and effects auditable.
+# These are starting points only; the per-song analysis below can trim them
+# within bounded limits, and explicit user overrides remain authoritative.
+ROLE_DSP_PROFILE_VERSION = 1
+ROLE_COMPRESSOR_PROFILES = {
+    "kick": {"ratio": 4.0, "threshold_db": -18.0, "release_ms": 90.0},
+    "snare": {"ratio": 3.5, "threshold_db": -20.0, "release_ms": 110.0},
+    "hh": {"ratio": 2.0, "threshold_db": -26.0, "release_ms": 80.0},
+    "overhead": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 120.0},
+    "drums": {"ratio": 3.0, "threshold_db": -20.0, "release_ms": 100.0},
+    "bass": {"ratio": 3.0, "threshold_db": -24.0, "release_ms": 180.0},
+    "guitar": {"ratio": 2.0, "threshold_db": -22.0, "release_ms": 140.0},
+    "keys": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 160.0},
+    "keys_l": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 160.0},
+    "keys_r": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 160.0},
+    "synth": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 150.0},
+    "horn": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 120.0},
+    "sax": {"ratio": 2.0, "threshold_db": -23.0, "release_ms": 120.0},
+    "flute": {"ratio": 2.0, "threshold_db": -24.0, "release_ms": 120.0},
+}
+AUTO_MIX_PROFILE_VERSION = 11
 AUTO_MIX_MAX_ATTENUATION_DB = -12.0
 # Vocal-role stems include the session's mic channels.  The channel may carry
 # speech, singing, flute, or another acoustic source, so this is intentionally
@@ -166,6 +259,11 @@ MASTERING_INTENSITY = "natural"
 MASTERING_TARGETS = {"natural": -14.0, "loud": -9.5}
 TRUE_PEAK_CEILING_DBFS = -1.0
 PREMASTER_HEADROOM_DB = -6.0
+MASTER_GLUE_PROFILE_VERSION = 2
+MASTER_GLUE_RATIO = 1.6
+MASTER_GLUE_THRESHOLD_DB = -18.0
+MASTER_GLUE_RELEASE_MS = 280
+MASTER_GLUE_SATURATION = 1.02
 MATCHERING_REFERENCE: Path | None = None
 EXPORT_SAMPLE_RATE = 44100
 MP3_BITRATE = "320k"
@@ -186,7 +284,40 @@ LOGIC_FRAGMENT_RE = re.compile(r"^.+#\d{2,}$", re.IGNORECASE)
 # per-block overhead that makes long full-session verification renders
 # unnecessarily slow.  Peak/RMS safety is still measured and applied per
 # block, so this does not change the clipping contract.
-RENDER_CHUNK_SECONDS = 300.0
+RENDER_CHUNK_SECONDS = 30.0
+
+
+def render_stem_workers(stem_count: int) -> int:
+    """Threads used to process the stems of one render chunk.
+
+    File reads and the NumPy/SciPy filters release the GIL, so independent
+    stems overlap well. ZUCKER_RENDER_STEM_WORKERS=1 restores serial order.
+    """
+    configured = os.environ.get("ZUCKER_RENDER_STEM_WORKERS", "").strip()
+    try:
+        workers = int(configured) if configured else min(4, os.cpu_count() or 1)
+    except ValueError:
+        workers = 1
+    return max(1, min(workers, stem_count))
+
+
+class _StemPool:
+    """Ordered map over stems: a thread pool, or the plain loop for one worker."""
+
+    def __init__(self, workers: int) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="render-stem") if workers > 1 else None
+
+    def map(self, fn, items):
+        return self._executor.map(fn, items) if self._executor else map(fn, items)
+
+    def __enter__(self) -> "_StemPool":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if self._executor:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+
 DETECTION_CACHE = Path(".jam_detection_envelopes.npz")
 DETECTION_CACHE_ROOT: Path | None = None
 LEGACY_DETECTION_CACHE: Path | None = None
@@ -210,6 +341,12 @@ SESSION_DETECTION_PROFILE: dict[str, object] = {}
 
 
 def whisper_runtime_paths() -> tuple[Path, Path]:
+    """Resolve Whisper from the frozen app first, then from a source checkout."""
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    if getattr(sys, "frozen", False):
+        # The frozen executable dispatches --whisper-worker itself. The script
+        # path is still returned so the detector can verify the bundled data.
+        return Path(sys.executable), bundle_root / "whisper_transcribe.py"
     roots = [Path(__file__).resolve().parent, Path.cwd(), Path.home() / "ZuckerMixer"]
     for root in roots:
         python = root / ".whisperenv" / "bin" / "python"
@@ -315,17 +452,17 @@ def configure_detection_profile(profile: dict[str, object] | None = None) -> dic
     EXPECTED_SONG_COUNT = expected
     EXPECTED_SLOT_COUNT = expected
 
-    minimum = _profile_number(raw, ("min_song_seconds", "hard_min_song_seconds"), 90.0)
-    maximum = _profile_number(raw, ("max_song_seconds", "hard_max_song_seconds"), 4 * 3600.0)
+    minimum = _profile_number(raw, ("min_song_seconds", "hard_min_song_seconds"), 480.0)
+    maximum = _profile_number(raw, ("max_song_seconds", "hard_max_song_seconds"), 780.0)
     structural_min = _profile_number(raw, ("structural_min_song_seconds",), minimum)
     structural_max = _profile_number(raw, ("structural_max_song_seconds",), maximum)
     close_min = _profile_number(raw, ("structural_close_song_seconds",), minimum)
     final_min = _profile_number(raw, ("min_final_song_seconds",), minimum)
     suspicious_short = _profile_number(raw, ("suspicious_short_song_seconds",), 5 * 60.0)
     suspicious_long = _profile_number(raw, ("suspicious_long_song_seconds",), 20 * 60.0)
-    MIN_SONG_SECONDS = max(1.0, float(minimum or 90.0))
+    MIN_SONG_SECONDS = max(1.0, float(minimum or 480.0))
     HARD_MIN_SONG_SECONDS = max(1.0, float(minimum or 90.0))
-    HARD_MAX_SONG_SECONDS = max(HARD_MIN_SONG_SECONDS, float(maximum or 4 * 3600.0))
+    HARD_MAX_SONG_SECONDS = max(HARD_MIN_SONG_SECONDS, float(maximum or 780.0))
     MC_STRUCTURAL_MIN_SONG_SECONDS = max(1.0, float(structural_min or HARD_MIN_SONG_SECONDS))
     MC_STRUCTURAL_MAX_SONG_SECONDS = max(MC_STRUCTURAL_MIN_SONG_SECONDS, float(structural_max or HARD_MAX_SONG_SECONDS))
     MC_STRUCTURAL_CLOSE_SONG_SECONDS = max(1.0, float(close_min or MC_STRUCTURAL_MIN_SONG_SECONDS))
@@ -507,6 +644,11 @@ def resolve_ffmpeg() -> str | None:
     global FFMPEG_PATH
     if FFMPEG_PATH and Path(FFMPEG_PATH).exists():
         return FFMPEG_PATH
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    for bundled in sorted(bundle_root.glob("ffmpeg*.exe")) + sorted(bundle_root.glob("ffmpeg*-*")):
+        if bundled.is_file():
+            FFMPEG_PATH = str(bundled)
+            return FFMPEG_PATH
     path = shutil.which("ffmpeg")
     if path:
         FFMPEG_PATH = path
@@ -522,8 +664,10 @@ ROLE_SYNONYMS: dict[str, tuple[str, ...]] = {
     # Keep this table intentionally human-editable: technicians' labels vary
     # from session to session and matching is case-insensitive/substring based.
     "kick": ("kick", "kickdrum", "bd", "bdjam", "bombo", "bass drum", "low drum"),
-    "snare": ("snare", "snr", "hh", "hihat", "hi-hat", "hi hat", "high hat", "cymbal"),
-    "drums": ("drum", "drums", "kit", "overhead", "overheads", "ov", "ovjam", "beatbox"),
+    "snare": ("snare", "snr"),
+    "hh": ("hh", "hihat", "hi-hat", "hi hat", "high hat", "cymbal"),
+    "overhead": ("overhead", "overheads", "ov", "ovjam"),
+    "drums": ("drum", "drums", "kit", "beatbox"),
     "bass": ("bass", "bassgtr", "bass gtr", "low end", "electric bass"),
     "keys": ("keys", "keybd", "keyboard", "piano", "organ", "epiano", "rhodes", "synth keys"),
     "guitar": ("guit", "gtr", "guitar", "acoustic guitar", "electric guitar"),
@@ -563,7 +707,7 @@ def drum_equivalent_stems(stems: list[Stem]) -> list[Stem]:
     """Return kit drums plus named and generic alternate rhythm sources."""
     return [
         stem for stem in stems
-        if stem.role in {"kick", "snare", "drums"}
+        if stem.role in {"kick", "snare", "hh", "overhead", "drums"}
         or is_rhythm_source_stem(stem)
         or is_generic_stem_name(stem)
     ]
@@ -582,12 +726,16 @@ def classify_role(name: str) -> str:
     low = str(name or "").lower()
     # Beatbox is a percussion/room label, not a vocal label; resolve it before
     # the intentionally broad "box" vocal synonym.
-    if _has_role_synonym(low, ROLE_SYNONYMS["drums"]):
-        return "drums"
     if _has_role_synonym(low, ROLE_SYNONYMS["kick"]):
         return "kick"
     if _has_role_synonym(low, ROLE_SYNONYMS["snare"]):
         return "snare"
+    if _has_role_synonym(low, ROLE_SYNONYMS["hh"]):
+        return "hh"
+    if _has_role_synonym(low, ROLE_SYNONYMS["overhead"]):
+        return "overhead"
+    if _has_role_synonym(low, ROLE_SYNONYMS["drums"]):
+        return "drums"
     if _has_role_synonym(low, ROLE_SYNONYMS["bass"]):
         return "bass"
     if "keys l" in low or "keysl" in low or "keyboard l" in low:
@@ -1412,7 +1560,10 @@ def transcribe_speech_candidates(
             input_json.write_text(json.dumps(requests), encoding="utf-8")
             model_dir = Path.home() / "Library" / "Application Support" / "ZuckerMixer" / "whisper"
             report_progress({"current_stage": "transcribing speech", "stage_detail": f"Preparing Whisper for {len(requests)} commentator windows", "progress": 70, "song_progress": 70, "phase_index": 4, "phase_total": 7, "candidate_windows": len(requests), "heartbeat": time.time()})
-            command = [str(whisper_python), str(worker), "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
+            if getattr(sys, "frozen", False):
+                command = [str(whisper_python), "--whisper-worker", "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
+            else:
+                command = [str(whisper_python), str(worker), "--input-json", str(input_json), "--output-json", str(output_json), "--model", WHISPER_MODEL_SIZE, "--model-dir", str(model_dir)]
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -3137,23 +3288,86 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     DETECTION_STRATEGY = {"id": "starting", "label": "fresh deterministic detection"}
     LAST_DETECTION_CALIBRATION = {}
 
-    if not WHISPER_ALLOWED:
-        segments = provisional_segments_from_metadata(stems)
+    has_voice_stems = any(stem.role in {"vocal", "room"} for stem in stems)
+    if not WHISPER_ALLOWED or not has_voice_stems:
+        # Whisper is optional. Use the acoustic MC/drum boundary detector for
+        # the normal pass so sessions without a commentator still get slots.
         LAST_WHISPER_STATUS = {
             "status": "skipped",
-            "reason": "optional analysis disabled for initial source registration",
+            "reason": "optional analysis disabled; acoustic detection used" if has_voice_stems else "no vocal/room stem; drum acoustic detection used",
         }
+        report_progress({
+            "current_stage": "reading cached envelopes",
+            "stage_detail": f"Reading cached activity envelopes for {len(stems)} parallel stems",
+            "progress": 24,
+            "song_progress": 24,
+            "phase_index": 2,
+            "phase_total": 7,
+            "stem_count": len(stems),
+            "heartbeat": time.time(),
+        })
+        timelines = load_cached_timelines_or_die(stems, "Acoustic detection")
+        durations = [float(stem.offset_seconds + stem.timeline_duration) for stem in stems]
+        metadata_session_end = max(durations)
+        session_end = active_session_end_from_timelines(stems, timelines, metadata_session_end)
+        voice_stems = [stem for stem in stems if stem.role in {"vocal", "room"}]
+        instrument_stems = [stem for stem in stems if stem.role not in {"vocal", "room"}]
+        if not instrument_stems:
+            segments = provisional_segments_from_metadata(stems)
+            DETECTION_STRATEGY = {
+                "id": "metadata_provisional",
+                "label": "No usable acoustic groups; Select Cuts required",
+                "candidate_only": True,
+                "session_segmentation_usable": False,
+                "detected_count": len(segments),
+                "needs_review": True,
+                "whisper": LAST_WHISPER_STATUS,
+            }
+            return segments, np.array([], dtype=np.float32)
+        if voice_stems:
+            mc_data, segments = auto_calibrate_detection(
+                voice_stems, instrument_stems, timelines, session_end
+            )
+        else:
+            mc_data = {"mc_mask": np.zeros(int(math.ceil(session_end / DETECTION_FRAME_SECONDS)), dtype=bool)}
+            segments = []
+        if not segments:
+            segments = auto_calibrate_drum_fallback(
+                stems, timelines, session_end, voice_stems, instrument_stems, mc_data
+            )
+        if not segments:
+            segments = provisional_segments_from_metadata(stems)
+        else:
+            segments = [
+                replace(
+                    segment,
+                    boundary_source="acoustic-break",
+                    speech_reason="Whisper skipped; boundary inferred from acoustic activity",
+                )
+                for segment in segments
+            ]
+        LAST_DETECTION_CALIBRATION["mode"] = "acoustic_without_whisper"
         DETECTION_STRATEGY = {
-            "id": "metadata_provisional",
-            "label": "Single conservative metadata block; Analyze or Select Cuts required",
-            "candidate_only": True,
-            "session_segmentation_usable": False,
+            "id": "acoustic_without_whisper",
+            "label": "Acoustic MC/drum boundaries; Whisper optional",
             "detected_count": len(segments),
+            "candidate_only": len(segments) < 2,
+            "session_segmentation_usable": len(segments) > 1,
             "needs_review": True,
             "whisper": LAST_WHISPER_STATUS,
         }
-        print(f"PROVISIONAL DETECTION: registered {len(segments)} metadata windows", flush=True)
-        return segments, np.array([], dtype=np.float32)
+        report_progress({
+            "current_stage": "validating cuts",
+            "stage_detail": f"Acoustic detection found {len(segments)} slot(s); Whisper was skipped",
+            "progress": 90,
+            "song_progress": 90,
+            "phase_index": 6,
+            "phase_total": 7,
+            "candidate_count": len(segments),
+            "heartbeat": time.time(),
+        })
+        print(f"ACOUSTIC DETECTION WITHOUT WHISPER: found {len(segments)} slot(s)", flush=True)
+        return segments, np.asarray(mc_data.get("mc_mask", np.array([], dtype=np.float32)), dtype=np.float32)
 
     print("\nSONG DETECTION")
     report_progress({"current_stage": "reading cached envelopes", "stage_detail": f"Reading cached activity envelopes for {len(stems)} parallel stems", "progress": 24, "song_progress": 24, "phase_index": 2, "phase_total": 7, "stem_count": len(stems), "heartbeat": time.time()})
@@ -3280,24 +3494,23 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
             "whisper": LAST_WHISPER_STATUS,
         }
     else:
-        # Without a sufficiently trusted commentator transcript there is no
-        # defensible slot boundary. Do not replace it with drum/acoustic or
-        # fixed-clock windows; expose one conservative review block instead.
-        segments = provisional_segments_from_metadata(stems)
+        # Preserve acoustic proposals when Whisper is unavailable or incomplete.
+        # They remain diagnostic until reviewed; never replace current cuts.
+        segments = list(probe_segments) or provisional_segments_from_metadata(stems)
         provisional_reason = str(
             LAST_WHISPER_STATUS.get("reason")
             or "Commentator-led slot boundaries were not available"
         )
         if segments:
             segments = [replace(
-                segments[0],
-                boundary_source="whisper-incomplete-provisional",
+                segment,
+                boundary_source="acoustic-whisper-incomplete",
                 boundary_validation="needs_review",
                 boundary_validation_reason=(
-                    "Candidate only; not a valid single-song session: "
+                    "Acoustic candidate; Whisper incomplete: "
                     + provisional_reason
                 ),
-            )]
+            ) for segment in segments]
         DETECTION_STRATEGY = {
             **(DETECTION_STRATEGY if isinstance(DETECTION_STRATEGY, dict) else {}),
             "id": "commentator_missing_review",
@@ -3317,6 +3530,12 @@ def detect_segments(stems: list[Stem]) -> tuple[list[Segment], np.ndarray]:
     # slots before any acoustic duration-repair pass can split a slot into
     # multiple songs.  Activity remains diagnostic only.
     segments = finalize_presented_slot_segments(whisper_transcripts, session_end)
+    if segments and segments[0].start > 0 and _has_meaningful_pre_session_content(segments[0], stems, timelines):
+        end = segments[0].start
+        segments.insert(0, Segment(0.0, end, core_start=0.0, core_end=end, nominal_end=end,
+                                  assigned_song_number=0, boundary_source="pre-session-content"))
+    if segments and segments[0].assigned_song_number == 0:
+        segments = [replace(seg, assigned_song_number=i) for i, seg in enumerate(segments)]
     DETECTION_STRATEGY.update({
         "id": "commentator_presented_slots",
         "label": "One global slot per commentator presentation",
@@ -3746,6 +3965,13 @@ def songs_from_mc_breaks(
     last_activity_end = active_regions[-1][1] if active_regions else session_end
 
     segments: list[Segment] = []
+    opening_end = float(mc_breaks[0][0])
+    opening_activity = instrument_playing[:int(opening_end / DETECTION_FRAME_SECONDS)]
+    if opening_end > 0 and np.count_nonzero(opening_activity) * DETECTION_FRAME_SECONDS >= MC_STRUCTURAL_MIN_SONG_SECONDS:
+        first_active = float(np.flatnonzero(opening_activity)[0]) * DETECTION_FRAME_SECONDS
+        segments.append(Segment(first_active, opening_end, core_start=first_active, core_end=opening_end,
+            nominal_end=opening_end, boundary_source="acoustic-opening-content",
+            boundary_validation="needs_review", boundary_validation_reason="recorded music before the first detected introduction; preserved for editing"))
     for idx, (mc_start, mc_end) in enumerate(mc_breaks):
         song_start = mc_end
         if idx + 1 < len(mc_breaks):
@@ -4058,7 +4284,7 @@ def trim_dead_air_segments(
     # Drum-core activity is the reliable indicator of the band actually
     # starting; guitars/keys can contain room bleed while the MC is still
     # finishing. Fall back to all non-voice stems only when no drums exist.
-    activity_stems = [stem for stem in stems if stem.role in {"kick", "snare", "drums"}]
+    activity_stems = [stem for stem in stems if stem.role in {"kick", "snare", "hh", "overhead", "drums"}]
     activity_stems = activity_stems or [stem for stem in stems if stem.role not in {"vocal", "room"}] or stems
     combined = smooth_envelope(combine_normalized_envelope(activity_stems, timelines), 7.0)
     if len(combined) == 0:
@@ -4556,7 +4782,7 @@ def per_stem_activity_threshold(env: np.ndarray, stem: Stem) -> float:
         threshold_db = floor + 0.45 * (high - floor)
     else:
         threshold_db = floor + 8.0
-    if stem.role in {"kick", "snare", "drums"}:
+    if stem.role in {"kick", "snare", "hh", "overhead", "drums"}:
         threshold_db -= 2.0
     return db_to_amp(threshold_db)
 
@@ -4763,7 +4989,7 @@ def cache_signature(stems: list[Stem]) -> str:
         stat = stem.path.stat()
         parts.append(
             f"{stem.path.name}:{stem.frames}:{stem.samplerate}:"
-            f"{stem.timeline_frames}:{stem.offset_seconds:.9f}:{int(stat.st_mtime)}"
+            f"{stem.timeline_frames}:{stem.offset_seconds:.9f}:{stat.st_size}:{stat.st_mtime_ns}"
         )
     return "|".join(parts)
 
@@ -4790,98 +5016,101 @@ def load_detection_cache(stems: list[Stem]) -> dict[str, np.ndarray]:
     return {}
 
 
+def stem_detection_cache_path(stem: Stem, session: Segment) -> Path:
+    """Keep one envelope independently, with the exact detection time grid."""
+    stat = stem.path.stat()
+    identity = [DETECTION_CACHE_ALGORITHM_VERSION, str(stem.path.resolve()),
+                stat.st_size, stat.st_mtime_ns, stem.frames, stem.samplerate,
+                stem.channels, stem.timeline_frames, stem.offset_seconds,
+                session.start, session.end]
+    digest = hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+    return detection_cache_path().parent / "stem-envelopes" / f"{digest}.npy"
+
+
+def save_stem_detection_envelope(path: Path, envelope: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique temporary names also permit independent analysis processes.
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".npy", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            np.save(handle, envelope, allow_pickle=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def build_detection_cache(stems: list[Stem]) -> None:
-    """Read each source stem once and save its complete 1-second envelope."""
+    """Reuse individual envelopes and scan missing stems with bounded workers."""
     if not stems:
         raise RuntimeError("Cannot build a detection cache without source stems.")
-    session_start = min(stem.offset_seconds for stem in stems)
-    session_end = max(stem.offset_seconds + stem.timeline_duration for stem in stems)
-    full_session = Segment(session_start, session_end)
-    total_bytes = sum(max(0, stem.path.stat().st_size) for stem in stems)
-    bytes_done = 0
-    started = time.perf_counter()
-    external_source = str(SOURCE_DIR).startswith(("/Volumes/", "/Network/", "smb://", "afp://"))
-    report_progress(
-        {
-            "current_stage": "scanning folder",
-            "stage_detail": (
-                f"external volume — scanning audio chunks; 0 of {len(stems)} stems"
-                if external_source
-                else f"scanning audio chunks; 0 of {len(stems)} stems"
-            ),
-            "progress": 20,
-            "song_progress": 20,
-            "heartbeat": time.time(),
-            "elapsed_seconds": 0.0,
-            "bytes_read": 0,
-            "bytes_total": total_bytes,
-        }
-    )
+    session = Segment(min(s.offset_seconds for s in stems),
+                      max(s.offset_seconds + s.timeline_duration for s in stems))
+    sizes = {s.path.name: max(0, s.path.stat().st_size) for s in stems}
+    total_bytes = sum(sizes.values())
+    completed_bytes = {s.path.name: 0 for s in stems}
     envelopes: dict[str, np.ndarray] = {}
-    for stem_index, stem in enumerate(stems, 1):
-        stem_size = max(0, stem.path.stat().st_size)
+    pending = []
+    started = time.perf_counter()
+    progress_lock = threading.Lock()
+    for stem in stems:
+        path = stem_detection_cache_path(stem, session)
+        try:
+            envelope = np.load(path, allow_pickle=False)
+            if envelope.ndim != 1 or not np.isfinite(envelope).all():
+                raise ValueError("Invalid stem envelope")
+            envelopes[stem.path.name] = envelope
+            completed_bytes[stem.path.name] = sizes[stem.path.name]
+        except (OSError, ValueError, EOFError):
+            pending.append((stem, path))
+    reused = len(envelopes)
+    # Four 10-second blocks remain bounded even for long multitrack sessions.
+    workers = min(4, max(1, os.cpu_count() or 1), max(1, len(pending)))
 
-        def on_progress(update: dict[str, object]) -> None:
-            nonlocal bytes_done
-            ratio = min(1.0, float(update.get("frames_read") or 0) / max(1, stem.frames))
-            bytes_read = min(stem_size, int(stem_size * ratio))
-            total_read = min(total_bytes, bytes_done + bytes_read)
+    def progress(name: str, frames: int) -> None:
+        with progress_lock:
+            size = sizes[name]
+            stem = next(s for s in stems if s.path.name == name)
+            completed_bytes[name] = max(completed_bytes[name], min(size, int(size * frames / max(1, stem.frames))))
+            total_read = sum(completed_bytes.values())
             elapsed = max(0.001, time.perf_counter() - started)
             overall = total_read / max(1, total_bytes)
-            eta = elapsed * (1.0 - overall) / overall if overall > 0 else None
-            percent = 20 + int(overall * 60)
-            detail = (
-                f"Analyzing {stem_index} of {len(stems)}: {stem.path.name} — "
-                f"{overall * 100:.1f}% ({total_read / 1048576:.0f}/{total_bytes / 1048576:.0f} MB) "
-                f"· {elapsed / 60:.1f} min elapsed"
-            )
-            if eta is not None:
-                detail += f" · about {eta / 60:.1f} min remaining"
-            report_progress(
-                {
-                    "current_stage": "scanning folder",
-                    "stage_detail": detail,
-                    "progress": percent,
-                    "song_progress": percent,
-                    "heartbeat": time.time(),
-                    "elapsed_seconds": elapsed,
-                    "eta_seconds": eta,
-                    "bytes_read": total_read,
-                    "bytes_total": total_bytes,
-                }
-            )
-
-        _rms, _energies, _has_audio, _spread, stem_envelopes, _peaks = scan_segment_activity(
-            [stem], full_session, stem.samplerate, chunk_seconds=10.0, progress_callback=on_progress
-        )
-        envelopes.update(stem_envelopes)
-        bytes_done += stem_size
-        report_progress(
-            {
+            report_progress({
                 "current_stage": "scanning folder",
-                "stage_detail": f"Finished {stem_index} of {len(stems)}: {stem.path.name}",
-                "progress": 20 + int(bytes_done / max(1, total_bytes) * 60),
-                "song_progress": 20 + int(bytes_done / max(1, total_bytes) * 60),
-                "heartbeat": time.time(),
-                "elapsed_seconds": time.perf_counter() - started,
-                "bytes_read": bytes_done,
-                "bytes_total": total_bytes,
-            }
+                "stage_detail": f"Scanning audio with {workers} workers · {reused} cached stems · {total_read / 1048576:.0f}/{total_bytes / 1048576:.0f} MB",
+                "progress": 20 + int(overall * 60),
+                "song_progress": 20 + int(overall * 60),
+                "heartbeat": time.time(), "elapsed_seconds": elapsed,
+                "bytes_read": total_read, "bytes_total": total_bytes,
+                "cached_stems": reused, "scan_workers": workers,
+            })
+
+    def scan(item: tuple[Stem, Path]) -> tuple[str, np.ndarray]:
+        stem, path = item
+        result = scan_segment_activity(
+            [stem], session, stem.samplerate, chunk_seconds=10.0,
+            progress_callback=lambda update: progress(stem.path.name, int(update.get("frames_read") or 0)),
         )
+        envelope = result[4][stem.path.name]
+        save_stem_detection_envelope(path, envelope)
+        progress(stem.path.name, stem.frames)
+        return stem.path.name, envelope
+
+    progress(stems[0].path.name, 0)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stem-scan") as executor:
+        futures = [executor.submit(scan, item) for item in pending]
+        for future in as_completed(futures):
+            name, envelope = future.result()
+            envelopes[name] = envelope
     save_detection_cache(stems, envelopes)
-    report_progress(
-        {
-            "current_stage": "loading songs",
-            "stage_detail": "Audio scan complete — loading songs from the scanned envelopes",
-            "progress": 82,
-            "song_progress": 82,
-            "heartbeat": time.time(),
-            "elapsed_seconds": time.perf_counter() - started,
-            "eta_seconds": 0.0,
-            "bytes_read": total_bytes,
-            "bytes_total": total_bytes,
-        }
-    )
+    report_progress({
+        "current_stage": "loading songs",
+        "stage_detail": f"Audio scan complete — {reused} reused, {len(pending)} scanned",
+        "progress": 82, "song_progress": 82, "heartbeat": time.time(),
+        "elapsed_seconds": time.perf_counter() - started,
+        "eta_seconds": 0.0, "bytes_read": total_bytes, "bytes_total": total_bytes,
+    })
 
 
 def save_detection_cache(stems: list[Stem], cache: dict[str, np.ndarray]) -> None:
@@ -5330,6 +5559,24 @@ def segment_stem_activity_decision(
     return False, "; ".join(reasons)
 
 
+def empty_noise_stem_names(analysis: dict[str, object]) -> set[str]:
+    """One safety decision shared by preview and export, before any gain."""
+    excluded = set()
+    diagnostics = analysis.get("noise_diagnostics", {})
+    rms = analysis.get("rms_values_db", {})
+    spreads = analysis.get("dynamic_spread_db", {})
+    peaks = analysis.get("segment_peaks_db", {})
+    for name, value in rms.items():
+        info = diagnostics.get(name, {})
+        if (info.get("case") == "B"
+            or (float(info.get("rms_dbfs", 0)) <= EMPTY_STEM_RMS_DBFS
+                and float(info.get("level_spread_db", 99)) <= EMPTY_STEM_SPREAD_DB)
+            or (float(value) <= -50 and float(spreads.get(name, 99)) <= 6)
+            or (float(value) <= -85 and float(peaks.get(name, 0)) <= -75)):
+            excluded.add(name)
+    return excluded
+
+
 def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[str, dict[str, object]]:
     """Classify sustained broadband noise, empty noisy inputs, and mains hum.
 
@@ -5339,7 +5586,12 @@ def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[s
     """
     result: dict[str, dict[str, object]] = {}
     for stem in stems:
-        audio = _analysis_mono(stem, segment, max_seconds=NOISE_ANALYSIS_MAX_SECONDS)
+        # Cover the song, including instruments that enter after its opening.
+        window_seconds = min(segment.duration, NOISE_ANALYSIS_MAX_SECONDS / 3)
+        starts = np.linspace(segment.start, max(segment.start, segment.end - window_seconds), 3)
+        parts = [_analysis_mono(stem, Segment(float(start), float(start + window_seconds)),
+                               max_seconds=window_seconds) for start in np.unique(starts)]
+        audio = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
         if len(audio) < RHYTHM_ANALYSIS_SR * 2:
             result[stem.path.name] = {"flagged": False, "is_noise": False, "case": "none", "reason": "insufficient audio"}
             continue
@@ -5364,7 +5616,12 @@ def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[s
         noise_mag = np.median(magnitude[quiet], axis=0) if np.any(quiet) else np.median(magnitude, axis=0)
         noise_power = noise_mag * noise_mag
         noise_floor_db = amp_to_db(float(np.sqrt(np.mean(noise_mag * noise_mag) / max(1.0, frame))))
-        noise_flatness = float(np.exp(np.mean(np.log(noise_power))) / max(np.mean(noise_power), 1e-12))
+        # Exclude DC and resampling roll-off: otherwise filtered white hiss
+        # looks tonal merely because the Nyquist bins were attenuated.
+        spectral_freqs = np.fft.rfftfreq(frame, 1.0 / RHYTHM_ANALYSIS_SR)
+        usable_band = (spectral_freqs >= 80) & (spectral_freqs <= RHYTHM_ANALYSIS_SR * 0.40)
+        usable_noise_power = noise_power[usable_band]
+        noise_flatness = float(np.exp(np.mean(np.log(usable_noise_power))) / max(np.mean(usable_noise_power), 1e-12))
         sustained_fraction = float(np.mean(frame_db >= quiet_cut - 3.0))
 
         freqs = np.fft.rfftfreq(frame, 1.0 / RHYTHM_ANALYSIS_SR)
@@ -5386,7 +5643,10 @@ def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[s
         sustained = bool(sustained_fraction >= NOISE_SUSTAINED_FRACTION_THRESHOLD)
         avg_rms = amp_to_db(float(np.sqrt(np.mean(frame_rms * frame_rms) + 1e-12)))
         peak_to_floor_db = float(np.percentile(frame_db, 90) - noise_floor_db)
-        empty_noise = bool(flat_broadband and sustained and avg_rms <= NOISE_EMPTY_RMS_THRESHOLD_DBFS and peak_to_floor_db < 12.0)
+        level_spread_db = float(np.percentile(frame_db, 95) - np.percentile(frame_db, 5))
+        stationary_noise = level_spread_db <= 3.0
+        empty_noise = bool(flat_broadband and sustained and peak_to_floor_db < 12.0
+                           and (stationary_noise or avg_rms <= NOISE_EMPTY_RMS_THRESHOLD_DBFS))
         broadband_overlay = bool(flat_broadband and sustained and noise_floor_db >= NOISE_FLOOR_MIN_DBFS and peak_to_floor_db >= 12.0 and not is_hum)
         if is_hum:
             case = "hum"
@@ -5413,7 +5673,7 @@ def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[s
             "rms_dbfs": float(avg_rms),
             "noise_floor_dbfs": float(noise_floor_db),
             "noise_floor_reduction_target_db": -10.0 if case == "A" else -0.0,
-            "level_spread_db": float(np.percentile(frame_db, 95) - np.percentile(frame_db, 5)),
+            "level_spread_db": level_spread_db,
             "spectral_flatness": float(np.mean(flatness)),
             "noise_floor_flatness": noise_flatness,
             "sustained_fraction": sustained_fraction,
@@ -5456,15 +5716,31 @@ def apply_chunk_fades(chunk: np.ndarray, sr: int, chunk_start_frame: int, total_
     return y.astype(np.float32)
 
 
-def build_section_gate(envelope: np.ndarray) -> tuple[np.ndarray, list[tuple[float, float]]]:
+def resolved_instrument_gate(overrides: dict, role: str, noise: dict) -> bool:
+    # Old editors initialized False without a user choice. New explicit
+    # clicks carry a marker; preserve those choices and legacy enabled gates.
+    if override_bool(overrides.get("gate_user_confirmed"), False) or override_bool(overrides.get("gate_enabled"), False):
+        return override_bool(overrides.get("gate_enabled"), False)
+    return role == "bass" and str(noise.get("case", "none")) == "A"
+
+
+def section_gate_noise_floor(role: str, noise: dict, envelope: np.ndarray) -> float | None:
+    if role != "bass" or noise.get("case") != "A" or not len(envelope):
+        return None
+    return min(amp_to_db(float(np.percentile(envelope, 10))), float(noise.get("noise_floor_dbfs", -120.0)) + 6.0)
+
+
+def build_section_gate(envelope: np.ndarray, noise_floor_dbfs: float | None = None) -> tuple[np.ndarray, list[tuple[float, float]]]:
     if len(envelope) < int(INSTRUMENT_SECTION_GATE_MIN_SECONDS):
         return np.ones(len(envelope), dtype=np.float32), []
-    active = envelope[envelope > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)]
+    active = envelope[envelope > 1e-12]
     if len(active) == 0:
         return np.zeros(len(envelope), dtype=np.float32), [(0.0, len(envelope) * DETECTION_FRAME_SECONDS)]
     playing_level = max(float(np.percentile(active, 75)), 1e-9)
     rel_db = 20.0 * np.log10(np.maximum(envelope, 1e-12) / playing_level)
     quiet = rel_db < -INSTRUMENT_SECTION_GATE_DROP_DB
+    if noise_floor_dbfs is not None:
+        quiet = envelope < db_to_amp(noise_floor_dbfs + 8.0)
     min_bins = max(1, int(round(INSTRUMENT_SECTION_GATE_MIN_SECONDS / DETECTION_FRAME_SECONDS)))
     gate = np.ones(len(envelope), dtype=np.float32)
     muted: list[tuple[float, float]] = []
@@ -5483,7 +5759,20 @@ def build_section_gate(envelope: np.ndarray) -> tuple[np.ndarray, list[tuple[flo
     if fade_bins > 1 and len(gate):
         kernel = np.ones(fade_bins, dtype=np.float32) / fade_bins
         gate = np.convolve(gate, kernel, mode="same").astype(np.float32)
+    # Never attenuate an analysis frame containing the player. Fade on
+    # the noise side of the boundary so the first note keeps its attack.
+    gate[~quiet] = 1.0
     return np.clip(gate, 0.0, 1.0), muted
+
+
+def section_gate_points(envelope: np.ndarray, noise_floor_dbfs: float | None = None) -> list[list[float]]:
+    """Compact the render gate into exact linear automation for preview."""
+    gate, _ = build_section_gate(envelope, noise_floor_dbfs)
+    if not len(gate):
+        return []
+    changes = np.flatnonzero(np.abs(np.diff(gate, n=2)) > 1e-6) + 1
+    indices = np.unique(np.concatenate(([0], changes, [len(gate) - 1])))
+    return [[float(i * DETECTION_FRAME_SECONDS), float(gate[i])] for i in indices]
 
 
 def section_gate_for_chunk(gate: np.ndarray, sr: int, chunk_start_frame: int, nframes: int) -> np.ndarray:
@@ -5503,8 +5792,17 @@ def biquad_filter(x: np.ndarray, sr: int, kind: str, freq: float, q: float = 0.7
 
 
 def make_sos(sr: int, kind: str, freq: float, q: float = 0.707, gain_db: float = 0.0) -> np.ndarray:
+    # Coefficients depend only on these parameters; DSP state stays per stem.
+    # Return a writable copy so callers cannot corrupt another track.
+    return _cached_sos(sr, kind, freq, q, gain_db).copy()
+
+
+@lru_cache(maxsize=512)
+def _cached_sos(sr: int, kind: str, freq: float, q: float, gain_db: float) -> np.ndarray:
     if kind == "highpass":
         return signal.butter(2, freq, btype="highpass", fs=sr, output="sos")
+    elif kind == "lowpass":
+        return signal.butter(2, freq, btype="lowpass", fs=sr, output="sos")
     elif kind == "lowshelf":
         return shelf_sos(sr, freq, q, gain_db, high=False)
     elif kind == "highshelf":
@@ -5664,17 +5962,33 @@ def spectral_subtract_noise(
     """
     if len(x) < 2048 or len(noise_profile) < 4:
         return x.astype(np.float32), 0.0
+    if len(x) > sr * 60:
+        block = int(math.ceil(sr * 30 / 512)) * 512
+        margin = 2048
+        output = np.empty_like(x, dtype=np.float32)
+        reductions = 0.0
+        for start in range(0, len(x), block):
+            end = min(start + block, len(x))
+            lo, hi = max(0, start - margin), min(len(x), end + margin)
+            filtered, reduction = spectral_subtract_noise(x[lo:hi], sr, noise_profile, profile_sr, noise_floor_dbfs)
+            output[start:end] = filtered[start-lo:end-lo]
+            reductions += reduction * (end-start)
+        return output, reductions / len(x)
     n_fft = 2048
     hop = 512
     f, _, z = signal.stft(x.astype(np.float32), fs=sr, nperseg=n_fft, noverlap=n_fft - hop, boundary="zeros")
     profile_freqs = np.linspace(0.0, profile_sr / 2.0, len(noise_profile))
-    profile = np.interp(f, profile_freqs, np.asarray(noise_profile, dtype=np.float64), left=float(noise_profile[0]), right=float(noise_profile[-1]))
-    profile /= max(float(np.median(profile[1:])), 1e-12)
-    noise_amp = db_to_amp(noise_floor_dbfs)
-    noise_mag = noise_amp * profile * math.sqrt(n_fft)
+    usable = (profile_freqs >= 80) & (profile_freqs <= profile_sr * 0.40)
+    tail = float(np.median(np.asarray(noise_profile)[usable]))
+    profile = np.interp(f, profile_freqs, np.asarray(noise_profile, dtype=np.float64),
+                        left=float(noise_profile[0]), right=tail)
+    # scipy STFT uses spectrum scaling (DFT / sum(window)). The stored
+    # profile is an unscaled FFT; multiplying by sqrt(N) suppresses music.
+    # Resampling lowers white-noise power in proportion to its bandwidth.
+    noise_mag = profile * math.sqrt(sr / profile_sr) / float(np.sum(np.hanning(n_fft)))
     power = np.abs(z) ** 2
     noise_power = noise_mag[:, None] ** 2
-    gain = 1.0 - NOISE_REDUCTION_STRENGTH * noise_power / np.maximum(power, 1e-12)
+    gain = 1.0 - NOISE_REDUCTION_STRENGTH * noise_power / np.maximum(power, 1e-24)
     gain = np.clip(gain, NOISE_REDUCTION_FLOOR, 1.0)
     y = signal.istft(z * gain, fs=sr, nperseg=n_fft, noverlap=n_fft - hop, input_onesided=True, boundary=True)[1]
     y = np.asarray(y[: len(x)], dtype=np.float32)
@@ -5764,17 +6078,29 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
     if role == "kick":
         bands = [("low", "highpass", 30, 0.707, 0.0), ("fixed", "peaking", 60, 0.9, 2.5), ("mid", "peaking", 350, 1.0, -2.5), ("fixed", "peaking", 3500, 0.9, 2.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role == "bass":
-        bands = [("low", "highpass", 35, 0.707, 0.0), ("mid", "peaking", 300, 1.0, -2.5), ("fixed", "peaking", 100, 0.8, 1.0), ("air", "highshelf", 10000, 0.707, 0.0)]
+        # Keep the fundamental with the kick, clear mud, and add a controlled
+        # upper-bass presence so the line remains audible on small speakers.
+        bands = [
+            ("low", "highpass", 32, 0.707, 0.0),
+            ("fixed", "peaking", 72, 0.9, 1.5),
+            ("mid", "peaking", 250, 1.0, -2.5),
+            ("fixed", "peaking", 850, 1.1, 1.5),
+            ("air", "highshelf", 10000, 0.707, 0.0),
+        ]
     elif role == "vocal":
         bands = [("low", "highpass", 115, 0.707, 0.0), ("mid", "peaking", 3000, 0.9, 2.0), ("air", "highshelf", 11000, 0.707, 1.0)]
     elif role == "guitar":
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 250, 1.0, -2.0), ("fixed", "peaking", 2800, 1.0, 0.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role in {"keys", "keys_l", "keys_r"}:
         bands = [("low", "highpass", 80, 0.707, 0.0), ("mid", "peaking", 320, 1.0, -2.0), ("air", "highshelf", 10000, 0.707, 0.0)]
-    elif role in {"sax", "horn"}:
+    elif role in {"sax", "horn", "flute"}:
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 2500, 0.9, 1.5), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role == "synth":
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 2500, 0.9, 1.5), ("fixed", "peaking", 320, 1.0, -1.5), ("air", "highshelf", 10000, 0.707, 0.0)]
+    elif role == "hh":
+        bands = [("low", "highpass", 350, 0.707, 0.0), ("mid", "peaking", 7500, 0.9, 1.5), ("air", "highshelf", 12000, 0.707, 1.0)]
+    elif role == "overhead":
+        bands = [("low", "highpass", 180, 0.707, 0.0), ("mid", "peaking", 450, 1.0, -2.0), ("air", "highshelf", 9000, 0.707, 1.0)]
     elif role == "drums":
         bands = [("low", "highpass", 150, 0.707, 0.0), ("mid", "peaking", 300, 1.0, 0.0), ("air", "highshelf", 9000, 0.707, 1.0)]
     elif role == "snare":
@@ -5844,33 +6170,39 @@ def process_track_streaming(
         x = downward_expander_streaming(x, sr, state, key)
         return x.astype(np.float32)
 
-    if role == "bass":
-        x = compressor_streaming(x, sr, ratio=3.0, threshold_db=-22.0, release_ms=140, state=state, key=f"{key}:bass")
-    elif role in {"kick", "snare", "drums"}:
-        x = compressor_streaming(x, sr, ratio=4.0, threshold_db=-20.0, release_ms=100, state=state, key=f"{key}:drums")
-    elif role in {"keys", "keys_l", "keys_r", "guitar", "synth"}:
-        x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-21.0, release_ms=140, state=state, key=f"{key}:other")
-    elif role in {"horn", "sax"}:
-        x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-22.0, release_ms=120, state=state, key=f"{key}:lead")
-    else:
-        x = compressor_streaming(x, sr, ratio=2.0, threshold_db=-22.0, release_ms=150, state=state, key=f"{key}:misc")
+    profile = ROLE_COMPRESSOR_PROFILES.get(
+        role,
+        {"ratio": 2.0, "threshold_db": -22.0, "release_ms": 150.0},
+    )
+    x = compressor_streaming(
+        x,
+        sr,
+        ratio=float(profile["ratio"]),
+        threshold_db=float(profile["threshold_db"]),
+        release_ms=float(profile["release_ms"]),
+        state=state,
+        key=f"{key}:{role}:compressor",
+    )
     return x.astype(np.float32)
 
 
 def base_level_db(role: str) -> float:
     return {
         "kick": 0.0,
-        "snare": -7.0,
+        "snare": -4.5,
         "drums": -8.0,
-        "bass": -3.5,
-        "keys_l": -7.0,
-        "keys_r": -7.0,
-        "keys": -8.0,
-        "guitar": -10.5,
-        "synth": -11.0,
+        "bass": -1.0,
+        "keys_l": -9.5,
+        "keys_r": -9.5,
+        "keys": -9.5,
+        "guitar": -13.5,
+        "hh": -12.0,
+        "overhead": -9.0,
+        "synth": -11.5,
         "sax": -8.0,
         "horn": -8.0,
-        "vocal": -5.0,
+        "flute": -4.5,
+        "vocal": -4.0,
     }.get(role, -12.0)
 
 
@@ -5887,7 +6219,7 @@ def automatic_makeup_gain_db(
     vocal.  Keep this calculation in one place for preview and export paths.
     """
     requested = TARGET_TRACK_RMS_DBFS - float(raw_rms_db)
-    cap = MAX_DRUM_MAKEUP_GAIN_DB if role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
+    cap = MAX_DRUM_MAKEUP_GAIN_DB if role in {"kick", "snare", "hh", "overhead", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
     gain = min(requested, cap) + base_level_db(role) + AUTO_MIX_ROLE_TRIMS_DB.get(role, 0.0)
     if role_norm_db is not None and raw_rms_db > -90.0:
         # Move unusually loud/quiet performances toward the session's own
@@ -5901,7 +6233,7 @@ def automatic_makeup_gain_db(
 
 def automatic_drum_peak_guard_gain_db(role: str, computed_gain_db: float, raw_peak_db: float) -> float:
     """Keep automatic drum input peaks below -8 dBFS before role DSP."""
-    if role not in {"kick", "snare", "drums"} or not np.isfinite(raw_peak_db):
+    if role not in {"kick", "snare", "hh", "overhead", "drums"} or not np.isfinite(raw_peak_db):
         return computed_gain_db
     return min(float(computed_gain_db), -8.0 - float(raw_peak_db))
 
@@ -5954,6 +6286,54 @@ def per_song_auto_mix_gain_db(
     return float(np.clip(requested, AUTO_MIX_MAX_ATTENUATION_DB, upper))
 
 
+def per_song_rhythm_harmonic_gains(
+    roles: dict[str, str], levels: dict[str, float], envelopes: dict[str, np.ndarray] | None = None,
+) -> dict[str, object]:
+    """Balance this song's kit as a group against its audible musical parts.
+
+    Quiet/unused inputs do not set the reference or receive automatic lifts.
+    These are automatic gains only; confirmed user controls are applied later.
+    """
+    drum_offsets = {"kick": -1.0, "snare": -2.0, "hh": -8.0, "overhead": -6.0, "drums": -4.0}
+    melodic_roles = {"guitar", "keys", "keys_l", "keys_r", "bass", "horn", "sax", "flute", "synth"}
+    def audible(name: str) -> bool:
+        level = float(levels.get(name, -120.0))
+        if not np.isfinite(level) or level <= -70.0:
+            return False
+        if envelopes is None:
+            return True
+        env = np.asarray(envelopes.get(name, []), dtype=float)
+        return np.count_nonzero(np.isfinite(env) & (env > db_to_amp(-70.0))) >= 4
+    musical_groups: dict[str, list[float]] = {}
+    for name, role in roles.items():
+        if role in melodic_roles and audible(name):
+            group = "keys" if role in {"keys", "keys_l", "keys_r"} else role
+            musical_groups.setdefault(group, []).append(float(levels[name]))
+    reference_values = [float(np.median(values)) for values in musical_groups.values()]
+    if not reference_values:
+        reference_values = [float(levels[name]) for name, role in roles.items() if role == "vocal" and audible(name)]
+    reference = float(np.median(reference_values)) if reference_values else None
+    gains: dict[str, float] = {}
+    for name, role in roles.items():
+        if role not in drum_offsets and role != "guitar":
+            continue
+        if not audible(name):
+            gains[name] = 0.0
+            continue
+        if reference is None:
+            continue
+        target = reference + drum_offsets.get(role, -0.5)
+        gains[name] = float(np.clip(target - float(levels[name]), -24.0 if role in drum_offsets else -12.0, AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(role, 0.0)))
+    drum_names = [name for name, role in roles.items() if role in drum_offsets and audible(name) and name in gains]
+    drum_level = group_active_level_db(drum_names, {name: float(levels[name]) + gains[name] for name in drum_names})
+    kit_trim = -max(0.0, float(drum_level) - (reference - 1.0)) if drum_level is not None and reference is not None else 0.0
+    for name in drum_names:
+        gains[name] += kit_trim
+    return {"gains_db": gains, "reference_db": reference, "kit_level_before_bus_db": drum_level,
+            "kit_trim_db": kit_trim, "kit_level_after_bus_db": None if drum_level is None else drum_level + kit_trim,
+            "method": "independent per-song active musical reference, bounded quiet-part recovery, combined kit power ceiling"}
+
+
 def vocal_pair_key(name: str) -> str:
     """Return a stable logical pair key without changing channel panning."""
     low = re.sub(r"\.[^.]+$", "", str(name or "")).lower()
@@ -5977,11 +6357,11 @@ def mix_role_group(role: str, name: str = "") -> str:
         return "harmonic_keys"
     if role == "guitar":
         return "harmonic_guitar"
-    if role in {"sax", "horn"}:
+    if role in {"sax", "horn", "flute"}:
         return "melodic_winds"
     if role == "bass":
         return "bass"
-    if role in {"kick", "snare", "drums"}:
+    if role in {"kick", "snare", "hh", "overhead", "drums"}:
         return "rhythm"
     return role or "other"
 
@@ -6004,7 +6384,7 @@ def vocal_harmonic_balance(
     envelopes: dict[str, np.ndarray] | None = None,
 ) -> dict[str, object]:
     """Measure the per-song vocal-vs-harmonic relationship."""
-    vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room"}]
+    vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room", "horn", "sax", "flute"}]
     harmonic_names = [
         name for name, role in effective_roles.items()
         if role in {"keys", "keys_l", "keys_r", "synth"}
@@ -6022,8 +6402,9 @@ def vocal_harmonic_balance(
         vocal_env = group_env(vocal_names)
         harmonic_env = group_env(harmonic_names)
         if vocal_env is not None and harmonic_env is not None and len(vocal_env):
-            voice_mask = vocal_env > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
-            overlap = float(np.mean(harmonic_env[voice_mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(voice_mask) else 0.0
+            length = min(len(vocal_env), len(harmonic_env))
+            voice_mask = vocal_env[:length] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
+            overlap = float(np.mean(harmonic_env[:length][voice_mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(voice_mask) else 0.0
     gap = None if vocal_level is None or harmonic_level is None else float(vocal_level - harmonic_level)
     vocal_correction = 0.0
     if gap is not None and gap < VOCAL_PRIORITY_MARGIN_DB:
@@ -6072,12 +6453,14 @@ def per_song_role_balance_corrections(
         role_env = env_for(names)
         if vocal_env is None or role_env is None or not len(vocal_env):
             return 0.0
-        mask = vocal_env > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
-        return float(np.mean(role_env[mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(mask) else 0.0
+        length = min(len(vocal_env), len(role_env))
+        mask = vocal_env[:length] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS)
+        return float(np.mean(role_env[:length][mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(mask) else 0.0
 
     role_groups = {
         "guitar": [name for name, role in effective_roles.items() if role == "guitar"],
         "keys": [name for name, role in effective_roles.items() if role in {"keys", "keys_l", "keys_r", "synth"}],
+        "bass": [name for name, role in effective_roles.items() if role == "bass"],
     }
     role_levels = {
         role: group_active_level_db(names, active_levels_db)
@@ -6088,7 +6471,10 @@ def per_song_role_balance_corrections(
     for role, names in role_groups.items():
         level = role_levels[role]
         overlap = group_overlap(names)
-        if vocal_level is None or level is None or overlap < 0.25:
+        if role == "bass":
+            correction = 0.0
+            reason = "bass follows kick balance, independently of vocal masking"
+        elif vocal_level is None or level is None or overlap < 0.25:
             correction = 0.0
             reason = "no reliable vocal overlap evidence"
         else:
@@ -6106,9 +6492,10 @@ def per_song_role_balance_corrections(
             role_reasons[name] = reason
 
     vocal_pair_corrections: dict[str, float] = {}
-    vocal_pair_keys = {name: vocal_pair_key(name) for name in vocal_names}
+    mic_names = [name for name, role in effective_roles.items() if role in {"vocal", "room", "horn", "sax", "flute"}]
+    vocal_pair_keys = {name: vocal_pair_key(name) for name in mic_names}
     for pair in sorted(set(vocal_pair_keys.values())):
-        names = [name for name in vocal_names if vocal_pair_keys[name] == pair]
+        names = [name for name in mic_names if vocal_pair_keys[name] == pair]
         if len(names) < 2:
             continue
         levels = [float(active_levels_db[name]) for name in names if name in active_levels_db]
@@ -6116,10 +6503,146 @@ def per_song_role_balance_corrections(
             continue
         target = float(np.median(levels))
         for name in names:
-            vocal_pair_corrections[name] = float(np.clip(target - float(active_levels_db.get(name, target)), -3.0, 3.0))
+            vocal_pair_corrections[name] = float(np.clip(target - float(active_levels_db.get(name, target)), -MIC_PAIR_MAX_CORRECTION_DB, MIC_PAIR_MAX_CORRECTION_DB))
 
+    drum_anchor_names = [name for name, role in effective_roles.items() if role == "snare"]
+    drum_anchor_level = group_active_level_db(drum_anchor_names, active_levels_db)
+    if drum_anchor_level is None:
+        drum_anchor_names = [name for name, role in effective_roles.items() if role in {"overhead", "hh", "drums"}]
+        drum_anchor_level = group_active_level_db(drum_anchor_names, active_levels_db)
+    harmonic_hierarchy_corrections: dict[str, float] = {}
+    if drum_anchor_level is not None:
+        harmonic_target = float(drum_anchor_level) - HARMONIC_BELOW_DRUM_REFERENCE_DB
+        for role in ("guitar", "keys"):
+            names = role_groups[role]
+            level = role_levels.get(role)
+            if level is None or not names:
+                continue
+            excess = float(level - harmonic_target)
+            if excess <= 0.5:
+                continue
+            trim = -float(np.clip(excess, 0.0, 6.0))
+            for name in names:
+                harmonic_hierarchy_corrections[name] = trim
+                role_corrections[name] = min(float(role_corrections.get(name, 0.0)), trim)
+                role_reasons[name] = f"{role} held below drum reference"
+
+    # Equalize competing harmonic instruments without flattening the
+    # intentional hierarchy. A piano/guitar that is materially above the
+    # harmonic median is trimmed; a quiet part is not blindly boosted.
+    harmonic_balance_corrections: dict[str, float] = {}
+    harmonic_names = [
+        name for name, role in effective_roles.items()
+        if role in {"guitar", "keys", "keys_l", "keys_r", "synth"}
+    ]
+    harmonic_levels = [
+        float(active_levels_db[name])
+        for name in harmonic_names
+        if name in active_levels_db and np.isfinite(active_levels_db[name])
+    ]
+    if len(harmonic_levels) >= 2:
+        harmonic_target = float(np.median(harmonic_levels))
+        for name in harmonic_names:
+            if name not in active_levels_db:
+                continue
+            excess = float(active_levels_db[name]) - harmonic_target
+            correction = -float(np.clip(excess - 1.5, 0.0, 3.0))
+            if abs(correction) > 0.01:
+                harmonic_balance_corrections[name] = correction
+                role_corrections[name] = float(np.clip(
+                    role_corrections.get(name, 0.0) + correction,
+                    -6.0,
+                    AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(effective_roles.get(name, ""), AUTO_MIX_MAX_BOOST_DB),
+                ))
+                role_reasons[name] = "harmonic role held near per-song median"
+
+    # A flute/trumpet pair is not one generic mic group: the louder wind is
+    # trimmed and the quieter wind is allowed a bounded lift so the melody is
+    # not decided by capture level alone.
+    wind_pair_corrections: dict[str, float] = {}
+    wind_names = [name for name, role in effective_roles.items() if role in {"horn", "sax", "flute"}]
+    wind_levels = [
+        float(active_levels_db[name])
+        for name in wind_names
+        if name in active_levels_db and np.isfinite(active_levels_db[name])
+    ]
+    if len(wind_levels) >= 2:
+        wind_target = float(np.median(wind_levels))
+        for name in wind_names:
+            if name not in active_levels_db:
+                continue
+            correction = float(np.clip(wind_target - float(active_levels_db[name]), -2.5, 2.5))
+            if abs(correction) > 0.01:
+                wind_pair_corrections[name] = correction
+                role_corrections[name] = float(np.clip(
+                    role_corrections.get(name, 0.0) + correction,
+                    -6.0,
+                    AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(effective_roles.get(name, ""), AUTO_MIX_MAX_BOOST_DB),
+                ))
+                role_reasons[name] = "wind pair equalized around per-song active median"
+
+    # Bass is referenced to the kick, not to the vocal/harmonic group. This
+    # restores presence on quiet bass captures while keeping the kick transient
+    # above the bass fundamental.
+    bass_kick_correction = 0.0
+    bass_names = role_groups["bass"]
+    bass_level = role_levels.get("bass")
+    kick_level = group_active_level_db(
+        [name for name, role in effective_roles.items() if role == "kick"],
+        active_levels_db,
+    )
+    if bass_names and bass_level is not None and kick_level is not None:
+        bass_target = float(kick_level) - 3.0
+        bass_gap = bass_target - float(bass_level)
+        if bass_gap > 0.5:
+            bass_kick_correction = float(np.clip(bass_gap - 0.5, 0.0, 3.0))
+        elif bass_gap < -1.0:
+            bass_kick_correction = -float(np.clip(abs(bass_gap) - 1.0, 0.0, 3.0))
+        if abs(bass_kick_correction) > 0.01:
+            for name in bass_names:
+                role_corrections[name] = float(np.clip(
+                    role_corrections.get(name, 0.0) + bass_kick_correction,
+                    -6.0,
+                    AUTO_MIX_ROLE_BOOST_LIMITS_DB.get("bass", 3.0),
+                ))
+                role_reasons[name] = "bass aligned to kick active level"
+
+    mic_voice_wind_corrections: dict[str, float] = {}
+    wind_names = [name for name, role in effective_roles.items() if role in {"horn", "sax", "flute"}]
+    wind_level = group_active_level_db(wind_names, active_levels_db)
+    if vocal_level is not None and wind_level is not None and wind_names:
+        voice_wind_gap = float(vocal_level - wind_level)
+        if voice_wind_gap < -1.0:
+            voice_lift = float(np.clip((-voice_wind_gap) - 1.0, 0.0, 4.0))
+            wind_trim = -float(np.clip((-voice_wind_gap) - 1.0, 0.0, 5.0))
+            for name in vocal_names:
+                mic_voice_wind_corrections[name] = voice_lift
+            for name in wind_names:
+                mic_voice_wind_corrections[name] = wind_trim
+        elif voice_wind_gap > 2.0:
+            wind_lift = float(np.clip(voice_wind_gap - 2.0, 0.0, 3.0))
+            for name in wind_names:
+                mic_voice_wind_corrections[name] = wind_lift
+        for name, correction in mic_voice_wind_corrections.items():
+            role_corrections[name] = float(np.clip(role_corrections.get(name, 0.0) + correction, -6.0, 4.0))
+            role_reasons[name] = "voice/wind active-level balance correction"
+
+    pair_diagnostics = {}
+    for pair in sorted(set(vocal_pair_keys.values())):
+        names = [name for name in vocal_names if vocal_pair_keys[name] == pair]
+        levels = [float(active_levels_db[name]) for name in names if name in active_levels_db]
+        if len(names) >= 2 and levels:
+            pair_diagnostics[pair] = {
+                "stems": names,
+                "active_levels_db": {name: float(active_levels_db[name]) for name in names if name in active_levels_db},
+                "spread_db": round(max(levels) - min(levels), 3),
+                "target_db": round(float(np.median(levels)), 3),
+                "max_correction_db": MIC_PAIR_MAX_CORRECTION_DB,
+                "method": "per-song active-level median with bounded pair correction",
+            }
     return {
         "vocal_pair_corrections_db": vocal_pair_corrections,
+        "vocal_pair_diagnostics": pair_diagnostics,
         "role_corrections_db": role_corrections,
         "role_reasons": role_reasons,
         "role_levels_db": role_levels,
@@ -6133,7 +6656,104 @@ def per_song_role_balance_corrections(
             (role_reasons[name] for name in role_groups["guitar"] if role_reasons.get(name)),
             "no reliable vocal overlap evidence",
         ),
-        "role_balance_method": "per-song vocal-active envelope balance; guitar correction is independent from keys/harmonic correction",
+        "bass_original_level_db": role_levels.get("bass"),
+        "bass_kick_correction_db": bass_kick_correction,
+        "bass_kick_target_method": "kick active level minus 3 dB, bounded to +3/-3 dB",
+
+        "mic_voice_wind_corrections_db": mic_voice_wind_corrections,
+        "harmonic_hierarchy_corrections_db": harmonic_hierarchy_corrections,
+        "harmonic_balance_corrections_db": harmonic_balance_corrections,
+        "wind_pair_corrections_db": wind_pair_corrections,
+        "drum_reference_level_db": drum_anchor_level,
+        "role_balance_method": "per-song drum-reference hierarchy plus harmonic median, wind-pair and vocal/wind active-level balance",
+        "role_balance_profile_version": ROLE_DSP_PROFILE_VERSION,
+    }
+
+
+def per_song_effect_profile(
+    effective_roles: dict[str, str],
+    active_levels_db: dict[str, float],
+    bpm: float,
+    bpm_confidence: float,
+    mic_content: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Choose restrained, content-aware send defaults for each song.
+
+    This is an automatic scene, not a destructive override: explicit effect
+    edits are marked by the UI and remain authoritative. The scene keeps
+    dense grooves drier, gives presenter/voice material a little space, and
+    lets wind-led songs breathe without putting the same reverb and echo on
+    every export.
+    """
+    classifications = [
+        str(info.get("classification", "voice"))
+        for info in mic_content.values()
+        if isinstance(info, dict)
+    ]
+    has_voice = "voice" in classifications or not classifications
+    has_wind = any(item in {"wind", "flute"} for item in classifications)
+    fast_groove = bool(float(bpm_confidence) >= 0.45 and float(bpm) >= 105.0)
+    if has_wind and not has_voice:
+        scene = "open-wind"
+        reverb_offset_db = 0.5
+        delay_offset_db = -1.0
+    elif fast_groove:
+        scene = "tight-groove"
+        reverb_offset_db = -1.5
+        delay_offset_db = -2.0
+    elif has_voice:
+        scene = "vocal-room"
+        reverb_offset_db = 0.0
+        delay_offset_db = -1.0
+    else:
+        scene = "dry-band"
+        reverb_offset_db = -2.0
+        delay_offset_db = -2.0
+
+    role_space = {
+        "vocal": has_voice,
+        "horn": has_wind,
+        "sax": has_wind,
+        "flute": has_wind,
+        "guitar": scene == "open-wind",
+        "keys": scene in {"vocal-room", "open-wind"},
+        "keys_l": scene in {"vocal-room", "open-wind"},
+        "keys_r": scene in {"vocal-room", "open-wind"},
+        "synth": False,
+    }
+    role_echo = {
+        "vocal": bool(has_voice and not fast_groove),
+        "horn": bool(has_wind and not fast_groove),
+        "sax": bool(has_wind and not fast_groove),
+        "flute": bool(has_wind and not fast_groove),
+        "guitar": False,
+        "keys": scene == "open-wind",
+        "keys_l": scene == "open-wind",
+        "keys_r": scene == "open-wind",
+        "synth": False,
+    }
+    role_offsets = {
+        role: {
+            "reverb_db": float(reverb_offset_db + (0.5 if role in {"vocal", "horn", "sax", "flute"} else 0.0)),
+            "delay_db": float(delay_offset_db),
+        }
+        for role in set(effective_roles.values())
+    }
+    return {
+        "version": 1,
+        "scene": scene,
+        "reason": (
+            "wind-led microphone content" if scene == "open-wind"
+            else "tempo-confident dense groove" if scene == "tight-groove"
+            else "voice-present space" if scene == "vocal-room"
+            else "conservative dry-band default"
+        ),
+        "bpm": float(bpm),
+        "bpm_confidence": float(bpm_confidence),
+        "role_space_enabled": role_space,
+        "role_echo_enabled": role_echo,
+        "role_offsets_db": role_offsets,
+        "method": "per-song content and tempo scene; explicit effect edits remain authoritative",
     }
 
 
@@ -6155,17 +6775,19 @@ def pan_for_role(role: str, name: str) -> float:
     # sides from song to song is harder to audit and can collapse the guitar
     # and keys into one speaker.
     if role == "guitar":
-        return -0.35
-    if role in {"keys", "keys_r"}:
-        return 0.35
-    if role == "keys_l":
-        return -0.35
-    if role == "synth":
-        return 0.0
-    if role in {"sax", "horn"}:
         return 0.25
-    if role == "vocal" and re.search(r"mic\s*2", name.lower()):
+    if role in {"keys", "keys_l", "keys_r"}:
+        return 0.35
+    if role == "synth":
         return 0.15
+    if role in {"sax", "horn", "flute"}:
+        return 0.25
+    if role == "vocal":
+        return 0.25
+    if role == "overhead":
+        return -0.35
+    if role == "hh":
+        return -0.45
     return 0.0
 
 
@@ -6237,6 +6859,22 @@ def mix_source_label(song_overrides: dict[str, object]) -> str:
     return "Automatic mix"
 
 
+def has_confirmed_manual_levels(song_overrides: dict[str, object]) -> bool:
+    stems = song_overrides.get("stems", {})
+    if not isinstance(stems, dict):
+        return False
+    return any(
+        isinstance(settings, dict) and (
+            override_bool(settings.get("manual_makeup_gain_db"), False)
+            or ((override_bool(settings.get("user_confirmed"), False)
+                 or override_bool(settings.get("user_fader_confirmed"), False))
+                and (abs(override_float(settings.get("fader_db"), 0.0)) > 0.001
+                     or abs(override_float(settings.get("gain_db"), 0.0)) > 0.001))
+        )
+        for settings in stems.values()
+    )
+
+
 def stem_override(song_overrides: dict[str, object], stem_name: str) -> dict[str, object]:
     stems = song_overrides.get("stems", {})
     if not isinstance(stems, dict):
@@ -6265,29 +6903,45 @@ def override_bool(value: object, default: bool = False) -> bool:
 
 def reverb_send_level_db(role: str) -> float | None:
     return {
-        "vocal": -10.0,
-        "sax": -14.0,
-        "horn": -14.0,
+        "vocal": -8.0,
+        "sax": -12.0,
+        "horn": -12.0,
+        "flute": -11.0,
         "guitar": -15.0,
-        "keys": -16.0,
-        "keys_l": -16.0,
-        "keys_r": -16.0,
+        "keys": -14.5,
+        "keys_l": -14.5,
+        "keys_r": -14.5,
         "synth": -17.0,
         "snare": -20.0,
         "drums": -24.0,
         "kick": -42.0,
         "bass": -42.0,
+        "hh": -36.0,
+        "overhead": -28.0,
     }.get(role)
 
 
 def delay_send_level_db(role: str, lead_bonus: float) -> float | None:
     if role == "vocal":
-        return -16.0
-    if role in {"sax", "horn", "guitar"}:
-        return -18.0 if lead_bonus > 0.0 else -24.0
+        return -13.0
+    if role in {"sax", "horn", "flute", "guitar"}:
+        return -17.0 if lead_bonus > 0.0 else -21.0
     if role in {"keys", "keys_l", "keys_r", "synth"} and lead_bonus > 0.0:
         return -22.0
     return None
+
+
+def resolved_effect_settings(overrides: dict, role: str, profile: dict) -> dict:
+    """Automatic defaults remain automatic until the user edits effects."""
+    manual = override_bool(overrides.get("effects_user_confirmed"), False)
+    offsets = profile.get("role_offsets_db", {}).get(role, {})
+    return {
+        "fx_enabled": override_bool(overrides.get("fx_enabled"), True),
+        "space_enabled": override_bool(overrides.get("space_enabled"), False) if manual else bool(profile.get("role_space_enabled", {}).get(role, False)),
+        "echo_enabled": override_bool(overrides.get("echo_enabled"), False) if manual else bool(profile.get("role_echo_enabled", {}).get(role, False)),
+        "reverb_scene_offset_db": float(offsets.get("reverb_db", 0.0)),
+        "delay_scene_offset_db": float(offsets.get("delay_db", 0.0)),
+    }
 
 
 def effective_mix_snapshot(
@@ -6314,13 +6968,22 @@ def effective_mix_snapshot(
         "target_lufs": TARGET_LUFS,
         "mastering_intensity": MASTERING_INTENSITY,
         "master_db": override_float(song_overrides.get("master_db"), 0.0),
+        "role_dsp_profile_version": ROLE_DSP_PROFILE_VERSION,
+        "role_compressor_profiles": ROLE_COMPRESSOR_PROFILES,
         "bus_processing": {
             "vocal_bus": {"type": "rms_compressor_streaming", "threshold_db": -12, "ratio": 2, "attack_ms": 150, "release_ms": 600},
-            "mix_bus": {"type": "mix_bus_streaming"},
+            "mix_bus": {
+                "type": "mix_bus_streaming",
+                "glue_profile_version": MASTER_GLUE_PROFILE_VERSION,
+                "ratio": MASTER_GLUE_RATIO,
+                "threshold_db": MASTER_GLUE_THRESHOLD_DB,
+                "release_ms": MASTER_GLUE_RELEASE_MS,
+            },
             "mastering": {
                 "type": "matchering" if MATCHERING_REFERENCE is not None else "master_temp_wav_streaming",
                 "target_lufs": TARGET_LUFS,
                 "intensity": MASTERING_INTENSITY,
+                "glue_profile_version": MASTER_GLUE_PROFILE_VERSION,
                 "reference": str(MATCHERING_REFERENCE) if MATCHERING_REFERENCE is not None else None,
             },
         },
@@ -6339,9 +7002,9 @@ def effective_mix_snapshot(
         delay_total = row.get("delay_total_db")
         role = str(row.get("effective_role") or row.get("role", ""))
         fx_enabled = override_bool(stem_override(song_overrides, name).get("fx_enabled"), True)
-        gate_enabled = override_bool(stem_override(song_overrides, name).get("gate_enabled"), False)
-        space_enabled = override_bool(stem_override(song_overrides, name).get("space_enabled"), False)
-        echo_enabled = override_bool(stem_override(song_overrides, name).get("echo_enabled"), False)
+        gate_enabled = override_bool(row.get("gate_enabled"), False)
+        space_enabled = override_bool(row.get("space_enabled"), False)
+        echo_enabled = override_bool(row.get("echo_enabled"), False)
         stems_payload[name] = {
             "file": name,
             "label": name,
@@ -6370,7 +7033,7 @@ def effective_mix_snapshot(
             "legacy_fader_db": override_float(row.get("legacy_fader_db"), 0.0),
             "legacy_gain_db": override_float(row.get("legacy_gain_db"), 0.0),
             "legacy_gain_state": row.get("legacy_gain_state", "none"),
-            "user_confirmed": bool(row.get("user_confirmed", False)),
+            "user_confirmed": override_bool(stem_override(song_overrides, name).get("user_confirmed"), False) or override_bool(stem_override(song_overrides, name).get("user_fader_confirmed"), False),
             "noise_detected": bool(row.get("noise_detected")),
             "noise_watchdog_flagged": bool(row.get("noise_watchdog_flagged")),
             "noise_case": row.get("noise_case", "none"),
@@ -6446,10 +7109,17 @@ def delay_line_streaming(
     buf = state.get(key)
     if buf is None or buf.shape != (delay_samples, x.shape[1]):
         buf = np.zeros((delay_samples, x.shape[1]), dtype=np.float32)
-    combined = np.vstack([buf, x.astype(np.float32)])
-    out = combined[: len(x)].copy()
-    state[key] = (combined[len(x) : len(x) + delay_samples] + out[-delay_samples:] * feedback if len(out) >= delay_samples else combined[-delay_samples:]).astype(np.float32)
-    return out.astype(np.float32)
+    frames = len(x)
+    combined = np.empty((delay_samples + frames, x.shape[1]), dtype=np.float32)
+    combined[:delay_samples] = buf
+    if feedback == 0:
+        combined[delay_samples:] = x
+    else:
+        for start in range(0, frames, delay_samples):
+            end = min(frames, start + delay_samples)
+            combined[delay_samples + start:delay_samples + end] = x[start:end] + feedback * combined[start:end]
+    state[key] = combined[frames:frames + delay_samples].copy()
+    return combined[:frames].copy()
 
 
 def slap_delay_streaming(
@@ -6489,13 +7159,13 @@ def mix_bus(x: np.ndarray, sr: int) -> np.ndarray:
 
 def mix_bus_streaming(x: np.ndarray, sr: int, state: dict[str, np.ndarray]) -> np.ndarray:
     mono = np.mean(x, axis=1)
-    comp = compressor_streaming(mono, sr, ratio=2.0, threshold_db=-14.0, release_ms=250, state=state, key="bus")
+    comp = compressor_streaming(mono, sr, ratio=MASTER_GLUE_RATIO, threshold_db=MASTER_GLUE_THRESHOLD_DB, release_ms=MASTER_GLUE_RELEASE_MS, state=state, key="bus")
     gain = np.divide(comp, mono, out=np.ones_like(comp), where=np.abs(mono) > 1e-8)
-    gain = np.clip(gain, 0.25, 1.0)
+    gain = np.clip(gain, 0.35, 1.0)
     x = x * gain[:, None]
-    x = np.tanh(x * 1.15) / np.tanh(1.15)
+    x = np.tanh(x * MASTER_GLUE_SATURATION) / np.tanh(MASTER_GLUE_SATURATION)
     for ch in range(2):
-        x[:, ch] = sosfilt_streaming(x[:, ch].astype(np.float32), sr, "highshelf", 10000, state, f"bus:air:{ch}", q=0.707, gain_db=1.0)
+        x[:, ch] = sosfilt_streaming(x[:, ch].astype(np.float32), sr, "highshelf", 10000, state, f"bus:air:{ch}", q=0.707, gain_db=0.7)
     return x.astype(np.float32)
 
 
@@ -6611,6 +7281,7 @@ def master_temp_wav_streaming(premaster_path: Path, master_path: Path, sr: int) 
         )
 
     if MATCHERING_REFERENCE is not None:
+        ensure_matchering_available()
         reference = Path(MATCHERING_REFERENCE).expanduser()
         if matchering_api is None:
             raise RuntimeError(
@@ -6622,11 +7293,12 @@ def master_temp_wav_streaming(premaster_path: Path, master_path: Path, sr: int) 
         print(f"  mastering backend: Matchering reference={reference}", flush=True)
         matchering_api.log(print)
         try:
-            matchering_api.process(
-                target=str(premaster_path),
-                reference=str(reference),
-                results=[matchering_api.pcm24(str(master_path))],
-            )
+            with bounded_reference_eq():
+                matchering_api.process(
+                    target=str(premaster_path),
+                    reference=str(reference),
+                    results=[matchering_api.pcm24(str(master_path))],
+                )
         except Exception as exc:
             if "Track length is exceeded in the TARGET file" not in str(exc):
                 raise
@@ -6678,62 +7350,68 @@ def master_temp_wav_streaming(premaster_path: Path, master_path: Path, sr: int) 
     return final_lufs, final_peak
 
 
-def measure_encoded_lufs(path: Path) -> float:
-    """Measure encoded loudness without buffering the complete MP3 in Python."""
-    ffmpeg = resolve_ffmpeg()
-    if not ffmpeg:
-        return float("nan")
-    # Let FFmpeg's ebur128 filter perform the integrated-loudness pass in
-    # streaming mode. The previous implementation decoded the whole MP3 into
-    # a Python bytes object and then into a NumPy array for every song.
+@lru_cache(maxsize=16)
+def _measure_ebur128_cached(path: str, ffmpeg: str, signature: tuple) -> tuple[float, float]:
+    # The signature includes nanosecond times and inode: any trim, rewrite or
+    # replacement invalidates the result, including same-size audio files.
     result = subprocess.run(
-        [
-            ffmpeg,
-            "-hide_banner",
-            "-nostats",
-            "-i",
-            str(path),
-            "-af",
-            "ebur128=peak=true",
-            "-f",
-            "null",
-            "-",
-        ],
-        capture_output=True,
-        text=True,
+        [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-i", path,
+         "-af", "ebur128=peak=true:framelog=verbose", "-f", "null", "-"],
+        capture_output=True, text=True,
     )
     if result.returncode != 0:
+        raise RuntimeError(f"audio measurement failed for {path}: {(result.stderr or '').strip()}")
+    loudness = re.findall(r"\bI:\s*([-+]?\d+(?:\.\d+)?)\s*LUFS", result.stderr or "")
+    peaks = re.findall(r"Peak:\s*([-+]?\d+(?:\.\d+)?)\s*dBFS", result.stderr or "")
+    if not peaks:
+        raise RuntimeError(f"ffmpeg did not return a true-peak value for {path}")
+    return (float(loudness[-1]) if loudness else float("nan"), float(peaks[-1]))
+
+
+def measure_audio_loudness_and_peak(path: Path) -> tuple[float, float]:
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for independent true-peak validation")
+    path = Path(path).resolve()
+    stat = path.stat()
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    return _measure_ebur128_cached(str(path), str(ffmpeg), signature)
+
+
+def measure_encoded_lufs(path: Path) -> float:
+    """Reuse the delivered file's independent loudness/true-peak pass."""
+    try:
+        loudness, _peak = measure_audio_loudness_and_peak(path)
+        if np.isfinite(loudness):
+            return loudness
+    except (RuntimeError, OSError):
         return float("nan")
-    matches = re.findall(r"\bI:\s*([-+]?\d+(?:\.\d+)?)\s*LUFS", result.stderr or "")
-    if matches:
-        return float(matches[-1])
-    # Keep a compatibility fallback for FFmpeg builds that omit the summary
-    # line from stderr.
+    # Compatibility for older FFmpeg builds which omit integrated loudness.
     try:
         decoded = subprocess.check_output(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "wav", "-"],
+            [resolve_ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "wav", "-"],
         )
         audio, sample_rate = sf.read(io.BytesIO(decoded), dtype="float32", always_2d=True)
         return float(pyln.Meter(sample_rate).integrated_loudness(audio))
     except Exception:
         return float("nan")
 
+
 def measure_true_peak_db(path: Path) -> float:
-    """Measure the delivered file with ffmpeg's independent true-peak meter."""
-    ffmpeg = resolve_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError("ffmpeg is required for independent true-peak validation")
-    result = subprocess.run(
-        [ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true", "-f", "null", "-"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"true-peak measurement failed for {path}: {(result.stderr or '').strip()}")
-    matches = re.findall(r"Peak:\s*([-+]?\d+(?:\.\d+)?)\s*dBFS", result.stderr or "")
-    if not matches:
-        raise RuntimeError(f"ffmpeg did not return a true-peak value for {path}")
-    return float(matches[-1])
+    """Measure independent true peak once per exact file revision."""
+    return measure_audio_loudness_and_peak(path)[1]
+
+
+def accumulate_audio_meter(meter: dict, audio: np.ndarray) -> None:
+    values = np.asarray(audio)
+    if not values.size:
+        return
+    meter["peak"] = max(float(meter["peak"]), float(np.max(np.abs(values))))
+    flat = values.reshape(-1)
+    # Double-precision reduction without allocating a float64 copy and a
+    # second full-size squared buffer for every bus/stem on every chunk.
+    meter["sumsq"] += float(np.einsum("i,i->", flat, flat, dtype=np.float64))
+    meter["count"] += int(values.size)
 
 
 def attenuate_wav_in_place(path: Path, attenuation_db: float) -> None:
@@ -6857,7 +7535,7 @@ def creative_title_from_features(mix: np.ndarray, sr: int, index: int, bpm: floa
         pool = ["Glass in the Sun", "Lucid Machinery", "A Brightness Between Us", "Prism Through Dust", "Daylight on Reeds", "Gold Thread in the Air"]
     elif dominant_role in {"bass", "kick"}:
         pool = ["Ground Wire Bloom", "The Low Road Turns", "Underneath the Engine", "Copper in the Floorboards", "Orbit Below the Room", "Weight of the Evening"]
-    elif dominant_role in {"horn", "sax"}:
+    elif dominant_role in {"horn", "sax", "flute"}:
         pool = ["Brass After Midnight", "A Signal in Blue", "Reeds Across the Hall", "Weather for Brass", "The Broadcast Fades", "Smoke on the Bell"]
     elif dominant_role in {"keys", "keys_l", "keys_r", "synth"}:
         pool = ["Rooms Made of Light", "Soft Circuitry", "Keys Underwater", "The Arcade at Closing", "Electric Rooms", "A Door in the Chord"]
@@ -6966,12 +7644,23 @@ def _onset_positions(audio: np.ndarray, sr: int) -> np.ndarray:
 
 
 def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, object]:
-    """Classify vocal-role mic content using wind purity vs voice formants/transients."""
+    """Classify a mic by content while keeping the physical pair intact.
+
+    The source role tells us that this is a microphone, not what is in front
+    of it. Use filename hints when present, but also allow a strict,
+    narrow-spectrum detector to identify flute/brass-like material when the
+    file is generically named (for example Vox 1/Vox 2). Voice remains the
+    conservative default when the evidence is ambiguous.
+    """
     audio = _analysis_mono(stem, segment, max_seconds=180.0)
     label = stem.path.name.lower()
     explicit_wind = any(term in label for term in VOICE_WIND_EXPLICIT_TERMS)
     if len(audio) < RHYTHM_ANALYSIS_SR * 2:
-        return {"classification": "wind" if explicit_wind else "voice", "confidence": 0.55 if explicit_wind else 0.35, "reason": "filename hint" if explicit_wind else "insufficient spectral evidence"}
+        return {
+            "classification": "wind" if explicit_wind else "voice",
+            "confidence": 0.55 if explicit_wind else 0.35,
+            "reason": "filename hint" if explicit_wind else "insufficient spectral evidence",
+        }
     frame, hop = 2048, 512
     frames = np.lib.stride_tricks.sliding_window_view(audio, frame)[::hop]
     windowed = frames * np.hanning(frame).astype(np.float32)
@@ -6981,7 +7670,11 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
     energy = power[:, band].sum(axis=1)
     active = energy > np.percentile(energy, 45)
     if not np.any(active):
-        return {"classification": "wind" if explicit_wind else "voice", "confidence": 0.55 if explicit_wind else 0.25, "reason": "no stable active frames"}
+        return {
+            "classification": "wind" if explicit_wind else "voice",
+            "confidence": 0.55 if explicit_wind else 0.25,
+            "reason": "no stable active frames",
+        }
     selected = power[active][:, band]
     selected_freqs = freqs[band]
     flatness = np.exp(np.mean(np.log(selected), axis=1)) / np.mean(selected, axis=1)
@@ -6989,18 +7682,17 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
     peak_counts = []
     harmonicity = []
     for spectrum in selected:
-        peaks, props = signal.find_peaks(spectrum, prominence=max(float(np.max(spectrum)) * 0.025, 1e-9), distance=3)
+        peaks, _props = signal.find_peaks(
+            spectrum,
+            prominence=max(float(np.max(spectrum)) * 0.025, 1e-9),
+            distance=3,
+        )
         peak_counts.append(len(peaks))
         harmonicity.append(float(np.max(spectrum) / np.sum(spectrum)))
     mean_flatness = float(np.median(flatness))
     mean_centroid = float(np.median(centroid))
     mean_peaks = float(np.median(peak_counts))
     mean_harmonicity = float(np.median(harmonicity))
-    # Flute and similar winds concentrate energy in one fundamental plus a
-    # small number of harmonics. Voice normally has several formant regions,
-    # more upper-band energy, and noisier consonant/breath transients. The
-    # pure-tone gate is deliberately strict so a vocal mic is not promoted to
-    # vocal priority merely because one vowel happens to be tonal.
     upper = selected[:, selected_freqs >= 1800.0].sum(axis=1)
     total = selected.sum(axis=1) + 1e-12
     upper_ratio = float(np.median(upper / total))
@@ -7011,22 +7703,42 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
         and mean_peaks <= 7.0
         and upper_ratio < 0.24
     )
-    wind_score = (1.5 if pure_wind else 0.0) + (1.0 if mean_flatness < 0.22 else 0.0) + (1.0 if mean_harmonicity > 0.20 else 0.0) + (0.5 if mean_centroid > 1800.0 else 0.0)
-    # A stable narrow spectrum is stronger evidence for wind than a single
-    # high harmonicity frame; voice formants move and broaden over time.
+    wind_score = (
+        (1.5 if pure_wind else 0.0)
+        + (1.0 if mean_flatness < 0.22 else 0.0)
+        + (1.0 if mean_harmonicity > 0.20 else 0.0)
+        + (0.5 if mean_centroid > 1800.0 else 0.0)
+    )
     if pure_wind and peak_stability < 2.5:
         wind_score += 0.5
     if explicit_wind:
         wind_score += 1.5
-    # A stem whose filename already identifies it as a vocal microphone must
-    # remain vocal unless the filename explicitly names a wind instrument.
-    # Spectral purity alone is not sufficient: sustained vowels can resemble
-    # narrow-band wind material and otherwise lose vocal-bus processing.
-    is_wind = bool(explicit_wind and wind_score >= 2.0)
+    # Generic microphone names can still be classified as wind, but only with
+    # a stricter profile than an explicit filename hint. This prevents a
+    # sustained vowel from being routed through the horn EQ and compressor.
+    generic_wind = bool(
+        not explicit_wind
+        and pure_wind
+        and mean_flatness < 0.14
+        and mean_harmonicity > 0.30
+        and mean_peaks <= 6.0
+        and peak_stability < 2.0
+        and 1200.0 <= mean_centroid <= 3200.0
+    )
+    is_wind = bool((explicit_wind and wind_score >= 2.0) or generic_wind)
+    confidence = float(np.clip(
+        0.45 + abs(wind_score - 1.5) * 0.18 + (0.12 if generic_wind else 0.0),
+        0.0,
+        0.95,
+    ))
     return {
         "classification": "wind" if is_wind else "voice",
-        "confidence": float(np.clip(0.45 + abs(wind_score - 1.5) * 0.18, 0.0, 0.95)),
-        "reason": "tonal narrow-spectrum wind profile" if is_wind else "formant-like broadband vocal profile",
+        "confidence": confidence,
+        "reason": (
+            "explicit wind filename and tonal profile" if explicit_wind and is_wind
+            else "generic mic narrow-spectrum wind profile" if generic_wind
+            else "formant-like broadband vocal profile"
+        ),
         "spectral_flatness": mean_flatness,
         "spectral_centroid_hz": mean_centroid,
         "median_peak_count": mean_peaks,
@@ -7035,7 +7747,6 @@ def classify_mic_content(stem: Stem, segment: Segment, sr: int) -> dict[str, obj
         "peak_count_stability": peak_stability,
         "pure_wind_profile": pure_wind,
     }
-
 
 def analyze_rhythmic_consistency(stem: Stem, segment: Segment, bpm: float) -> dict[str, object]:
     """Measure onset/grid alignment and activity continuity for one stem/song."""
@@ -7127,12 +7838,35 @@ def analyze_song_mix_controls(
         stem.path.name: classify_mic_content(stem, segment, sr)
         for stem in stems if stem.role == "vocal"
     }
+    wind_mic_names = [
+        name for name, info in mic_content.items()
+        if isinstance(info, dict) and info.get("classification") == "wind"
+    ]
+    explicit_wind_name = lambda name: any(
+        term in str(name).lower()
+        for term in ("flute", "trump", "horn", "sax", "trombone", "brass")
+    )
+    generic_wind_names = [name for name in wind_mic_names if not explicit_wind_name(name)]
+    if len(generic_wind_names) >= 2:
+        ranked_wind = sorted(
+            generic_wind_names,
+            key=lambda name: float(mic_content[name].get("spectral_centroid_hz") or 0.0),
+        )
+        mic_content[ranked_wind[0]]["instrument_variant"] = "flute"
+        mic_content[ranked_wind[-1]]["instrument_variant"] = "horn"
+        mic_content[ranked_wind[0]]["variant_reason"] = "lower spectral centroid in generic wind pair"
+        mic_content[ranked_wind[-1]]["variant_reason"] = "higher spectral centroid in generic wind pair"
     effective_roles = {
         stem.path.name: (
-            "horn"
+            (
+                "flute"
+                if str(mic_content.get(stem.path.name, {}).get("instrument_variant") or "").lower() == "flute"
+                or "flute" in stem.path.name.lower()
+                else "horn"
+            )
             if stem.role == "vocal"
             and mic_content.get(stem.path.name, {}).get("classification") == "wind"
-            and any(term in stem.path.name.lower() for term in VOICE_WIND_EXPLICIT_TERMS)
+            and float(mic_content.get(stem.path.name, {}).get("confidence", 0.0)) >= 0.68
             else stem.role
         )
         for stem in stems
@@ -7153,6 +7887,14 @@ def analyze_song_mix_controls(
     active_levels_db = active_levels_db or dict(rms_values_db)
     balance = vocal_harmonic_balance(effective_roles, active_levels_db, segment_envelopes)
     role_balance = per_song_role_balance_corrections(effective_roles, active_levels_db, segment_envelopes)
+    rhythm_harmonic_balance = per_song_rhythm_harmonic_gains(effective_roles, active_levels_db, segment_envelopes)
+    effect_profile = per_song_effect_profile(
+        effective_roles,
+        active_levels_db,
+        bpm,
+        bpm_confidence,
+        mic_content,
+    )
     vocal_names = set(balance["vocal_names"])
     harmonic_names = set(balance["harmonic_names"])
     vocal_group_correction = float(balance["vocal_group_correction_db"] or 0.0)
@@ -7177,6 +7919,7 @@ def analyze_song_mix_controls(
         "bpm_confidence": bpm_confidence,
         "mic_content": mic_content,
         "effective_roles": effective_roles,
+        "rhythm_harmonic_balance": rhythm_harmonic_balance,
         "rhythm": rhythm,
         "harmonic": harmonic,
         "vocal_priority": priority,
@@ -7184,6 +7927,18 @@ def analyze_song_mix_controls(
         "vocal_pair_keys": pair_keys,
         "balance": balance,
         "role_balance": role_balance,
+        "effect_profile": effect_profile,
+        "automatic_mix_profile": {
+            "version": AUTO_MIX_PROFILE_VERSION,
+            "rhythm_harmonic_balance": rhythm_harmonic_balance,
+            "mic_pair_balance": role_balance.get("vocal_pair_diagnostics", {}),
+            "content_adaptive_mic_eq": True,
+            "content_adaptive_mic_role": True,
+            "guitar_vocal_overlap_trim": True,
+            "instrument_profile_version": 3,
+            "noise_watchdog": "spectral subtraction, hum notches and raw wind/mic gating",
+            "role_profiles": ["kick", "snare", "hh", "overhead", "bass", "guitar", "keys", "synth", "vocal", "horn", "sax", "flute"],
+        },
         "voice_floor_db": voice_floor,
         "synth_floor_db": synth_floor,
         "pan_assignments": {
@@ -7215,6 +7970,18 @@ def spectral_centroid(x: np.ndarray, sr: int) -> float:
     return float(np.sum(f[:, None] * mag) / (np.sum(mag) + 1e-9))
 
 
+def analysis_window_offset(cache: dict, segment: Segment, song_id: int, preview_window: dict | None = None) -> float:
+    selection = cache.get("selection", {})
+    start, end = float(selection.get("start_sec", -1)), float(selection.get("end_sec", -1))
+    if int(cache.get("song_id", -1)) != int(song_id):
+        raise RuntimeError("Analysis snapshot belongs to another song.")
+    if abs(start - segment.start) <= 1e-6 and abs(end - segment.end) <= 1e-6:
+        return 0.0
+    if isinstance(preview_window, dict) and start <= segment.start < segment.end <= end and abs(float(preview_window.get("start_sec", -1)) - segment.start) <= 1e-6 and abs(float(preview_window.get("end_sec", -1)) - segment.end) <= 1e-6:
+        return segment.start - start
+    raise RuntimeError("Analyze required: analysis snapshot does not match the selected song window.")
+
+
 def render_segment(
     stems: list[Stem],
     segment: Segment,
@@ -7224,7 +7991,9 @@ def render_segment(
     verify_announcement: bool = True,
     prepared_plan: dict[str, object] | None = None,
     artifact_dir: Path | None = None,
+    retain_diagnostic_audio: bool = True,
 ) -> dict[str, object]:
+    validate_mastering_reference(MATCHERING_REFERENCE)
     render_t0 = time.perf_counter()
     song_overrides = current_song_overrides(index)
     override_trace = {str(name): dict(value) for name, value in current_override_verify_trace(index).items() if isinstance(value, dict)}
@@ -7253,61 +8022,19 @@ def render_segment(
             }
         )
 
-    lightweight_render = bool(isinstance(prepared_plan, dict) and prepared_plan.get("lightweight_render"))
-    if lightweight_render:
-        # Fast render fallback: use current controls and conservative defaults.
-        # It never scans source audio, runs Whisper, computes thresholds, or
-        # rebuilds Auto-Mix. The full analysis remains an explicit Analyze step.
-        names = [stem.path.name for stem in stems]
-        analysis_cache = {
-            "version": 2,
-            "song_id": int(index),
-            "selection": {"start_sec": float(segment.start), "end_sec": float(segment.end)},
-            "rms_values_db": {name: -30.0 for name in names},
-            "energies": {name: 1.0 for name in names},
-            "has_audio": {name: True for name in names},
-            "dynamic_spread_db": {name: 0.0 for name in names},
-            "segment_envelopes": {name: np.array([], dtype=np.float32) for name in names},
-            "segment_peaks_db": {name: -6.0 for name in names},
-            "role_norms_db": {},
-            "mix_controls": {
-                "effective_roles": {name: stem.role for name, stem in zip(names, stems)},
-                "rhythm": {},
-                "harmonic": {},
-                "vocal_priority": {},
-                "vocal_group_gain": {},
-                "vocal_pair_keys": {},
-                "mic_content": {},
-                "balance": {},
-                "bpm": 0.0,
-            },
-            "noise_diagnostics": {},
-            "flattening": {},
-            "drum_bpm": (0.0, 0.0),
-        }
-        print(f"RENDER ANALYSIS CACHE: lightweight settings snapshot for song {index}", flush=True)
-    else:
-        if not isinstance(prepared_plan, dict):
-            raise RuntimeError("Render did not receive a usable settings snapshot.")
-        cache_path_value = prepared_plan.get("analysis_cache_path")
-        cache_signature = prepared_plan.get("analysis_cache_signature")
-        if not cache_path_value or not cache_signature:
-            raise RuntimeError("Render analysis snapshot is incomplete.")
-        cache_path = Path(str(cache_path_value))
-        try:
-            with cache_path.open("rb") as cache_file:
-                analysis_cache = load_analysis_cache(cache_path)
-        except Exception as exc:
-            raise RuntimeError(f"Render analysis snapshot is unavailable: {exc}") from exc
-        if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
-            raise RuntimeError("Render analysis snapshot version is unsupported.")
-    cached_selection = analysis_cache.get("selection", {})
-    if (
-        int(analysis_cache.get("song_id", index)) != int(index)
-        or abs(float(cached_selection.get("start_sec", -1.0)) - float(segment.start)) > 1e-6
-        or abs(float(cached_selection.get("end_sec", -1.0)) - float(segment.end)) > 1e-6
-    ):
-        raise RuntimeError("Analyze required: analysis snapshot does not match the selected song window.")
+    if not isinstance(prepared_plan, dict):
+        raise RuntimeError("Render requires an independent per-song analysis snapshot.")
+    cache_path_value = prepared_plan.get("analysis_cache_path")
+    cache_signature = prepared_plan.get("analysis_cache_signature")
+    if not cache_path_value or not cache_signature:
+        raise RuntimeError("Render analysis snapshot is incomplete.")
+    try:
+        analysis_cache = load_analysis_cache(Path(str(cache_path_value)))
+    except Exception as exc:
+        raise RuntimeError(f"Render analysis snapshot is unavailable: {exc}") from exc
+    if not isinstance(analysis_cache, dict) or int(analysis_cache.get("version", 0)) != 2:
+        raise RuntimeError("Render analysis snapshot version is unsupported.")
+    analysis_offset_seconds = analysis_window_offset(analysis_cache, segment, int(prepared_plan.get("analysis_song_id", index)), prepared_plan.get("preview_window"))
     rms_values_db = analysis_cache.get("rms_values_db", {})
     energies = analysis_cache.get("energies", {})
     has_audio = analysis_cache.get("has_audio", {})
@@ -7323,9 +8050,9 @@ def render_segment(
         raise RuntimeError("Analyze required: Auto-Mix analysis snapshot is incomplete.")
     if not isinstance(noise_diagnostics, dict):
         noise_diagnostics = {}
-    noise_names = [name for name, info in noise_diagnostics.items() if info.get("case") == "B"]
+    noise_names = sorted(empty_noise_stem_names(analysis_cache))
     if noise_names:
-        print(f"NOISE DETECTION song={index}: empty noisy inputs muted: {', '.join(noise_names)}", flush=True)
+        print(f"NOISE DETECTION song={index}: empty/noisy inputs muted: {', '.join(noise_names)}", flush=True)
     watchdog_names = [name for name, info in noise_diagnostics.items() if info.get("flagged")]
     if watchdog_names:
         print("NOISE WATCHDOG " + json.dumps(
@@ -7363,6 +8090,10 @@ def render_segment(
     role_corrections = role_balance.get("role_corrections_db", {}) if isinstance(role_balance, dict) else {}
     vocal_pair_corrections = role_balance.get("vocal_pair_corrections_db", {}) if isinstance(role_balance, dict) else {}
     role_balance_reasons = role_balance.get("role_reasons", {}) if isinstance(role_balance, dict) else {}
+    effect_profile = mix_controls.get("effect_profile", {}) if isinstance(mix_controls, dict) else {}
+    if not effect_profile:
+        effect_profile = per_song_effect_profile(effective_roles, rms_values_db, float(mix_controls.get("bpm", 0.0) or 0.0), 0.0, mix_controls.get("mic_content", {}))
+    effect_role_offsets = effect_profile.get("role_offsets_db", {}) if isinstance(effect_profile, dict) else {}
     mic_content = mix_controls["mic_content"]
     active_levels_db = {
         name: active_level_db(rms_values_db.get(name, -120.0), segment_envelopes.get(name))
@@ -7415,10 +8146,12 @@ def render_segment(
             inactive_reasons.append("silenced by fader")
         if solo_names and stem.path.name not in solo_names:
             inactive_reasons.append("not soloed")
+        if not stem_activity:
+            inactive_reasons.append(activity_reason)
         if inactive_reasons:
             eq_defaults = role_eq_defaults(mix_role)
             requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
-            makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
+            makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "hh", "overhead", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
             role_norm_db = role_norms_db.get(mix_role)
             gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
             computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
@@ -7495,12 +8228,12 @@ def render_segment(
                     "flattening_range_db": float(flattening.get(stem.path.name, {}).get("range_db", 0.0)),
                     "pan": enforced_pan(mix_role, stem.name, overrides.get("pan")),
                     "gain_overridden": abs(user_gain_db) > 0.001,
-                    "reverb_base_db": reverb_send_level_db(stem.role),
+                    "reverb_base_db": reverb_send_level_db(mix_role),
                     "reverb_send_db": override_float(overrides.get("reverb_send_db"), 0.0),
-                    "reverb_total_db": None if reverb_send_level_db(stem.role) is None else reverb_send_level_db(stem.role) + override_float(overrides.get("reverb_send_db"), 0.0),
-                    "delay_base_db": delay_send_level_db(stem.role, 0.0),
+                    "reverb_total_db": None if reverb_send_level_db(mix_role) is None else reverb_send_level_db(mix_role) + override_float(overrides.get("reverb_send_db"), 0.0),
+                    "delay_base_db": delay_send_level_db(mix_role, 0.0),
                     "delay_send_db": override_float(overrides.get("delay_send_db"), 0.0),
-                    "delay_total_db": None if delay_send_level_db(stem.role, 0.0) is None else delay_send_level_db(stem.role, 0.0) + override_float(overrides.get("delay_send_db"), 0.0),
+                    "delay_total_db": None if delay_send_level_db(mix_role, 0.0) is None else delay_send_level_db(mix_role, 0.0) + override_float(overrides.get("delay_send_db"), 0.0),
                     **eq_settings,
                     "status": "muted (inactive)",
                     "reason": "; ".join(inactive_reasons),
@@ -7510,7 +8243,7 @@ def render_segment(
             continue
 
         requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
-        makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
+        makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "hh", "overhead", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
         role_norm_db = role_norms_db.get(mix_role)
         gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
         computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
@@ -7519,6 +8252,7 @@ def render_segment(
             AUTO_MIX_MAX_ATTENUATION_DB,
             AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
         ))
+        computed_makeup_gain_db = float(mix_controls.get("rhythm_harmonic_balance", {}).get("gains_db", {}).get(stem.path.name, computed_makeup_gain_db))
         if not override_bool(overrides.get("manual_makeup_gain_db"), False):
             computed_makeup_gain_db = automatic_drum_peak_guard_gain_db(
                 mix_role, computed_makeup_gain_db, segment_peaks_db.get(stem.path.name, -120.0)
@@ -7529,7 +8263,14 @@ def render_segment(
             makeup_gain_db = override_float(overrides.get("auto_mix_gain_db", overrides.get("makeup_gain_db")), computed_makeup_gain_db)
             makeup_gain_db = min(makeup_gain_db, AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB))
         user_gain_db = override_float(overrides.get("gain_db"), 0.0)
-        lead_bonus = 1.5 if energies[stem.path.name] > median_energy * 1.35 and mix_role not in {"kick", "snare", "drums", "bass"} else 0.0
+        lead_bonus = 1.5 if energies[stem.path.name] > median_energy * 1.35 and mix_role not in {"kick", "snare", "hh", "overhead", "drums", "bass"} else 0.0
+        effect_offsets = effect_role_offsets.get(mix_role, {}) if isinstance(effect_role_offsets, dict) else {}
+        effect_space = effect_profile.get("role_space_enabled", {}) if isinstance(effect_profile, dict) else {}
+        effect_echo = effect_profile.get("role_echo_enabled", {}) if isinstance(effect_profile, dict) else {}
+        reverb_scene_offset_db = float(effect_offsets.get("reverb_db", 0.0) or 0.0)
+        delay_scene_offset_db = float(effect_offsets.get("delay_db", 0.0) or 0.0)
+        automatic_space_enabled = bool(effect_space.get(mix_role, False)) if isinstance(effect_space, dict) else False
+        automatic_echo_enabled = bool(effect_echo.get(mix_role, False)) if isinstance(effect_echo, dict) else False
         fader_gain_db = override_float(overrides.get("fader_db"), 0.0)
         level_gain_db = fader_gain_db
         trace_row["dsp_applied"] = {
@@ -7562,10 +8303,13 @@ def render_segment(
             "lead_bonus_db": lead_bonus,
             "reverb_send_db": override_float(overrides.get("reverb_send_db"), 0.0),
             "delay_send_db": override_float(overrides.get("delay_send_db"), 0.0),
+            "reverb_scene_offset_db": reverb_scene_offset_db,
+            "delay_scene_offset_db": delay_scene_offset_db,
+            "effect_scene": effect_profile.get("scene") if isinstance(effect_profile, dict) else None,
             "fx_enabled": bool(overrides.get("fx_enabled", True)),
-            "gate_enabled": override_bool(overrides.get("gate_enabled"), False),
-            "space_enabled": override_bool(overrides.get("space_enabled"), False),
-            "echo_enabled": override_bool(overrides.get("echo_enabled"), False),
+            "gate_enabled": resolved_instrument_gate(overrides, mix_role, noise_diagnostics.get(stem.path.name, {})),
+            "space_enabled": resolved_effect_settings(overrides, mix_role, effect_profile)["space_enabled"],
+            "echo_enabled": resolved_effect_settings(overrides, mix_role, effect_profile)["echo_enabled"],
             "activity_decision": activity_reason,
             "flattening_range_db": float(flattening.get(stem.path.name, {}).get("range_db", 0.0)),
             "pan": enforced_pan(mix_role, stem.name, overrides.get("pan")),
@@ -7575,7 +8319,8 @@ def render_segment(
         }
         muted_regions: list[tuple[float, float]] = []
         if stem.role != "vocal":
-            gate, muted_regions = build_section_gate(segment_envelopes.get(stem.path.name, np.array([], dtype=np.float32)))
+            gate_envelope = segment_envelopes.get(stem.path.name, np.array([], dtype=np.float32))
+            gate, muted_regions = build_section_gate(gate_envelope, section_gate_noise_floor(mix_role, noise_diagnostics.get(stem.path.name, {}), gate_envelope))
             track_settings[stem.path.name]["section_gate"] = gate
         stem_report.append(
             {
@@ -7619,15 +8364,18 @@ def render_segment(
                 "total_gain_db": makeup_gain_db + user_gain_db + level_gain_db,
                 "override_gain_db": fader_gain_db,
                 "override_mute": override_bool(overrides.get("mute"), False),
-                "fx_enabled": override_bool(overrides.get("fx_enabled"), False),
+                "fx_enabled": track_settings[stem.path.name]["fx_enabled"],
+                "gate_enabled": track_settings[stem.path.name]["gate_enabled"],
+                "space_enabled": track_settings[stem.path.name]["space_enabled"],
+                "echo_enabled": track_settings[stem.path.name]["echo_enabled"],
                 "pan": enforced_pan(mix_role, stem.name, overrides.get("pan")),
                 "gain_overridden": abs(user_gain_db) > 0.001,
-                "reverb_base_db": reverb_send_level_db(stem.role),
+                "reverb_base_db": reverb_send_level_db(mix_role),
                 "reverb_send_db": override_float(overrides.get("reverb_send_db"), 0.0),
-                "reverb_total_db": None if reverb_send_level_db(stem.role) is None else reverb_send_level_db(stem.role) + override_float(overrides.get("reverb_send_db"), 0.0),
-                "delay_base_db": delay_send_level_db(stem.role, lead_bonus),
+                "reverb_total_db": None if reverb_send_level_db(mix_role) is None else reverb_send_level_db(mix_role) + reverb_scene_offset_db + override_float(overrides.get("reverb_send_db"), 0.0),
+                "delay_base_db": delay_send_level_db(mix_role, lead_bonus),
                 "delay_send_db": override_float(overrides.get("delay_send_db"), 0.0),
-                "delay_total_db": None if delay_send_level_db(stem.role, lead_bonus) is None else delay_send_level_db(stem.role, lead_bonus) + override_float(overrides.get("delay_send_db"), 0.0),
+                "delay_total_db": None if delay_send_level_db(mix_role, lead_bonus) is None else delay_send_level_db(mix_role, lead_bonus) + delay_scene_offset_db + override_float(overrides.get("delay_send_db"), 0.0),
                 **eq_settings,
                 "status": "active",
                 "reason": reason,
@@ -7635,12 +8383,15 @@ def render_segment(
             }
         )
 
-    # Final, non-bypassable hierarchy ceiling. This runs after automatic gain,
+    # Automatic hierarchy is a fallback for untouched mixes. Confirmed Fine
+    # Tune levels are final artistic choices, not input for another rebalance.
+    manual_levels = has_confirmed_manual_levels(song_overrides)
+    # This runs after automatic gain,
     # rhythm/harmonic trims, and manual fader/makeup decisions. It is applied
     # to the actual DSP settings before any audio chunk is rendered.
     melodic_rows = [row for row in stem_report if row.get("status") == "active" and row.get("effective_role") in {"guitar", "keys", "keys_l", "keys_r"}]
     synth_rows = [row for row in stem_report if row.get("status") == "active" and row.get("effective_role") == "synth"]
-    if melodic_rows and synth_rows:
+    if not manual_levels and melodic_rows and synth_rows:
         melodic_levels = [float(row.get("rms_dbfs", -120.0)) + float(row.get("makeup_gain_db", 0.0)) + float(row.get("user_gain_db", 0.0)) + float(row.get("level_gain_db", 0.0)) for row in melodic_rows]
         synth_target = min(melodic_levels) - SYNTH_BELOW_MELODIC_MARGIN_DB
         for row in synth_rows:
@@ -7668,7 +8419,7 @@ def render_segment(
         for row in vocal_rows
     ])) if vocal_rows else None
     ceiling_hits: list[dict[str, object]] = []
-    if vocal_level is not None:
+    if not manual_levels and vocal_level is not None:
         for row in stem_report:
             if row.get("status") != "active" or row.get("effective_role") in {"vocal", "kick", "snare", "drums"}:
                 continue
@@ -7704,6 +8455,9 @@ def render_segment(
     vocal_bus_trim_db = override_float(song_overrides.get("vocal_bus_db"), VOCAL_BUS_TRIM_DB)
     effective_mix = effective_mix_snapshot(index, song_overrides, stem_report, used, vocal_bus_trim_db)
     print("PYTHON_EFFECTIVE_MIX_JSON " + json.dumps(effective_mix, sort_keys=True), flush=True)
+    required_bytes = max(1024 ** 3, int(segment.duration * sr * 2 * 7 * 3))
+    if shutil.disk_usage(tempfile.gettempdir()).free < required_bytes:
+        raise RuntimeError("Not enough disk space for rendering. Free space on the system disk and try again.")
     with tempfile.TemporaryDirectory(prefix=f"jam_song_{index:02d}_") as tmp:
         tmp_dir = Path(tmp)
         premaster_path = tmp_dir / f"song_{index:02d}_premaster.wav"
@@ -7721,12 +8475,7 @@ def render_segment(
         }
 
         def meter_stage(name: str, audio: np.ndarray) -> None:
-            values = np.asarray(audio, dtype=np.float64)
-            meter = stage_meters[name]
-            if values.size:
-                meter["peak"] = max(float(meter["peak"]), float(np.max(np.abs(values))))
-                meter["sumsq"] += float(np.sum(values * values))
-                meter["count"] += int(values.size)
+            accumulate_audio_meter(stage_meters[name], audio)
 
         def finish_stage_meters() -> dict[str, dict[str, float]]:
             result: dict[str, dict[str, float]] = {}
@@ -7738,6 +8487,7 @@ def render_segment(
         with sf.SoundFile(str(premaster_path), "w", samplerate=sr, channels=2, subtype="FLOAT") as writer:
             with ExitStack() as stack:
                 handles = {stem.path.name: stack.enter_context(sf.SoundFile(str(stem.path), "r")) for stem in stems}
+                stem_pool = stack.enter_context(_StemPool(render_stem_workers(len(stems))))
                 for chunk_start in range(0, target_frames, chunk_frames):
                     nframes = min(chunk_frames, target_frames - chunk_start)
                     chunk_timing = {"read": 0.0, "filter_compress": 0.0, "sum_bus_write": 0.0}
@@ -7747,14 +8497,18 @@ def render_segment(
                     delay_send = np.zeros((nframes, 2), dtype=np.float32)
                     bass_items: list[np.ndarray] = []
                     kick_control = np.zeros(nframes, dtype=np.float32)
-                    for stem in stems:
+                    def render_stem_chunk(stem: Stem) -> tuple[np.ndarray, dict, str, bool, float, dict[str, float]] | None:
+                        # Each stem reads its own file handle and owns its DSP state keys,
+                        # so stems can be processed concurrently. Summing stays sequential
+                        # in stem order below, keeping the mix bit-identical.
+                        timing = {"read": 0.0, "filter_compress": 0.0, "stem_gain": 0.0}
                         if stem.path.name not in track_settings:
-                            continue
+                            return None
                         t0 = time.perf_counter()
                         chunk = read_stem_chunk(stem, segment, chunk_start, nframes, handles[stem.path.name])
-                        chunk_timing["read"] += time.perf_counter() - t0
+                        timing["read"] += time.perf_counter() - t0
                         if chunk is None:
-                            continue
+                            return None
                         # Some late virtual-tail blocks contain NaN/Inf values
                         # even though the analysis path has already sanitized
                         # them.  Keep render DSP and activity decisions on the
@@ -7833,7 +8587,7 @@ def render_segment(
                                 neginf=0.0,
                             )
                             flatten_curve = np.clip(flatten_curve, 0.0, 4.0)
-                            curve_positions = np.arange(len(chunk), dtype=np.float64) / max(1, stem.samplerate) + chunk_start / max(1, stem.samplerate)
+                            curve_positions = np.arange(len(chunk), dtype=np.float64) / max(1, stem.samplerate) + chunk_start / max(1, stem.samplerate) + analysis_offset_seconds
                             curve = np.interp(curve_positions, np.arange(len(flatten_curve), dtype=np.float64) * DETECTION_FRAME_SECONDS, flatten_curve, left=float(flatten_curve[0]), right=float(flatten_curve[-1]))
                             if chunk.ndim == 2:
                                 chunk = (np.asarray(chunk, dtype=np.float64) * curve[:, None]).astype(np.float32)
@@ -7867,26 +8621,39 @@ def render_segment(
                                 ]
                             ).astype(np.float32)
                         y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-                        chunk_timing["filter_compress"] += time.perf_counter() - t0
+                        timing["filter_compress"] += time.perf_counter() - t0
                         t0 = time.perf_counter()
                         y *= db_to_amp(level_gain_db)
                         if fx_enabled and bool(settings.get("gate_enabled", False)) and processing_role != "vocal":
                             gate = settings.get("section_gate")
                             if isinstance(gate, np.ndarray):
-                                gain = section_gate_for_chunk(gate, stem.samplerate, chunk_start, len(y))
+                                gain = section_gate_for_chunk(gate, stem.samplerate, chunk_start + int(round(analysis_offset_seconds * stem.samplerate)), len(y))
                                 if y.ndim == 2:
                                     y *= gain[:, None]
                                 else:
                                     y *= gain
                         stereo = apply_stereo_pan(y, pan)
                         stereo = stereo[:nframes]
+                        timing["stem_gain"] += time.perf_counter() - t0
+                        return stereo, settings, processing_role, fx_enabled, lead_bonus, timing
+
+                    for stem_result in stem_pool.map(render_stem_chunk, stems):
+                        if stem_result is None:
+                            continue
+                        stereo, settings, processing_role, fx_enabled, lead_bonus, stem_timing = stem_result
+                        chunk_timing["read"] += stem_timing["read"]
+                        chunk_timing["filter_compress"] += stem_timing["filter_compress"]
+                        chunk_timing["sum_bus_write"] += stem_timing["stem_gain"]
+                        t0 = time.perf_counter()
                         meter_stage("post_stem_gain", stereo)
                         send_db = reverb_send_level_db(processing_role) if fx_enabled and bool(settings.get("space_enabled", False)) else None
                         if send_db is not None:
+                            send_db += float(settings.get("reverb_scene_offset_db", 0.0))
                             send_db += float(settings.get("reverb_send_db", 0.0))
                             reverb_send[: len(stereo)] += stereo * db_to_amp(send_db)
                         delay_db = delay_send_level_db(processing_role, lead_bonus) if fx_enabled and bool(settings.get("echo_enabled", False)) else None
                         if delay_db is not None:
+                            delay_db += float(settings.get("delay_scene_offset_db", 0.0))
                             delay_db += float(settings.get("delay_send_db", 0.0))
                             delay_send[: len(stereo)] += stereo * db_to_amp(delay_db)
                         if processing_role == "vocal":
@@ -7903,7 +8670,9 @@ def render_segment(
                         kick_env = signal.lfilter([0.04], [1.0, -0.96], kick_control.astype(np.float32))
                         if np.max(kick_env) > 1e-8:
                             norm = kick_env / np.max(kick_env)
-                            duck = np.power(10.0, (-2.0 * norm) / 20.0).astype(np.float32)
+                            # Keep the kick/bass relationship audible without
+                            # erasing the bass note on every kick transient.
+                            duck = np.power(10.0, (-1.5 * norm) / 20.0).astype(np.float32)
                         else:
                             duck = np.ones(nframes, dtype=np.float32)
                         for bass_stereo in bass_items:
@@ -7955,7 +8724,7 @@ def render_segment(
                         meter_stage("vocal_bus_post_safety", vocal_bus)
                         mix += vocal_bus
                     mix += plate_reverb_streaming(reverb_send, sr, reverb_decay, fx_state)
-                    mix += slap_delay_streaming(delay_send, sr, drum_bpm, fx_state)
+                    mix += slap_delay_streaming(delay_send, sr, drum_bpm if drum_bpm > 0 else 90.0, fx_state)
                     meter_stage("post_sum", mix)
                     # Keep the summed premaster comfortably below full scale
                     # before the bus compressor and mastering gain. This is a
@@ -8104,7 +8873,7 @@ def render_segment(
                 print(f"  Announcement verification warning for song {index}: {announcement_verification['verification_warning']}", flush=True)
 
         preserved_artifacts: dict[str, str] = {}
-        if artifact_dir is not None:
+        if artifact_dir is not None and retain_diagnostic_audio:
             artifact_root = Path(artifact_dir)
             artifact_root.mkdir(parents=True, exist_ok=True)
             premaster_artifact = artifact_root / f"song_{index:02d}_premaster.wav"
@@ -8173,6 +8942,7 @@ def render_segment(
         "stage_metrics": stage_meters_final,
         "premaster_headroom_db": PREMASTER_HEADROOM_DB,
         "preserved_artifacts": preserved_artifacts,
+        "diagnostic_audio_retained": bool(artifact_dir is not None and retain_diagnostic_audio),
         "timings": {
             "scan_seconds": round(float(scan_seconds), 3),
             "mix_seconds": round(float(mix_seconds), 3),
@@ -8533,7 +9303,7 @@ def write_report(out_dir: Path, rows: list[dict[str, object]], segments: list[Se
         if final_cut:
             f.write("\nFinal render cut gate audit (exact source cut sample):\n")
             for item in final_cut:
-                active = ", ".join(str(x.get("stem")) for x in item.get("active_instruments", [])) or "none"
+                active = ", ".join(str(x.get("stem", x.get("name", "unknown"))) if isinstance(x, dict) else str(x) for x in (item.get("active_instruments") or [])) or "none"
                 f.write(f"  song {item.get('song')}: sample {item.get('cut_sample')} at {fmt_time(float(item.get('cut_seconds', 0)))}; safe={item.get('safe')}; active instruments={active}\n")
         titles = [str(row.get("title")) for row in rows if row.get("title")]
         if titles:

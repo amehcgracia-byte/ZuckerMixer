@@ -2,3 +2,14 @@ Flask>=3.0
 pywebview>=5.0
 pyinstaller>=6.0
 Pillow>=10.0
+numpy
+scipy
+soundfile
+pyloudnorm
+# The updater verifies GitHub over HTTPS with this CA bundle.
+certifi>=2024.2.2
+
+# Reference mastering ships with the desktop app.
+matchering==2.0.6
+numba==0.60.0
+llvmlite==0.43.0

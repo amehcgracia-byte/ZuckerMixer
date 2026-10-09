@@ -11,10 +11,11 @@
     <div id="loadingOverlay" hidden aria-live="polite">
       <div class="loading-stage">
         <div class="loading-stage-visual">
-          <video class="loading-stage-media" autoplay loop muted playsinline preload="auto">
+          <button id="closeLoadingOverlay" class="dialog-close" type="button" aria-label="Close progress">X</button>
+          <video id="loadingStageVideo" class="loading-stage-media" loop muted playsinline preload="none">
             <source src="/static/zucker_loading_fragment.mp4" type="video/mp4">
-            <img class="loading-stage-media" src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="">
           </video>
+          <img id="loadingStageFallback" class="loading-stage-media loading-stage-fallback" data-src="/static/zucker_loading_fast_interleaved_sequence.gif" alt="" hidden>
           <div class="loading-stage-info">
             <h2 id="loadingOverlayTitle">Working...</h2>
             <p id="loadingOverlayDetail">Please wait...</p>
@@ -38,6 +39,11 @@
               <div id="loadingPhaseList" class="loading-phase-list"></div>
               <div id="loadingSongStates" class="loading-song-states"></div>
               <p id="loadingOverlayHealth" class="loading-overlay-health"></p>
+              <button id="cancelLoadingWork" class="danger loading-cancel" type="button" hidden>
+                Cancel loading
+              </button>
+              <button id="openLoadingRenderFolder" type="button" class="ghost" disabled>Open renders folder</button>
+              <p id="loadingOverlayVersion" class="loading-overlay-version">ZuckerMixer {{ build_version }}</p>
             </div>
           </div>
         </div>
@@ -51,7 +57,7 @@
           <p>Pick songs. Press mix. Listen here.</p>
         </div>
       </div>
-      <button id="redetectSongs" class="ghost">Re-detect songs</button>
+      <button id="redetectSongs" class="ghost">Re-detect songs (acoustic)</button>
     </header>
 
     <main>
@@ -107,10 +113,12 @@
               <option value="loud">Loud</option>
             </select>
           </label>
+          <button id="selectAllSongs" class="ghost">Select all</button>
           <button id="mixSelected" class="big accent">Mix selected</button>
+          <button id="openRenderFolder" type="button" disabled>Open renders folder</button>
           <button id="mixAll" class="big">Mix everything</button>
           <button id="editAllCuts" class="big ghost">Edit All Cuts</button>
-          <button id="secondWhisperPass" class="big ghost">Second Whisper pass</button>
+          <button id="secondWhisperPass" class="big ghost">Analyze with Whisper (optional)</button>
         </div>
         <div class="progress-box">
           <div class="progress-text">
@@ -149,33 +157,15 @@
     </main>
 
     <footer class="app-footer">
+      <button id="openGuide" type="button">Read me first</button>
+      <button id="checkUpdate" type="button" hidden>Check for updates</button>
+      <span id="updateNotice" role="status"></span>
       Built by JM.G (José Manuel García) · ZuckerMixer build <span id="buildInfo">development build</span>
     </footer>
 
-    <script>
-      // Bootstrap the analysis indicator independently of the large /api/state
-      // request. Native WebKit can keep that request pending while the worker
-      // is already progressing, so this tiny channel must remain responsive.
-      (() => {
-        const pollAnalysis = () => fetch('/api/jobs').then((response) => response.json()).then((jobs) => {
-          const active = [...jobs].reverse().find((job) => ['running', 'stopping'].includes(job.status))
-            || [...jobs].reverse().find((job) => job.status === 'queued');
-          const job = active && active.kind === 'redetect' ? active : null;
-          const box = document.getElementById('loadingStatus');
-          if (!box) return;
-          box.hidden = !job;
-          if (!job) return;
-          document.getElementById('loadingLabel').textContent =
-            String(job.current_stage || '').toLowerCase() === 'scanning folder'
-              ? 'Scanning source folder...' : 'Loading songs...';
-          document.getElementById('loadingDetail').textContent =
-            `${job.stage_detail || 'working'} · ${job.progress || 0}%`;
-          document.getElementById('loadingProgressFill').style.width = `${job.progress || 0}%`;
-        }).catch(() => {});
-        pollAnalysis();
-        setInterval(pollAnalysis, 1000);
-      })();
-    </script>
     <script src="/static/app.js?v={{ static_version }}"></script>
+    <script src="/static/updater.js?v={{ static_version }}"></script>
+    <script src="/static/guide.js?v={{ static_version }}"></script>
+    <script src="/static/render-listening.js?v={{ static_version }}"></script>
   </body>
 </html>

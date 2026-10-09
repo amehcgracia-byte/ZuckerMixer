@@ -1,6 +1,7 @@
 let appState = null;
 let loadingOverlayJob = null;
 let loadingOverlayCut = null;
+let suppressLoadingOverlay = false;
 let checkedSongs = new Set();
 let lastLogId = -1;
 let songListSignature = "";
@@ -30,6 +31,72 @@ const previewVocalExpander = {
 };
 
 const $ = (sel) => document.querySelector(sel);
+
+function makeDialogDismissible(dialog, dismiss = () => dialog.close("cancel")) {
+  if (dialog.dataset.dismissible) return;
+  dialog.dataset.dismissible = "true";
+  const close = dialog.querySelector("[data-dialog-close]") || document.createElement("button");
+  if (!close.isConnected) {
+    close.type = "button";
+    close.className = "dialog-close";
+    close.textContent = "X";
+    close.setAttribute("aria-label", "Close");
+    close.dataset.dialogClose = "true";
+    dialog.appendChild(close);
+  }
+  close.addEventListener("click", () => dismiss());
+  dialog.addEventListener("click", (event) => {
+    const rect = dialog.getBoundingClientRect();
+    if (event.target === dialog && (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom)) dismiss();
+  });
+  dialog.addEventListener("cancel", (event) => { event.preventDefault(); dismiss(); });
+}
+
+function showConfirm(message, confirmLabel = "Continue", cancelLabel = "Cancel") {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "message-dialog";
+    const text = document.createElement("p");
+    text.textContent = message;
+    const confirm = document.createElement("button");
+    confirm.type = "button"; confirm.textContent = confirmLabel;
+    const cancel = document.createElement("button");
+    cancel.type = "button"; cancel.textContent = cancelLabel;
+    const finish = (accepted) => { dialog.close(); dialog.remove(); resolve(accepted); };
+    confirm.onclick = () => finish(true);
+    cancel.onclick = () => finish(false);
+    dialog.append(text, confirm, cancel);
+    document.body.appendChild(dialog);
+    makeDialogDismissible(dialog, () => finish(false));
+    dialog.showModal();
+    cancel.focus();
+  });
+}
+
+function setupDismissControls() {
+  $("#closeLoadingOverlay").addEventListener("click", dismissLoadingOverlay);
+  $("#loadingOverlay").addEventListener("click", (event) => { if (event.target === event.currentTarget) dismissLoadingOverlay(); });
+  document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !document.querySelector("dialog[open]")) dismissLoadingOverlay(); });
+  document.addEventListener("click", (event) => { const toast = $("#toast"); if (toast?.classList.contains("show") && !toast.contains(event.target)) toast.classList.remove("show"); });
+}
+
+function dismissLoadingOverlay() {
+  window.renderListening?.pause();
+  suppressLoadingOverlay = true;
+  renderLoadingOverlay();
+  document.querySelector("#loadingStageVideo")?.pause();
+}
+
+let stateFetchPromise = null;
+function fetchStateSnapshot() {
+  if (!stateFetchPromise) {
+    stateFetchPromise = fetch("/api/state").then(async (response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    }).finally(() => { stateFetchPromise = null; });
+  }
+  return stateFetchPromise;
+}
 
 function esc(text) {
   return String(text ?? "").replace(/[&<>"']/g, (ch) => ({
@@ -83,6 +150,7 @@ function refreshSlotSummary() {
   if (!appState) return;
   const calibration = appState.detection_calibration || {};
   const songs = visibleSongs();
+  calibration.count = (appState.songs || []).length;
   calibration.exported_count = songs.filter((song) => song.latest_render).length;
   calibration.pending_count = Math.max(0, Number(calibration.count || songs.length) - calibration.exported_count);
   calibration.ready_count = songs.filter((song) => song.render_valid).length;
@@ -385,7 +453,7 @@ function effectiveMixDump(songIndex, reason = "preview") {
         : numeric(params.user_fader_db, 0);
       const muted = Boolean(ov.mute) || faderDb <= -60;
       const solo = Boolean(ov.solo);
-      const fxEnabled = ov.fx_enabled === true;
+      const fxEnabled = ov.fx_enabled !== false;
       const mutedBySolo = Boolean(soloFiles.length && !soloFiles.includes(stem.file));
       const finalGainDb = preGainDb + faderDb;
       const eq = stemEq(songIndex, stem);
@@ -419,7 +487,7 @@ function effectiveMixDump(songIndex, reason = "preview") {
         delay_send_db: numeric(ov.delay_send_db, 0),
         delay_total_db: delayBaseDb == null ? null : numeric(delayBaseDb) + numeric(ov.delay_send_db, 0),
         delay_linear_gain: delayBaseDb == null || !fxEnabled ? 0 : dbToGain(numeric(delayBaseDb) + numeric(ov.delay_send_db, 0)),
-        track_processing: fxEnabled ? (stem.role === "vocal" ? "per-stem expander: DynamicsCompressorNode" : "no per-stem compressor in preview") : "raw_dry_bypass",
+        track_processing: fxEnabled ? (stem.role === "vocal" ? "per-stem downward expander: AudioWorkletNode" : "no per-stem compressor in preview") : "raw_dry_bypass",
         track_processing_params: stem.role === "vocal" ? {
           threshold_db: previewVocalExpander.thresholdDb,
           ratio: previewVocalExpander.ratio,
@@ -470,6 +538,7 @@ function markOverrideSequence(songIndex) {
 
 async function postOverrides(reason = "manual") {
   const payload = cloneOverridesPayload();
+  payload.source_folder = appState.source_folder;
   const planSongs = [...pendingOverrideSongs];
   const postedSeqs = Object.fromEntries(Object.entries(payload.songs || {}).map(([songId, song]) => [songId, Number(song?._seq || 0)]));
   console.log("[mix-preview overrides post]", {
@@ -487,6 +556,7 @@ async function postOverrides(reason = "manual") {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `override write failed (${res.status})`);
+    if (payload.source_folder !== appState.source_folder) return data;
     console.log("[mix-preview overrides ack]", { reason, response: data });
     [...pendingOverrideSongs].forEach((songId) => {
       const currentSeq = Number(appState.overrides?.songs?.[songId]?._seq || 0);
@@ -594,25 +664,33 @@ function persistPreviewChange(songIndex, reason) {
 async function loadState() {
   let res;
   try {
-    res = await fetch("/api/state");
-    appState = await res.json();
+    const next = await fetchStateSnapshot();
+    appState = {
+      songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [],
+      source_folder: "Not available", ...next,
+    };
+    if (!Array.isArray(appState.songs)) appState.songs = [];
+    // Bind the initial job before the first /api/jobs poll.
+    if (appState.detection_job && ["queued", "running", "stopping"].includes(appState.detection_job.status)) {
+      setLoadingOverlayJob(appState.detection_job);
+    }
   } catch (error) {
     appState = appState || {
       songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [],
       source_folder: "Not available", last_error: error?.message || String(error),
     };
-    showToast(`Error loading folder: ${appState.last_error}`);
+    showToast(`Error loading folder: ${appState.last_error || error?.message || String(error)}`);
   }
   renderBuildInfo();
   renderSlotAudit();
   refreshSlotSummary();
   syncOverrideSequenceFromState();
   const detected = visibleSongs().length;
-  const review = visibleSongs().filter((song) => song.render_valid === false).length;
+  const review = visibleSongs().filter((song) => song.needs_review).length;
   const loadError = appState.last_error || appState.audio_scan?.error;
   $("#songCount").textContent = loadError
     ? `Error loading folder: ${loadError}`
-    : `${detected} songs detected / ${renderableSongs().length} songs prepared${review ? ` · ${review} needs review` : ""}`;
+    : `${detected} songs${appState.source_integrity?.expected_slot_count === (appState.songs || []).length ? " in saved cuts" : " detected"} / ${renderableSongs().length} ready to render${review ? ` · ${review} suggested boundaries to review` : ""}`;
   if (appState.ffmpeg && !appState.ffmpeg.ok) {
     showToast("ffmpeg is missing. Install it with Homebrew: brew install ffmpeg");
   }
@@ -620,14 +698,11 @@ async function loadState() {
   renderSongs();
   renderResults();
   fetch("/api/redetect/second-pass").then((response) => response.json()).then((candidate) => { if (candidate?.status === "pending_confirmation" || candidate?.status === "incomplete") showSecondPassCandidate(candidate); }).catch(() => {});
-  // /api/state may have been serialized before a newly queued detection was
-  // visible. Reconcile the lightweight live job channel after the large state
-  // response so an old 0% snapshot cannot overwrite current progress.
-  pollJobs().catch((err) => console.warn("[state jobs refresh failed]", err));
+
 }
 
 function visibleSongs() {
-  return appState.songs.filter((song) => !song.skipped);
+  return (Array.isArray(appState?.songs) ? appState.songs : []).filter((song) => !song.skipped);
 }
 
 function renderableSongs() {
@@ -694,7 +769,8 @@ function isEditingText() {
 
 function hasProtectedPlaybackOrPanel() {
   return Boolean(
-    document.querySelector(".fine-tune[open]")
+    window.renderListening?.isPlaying()
+    || document.querySelector(".fine-tune[open]")
     || [...document.querySelectorAll("audio")].some((audio) => !audio.paused && !audio.ended)
   );
 }
@@ -762,7 +838,7 @@ function renderCutTools() {
     referenceNode.value = appState?.settings?.matchering_reference || "";
   }
   const matchering = appState?.matchering;
-  if (matchering && !matchering.available && matchering.reference) {
+  if (matchering && !matchering.loading && !matchering.available && matchering.reference) {
     const warning = document.createElement("div");
     warning.className = "scan-warning";
     warning.textContent = `Matchering reference is set but unavailable: ${matchering.import_error || "dependency error"}. Renders will stop until this is fixed.`;
@@ -817,6 +893,7 @@ function renderCutTools() {
   if (signature === transitionSignature || isEditingText()) return;
   transitionSignature = signature;
   const list = $("#transitionList");
+  if (!list) return;
   list.innerHTML = "";
   appState.transitions.forEach((transition) => {
     const row = document.createElement("div");
@@ -840,6 +917,7 @@ function renderSongs() {
   box.innerHTML = "";
   appState.songs.forEach((song) => {
     const card = document.createElement("article");
+    card.dataset.songId = String(song.id);
     card.className = `song-card ${song.skipped ? "skipped" : ""}`;
     const speed = song.bpm ? `${Math.round(song.bpm)} bpm` : "speed unknown";
     const key = song.key || "key unknown";
@@ -876,7 +954,7 @@ function renderSongs() {
         <div class="row-actions">
           <label class="skip-toggle"><input type="checkbox" data-skip="${song.id}" ${song.skipped ? "checked" : ""}> Skip this one</label>
           <button data-mix-one="${song.id}" class="accent" ${song.skipped ? "disabled" : ""}>Mix this one</button>
-          <button data-select-cuts="${song.id}" class="ghost" ${song.skipped ? "disabled" : ""}>Select Cuts</button>
+          <button data-select-cuts="${song.id}" class="ghost">Select Cuts</button>
           <button data-reset-auto="${song.id}" class="ghost">Reset to automatic mix</button>
         </div>
       </div>
@@ -896,6 +974,7 @@ function renderSongs() {
     wireFineTune(card, song.id);
   });
   updateSelectedButton();
+  window.renderListening?.sync();
 }
 
 let cutSelector = null;
@@ -912,16 +991,18 @@ function ensureCutSelector() {
   dialog.id = "cutSelectorDialog";
   dialog.innerHTML = `
     <form method="dialog" class="cut-selector-shell">
-      <div class="cut-selector-header"><div><h2>Edit Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><div class="cut-slot-nav"><button type="button" id="cutPrevious" class="ghost">Previous</button><span id="cutSlotPosition">Slot 1 of 1</span><select id="cutSlotList" aria-label="All slots"></select><button type="button" id="cutNext" class="ghost">Next</button><button type="button" id="cutClose" class="ghost" aria-label="Close">×</button></div></div>
+      <div class="cut-selector-header"><div><h2>Edit Cuts</h2><p id="cutSelectorTitle" class="muted"></p></div><div class="cut-slot-nav"><button type="button" id="cutPrevious" class="ghost">Previous</button><span id="cutSlotPosition">Slot 1 of 1</span><select id="cutSlotList" aria-label="All slots"></select><button type="button" id="cutNext" class="ghost">Next</button><button type="button" id="cutClose" class="ghost" aria-label="Close">X</button></div></div>
       <div class="cut-wave-wrap"><canvas id="cutWaveform" aria-label="Selected slot waveform"></canvas><div id="cutPlayheadLine" class="cut-playhead-line" aria-hidden="true"></div><div id="cutMarkers" class="cut-markers"></div><div id="cutSelection" class="cut-selection"><button type="button" class="cut-handle left" aria-label="Move start"></button><button type="button" class="cut-center" aria-label="Move selection"></button><button type="button" class="cut-handle right" aria-label="Move end"></button></div></div>
       <div class="cut-zoom-controls" hidden><label>Zoom <input id="cutZoom" type="range" min="1" max="20" step="0.1" value="1"></label><button type="button" id="cutFit" class="ghost">Fit selected slot</button><button type="button" id="cutZoomSelection" class="ghost">Zoom to selection</button><label>Scroll <input id="cutPan" type="range" min="0" max="1000" step="1" value="0"></label></div>
-      <div class="cut-editor-tools"><select id="cutEditMode" hidden><option value="select">Select</option><option value="cut">Cut</option><option value="paste">Paste</option><option value="delete">Delete</option></select><button type="button" id="cutBack5" class="ghost">−5s</button><button type="button" id="cutPlay" class="ghost">Play</button><button type="button" id="cutPause" class="ghost">Pause</button><button type="button" id="cutStop" class="ghost">Stop</button><button type="button" id="cutForward5" class="ghost">+5s</button><label>Speed <select id="cutSpeed"><option>0.5</option><option>0.75</option><option selected>1</option><option>1.25</option><option>1.5</option><option>2</option></select></label><audio id="cutAudio" controls preload="metadata"></audio><span id="cutPlayheadReadout" class="muted">Playhead —</span><span id="cutModeReadout" class="pill">Active tool: Select</span><span id="cutActionLog" class="cut-action-log" role="status">Waiting for an editor action</span></div>
+      <div class="cut-editor-tools"><select id="cutEditMode" hidden><option value="select">Select</option><option value="cut">Cut</option><option value="paste">Paste</option><option value="delete">Delete</option></select><button type="button" id="cutBack5" class="ghost">−5s</button><button type="button" id="cutPlay" hidden>Play</button><button type="button" id="cutPause" hidden>Pause</button><button type="button" id="cutStop" hidden>Stop</button><button type="button" id="cutForward5" class="ghost">+5s</button><label>Speed <select id="cutSpeed"><option>0.5</option><option>0.75</option><option selected>1</option><option>1.25</option><option>1.5</option><option>2</option></select></label><audio id="cutAudio" preload="metadata" hidden></audio><span id="cutPlayheadReadout" class="muted">Playhead —</span><span id="cutModeReadout" class="pill">Active tool: Select</span><span class="muted">Space: play / pause · Arrows: seek · Wheel: zoom · Cmd + wheel: scroll</span><label><input type="checkbox" id="cutSongZero"> First song is song 0</label><span id="cutActionLog" class="cut-action-log" role="status">Waiting for an editor action</span></div>
       <div class="cut-readout"><label>Start <input id="cutStart" type="number" step="0.1"></label><label>End <input id="cutEnd" type="number" step="0.1"></label><strong>Duration <span id="cutDuration">—</span></strong><span id="cutValidation" class="cut-validation"></span></div>
       <div id="cutEvidence" class="cut-evidence"></div>
       <div class="cut-selector-actions"><button id="cutApply" type="button" class="accent">Save Changes</button></div>
     </form><div id="cutContextMenu" class="cut-context-menu" hidden><div class="cut-context-heading">Editing mode</div><button data-context-mode="select">Select</button><button data-context-mode="cut">Cut</button><button data-context-mode="paste">Paste</button><button data-context-mode="delete">Delete</button><div class="cut-context-divider"></div><button data-context-action="add">Add cut here</button><button data-context-action="delete">Delete cut here</button><button data-context-action="copy">Copy cut</button><button data-context-action="paste">Paste cut</button><button data-context-action="play">Play from here</button></div>`;
   document.body.appendChild(dialog);
-  dialog.querySelector("#cutClose").addEventListener("click", () => closeCutSelector());
+  dialog.querySelector("#cutClose").dataset.dialogClose = "true";
+  makeDialogDismissible(dialog, closeCutSelector);
+  dialog.addEventListener("close", () => { cutSelector?.audio?.pause(); releaseCutPointerCaptures(cutSelector); clearCutLoading(); });
   dialog.tabIndex = -1;
   cutSelector = { dialog, canvas: dialog.querySelector("#cutWaveform"), selection: dialog.querySelector("#cutSelection"), start: dialog.querySelector("#cutStart"), end: dialog.querySelector("#cutEnd"), zoom: dialog.querySelector("#cutZoom"), pan: dialog.querySelector("#cutPan"), mode: dialog.querySelector("#cutEditMode"), speed: dialog.querySelector("#cutSpeed"), audio: dialog.querySelector("#cutAudio"), playheadLine: null, pendingAudioTime: null, selectedBoundary: null, clipboard: null, capturedPointers: new Map() };
   wireCutSelector(cutSelector);
@@ -929,12 +1010,19 @@ function ensureCutSelector() {
 }
 
 async function openCutSelector(songId) {
+  window.renderListening?.pause();
   const ui = ensureCutSelector();
-  setCutLoading("Loading cut editor", `Loading selected slot ${songId}`, 8);
-  const response = await fetch(`/api/cuts/${songId}`);
+  suppressLoadingOverlay = false;
+  setCutLoading("Opening Edit Cuts", "Reading saved cuts", null);
+  const sourceFolder = appState.source_folder; const generation = ui.loadingGeneration = (ui.loadingGeneration || 0) + 1;
+  const reuseWaveform = ui.sourceFolder === sourceFolder && ui.data?.global_waveform && ui.waveformKey;
+  const response = await fetch(`/api/cuts/${songId}${reuseWaveform ? `?waveform_key=${encodeURIComponent(ui.waveformKey)}` : ""}`);
   const data = await response.json();
-  if (!response.ok) { setCutLoading("Error", data.error || "Could not load cut editor."); return showToast(data.error || "Could not load cut editor."); }
-  setCutLoading("Loading selected waveform", `Preparing slot ${songId}`, 40);
+  if (!data.global_waveform && reuseWaveform) data.global_waveform = ui.data.global_waveform;
+  if (generation !== ui.loadingGeneration || sourceFolder !== appState.source_folder) return;
+  ui.waveformKey = data.waveform_key;
+  if (!response.ok) { clearCutLoading(); return showToast(data.error || "Could not load cut editor."); }
+  setCutLoading("Drawing timeline", "Saved cuts loaded", null);
   ui.songId = songId;
   ui.data = data;
   ui.allSlots = (data.markers || []).map((marker) => Number(marker.song_id)).filter(Number.isFinite);
@@ -946,34 +1034,37 @@ async function openCutSelector(songId) {
   ui.startValue = Number(data.selection.start_sec);
   ui.endValue = Number(data.selection.end_sec);
   ui.selectedBoundary = null;
-  ui.savedClean = false;
+  ui.savedClean = false; ui.localUndo = []; ui.localRedo = []; ui.sourceFolder = appState.source_folder;
+  ui.dialog.querySelector("#cutSongZero").checked = data.markers[0]?.display_number === 0;
   // A newly opened editor must have a usable insertion point.  Starting on a
   // boundary makes Add cut look dead because the backend correctly rejects it.
   ui.playhead = ui.startValue + (ui.endValue - ui.startValue) / 2;
   ui.viewStart = ui.sourceStart; ui.viewEnd = ui.sourceEnd; ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue;
-  ui.dialog.querySelector("#cutSelectorTitle").textContent = `Slot ${String(songId).padStart(2, "0")} · ${data.waveform.cached ? "waveform cache hit" : "waveform prepared"}`;
+  ui.dialog.querySelector("#cutSelectorTitle").textContent = `Song ${data.markers.find(marker => Number(marker.song_id) === Number(songId))?.display_number ?? songId}`;
   const slotIndex = Math.max(0, ui.allSlots.indexOf(Number(songId)));
   ui.dialog.querySelector("#cutSlotPosition").textContent = `Slot ${slotIndex + 1} of ${ui.allSlots.length}`;
   const slotList = ui.dialog.querySelector("#cutSlotList"); slotList.innerHTML = ui.allSlots.map((id, index) => `<option value="${id}">Slot ${index + 1} of ${ui.allSlots.length}</option>`).join(""); slotList.value = String(songId);
   ui.dialog.querySelector("#cutPrevious").disabled = slotIndex <= 0; ui.dialog.querySelector("#cutNext").disabled = slotIndex >= ui.allSlots.length - 1;
   ui.dialog.querySelector("#cutEvidence").innerHTML = data.markers.filter((marker) => marker.song_id === songId).map((marker) => `<span class="cut-evidence-item ${marker.status}">${cutTime(marker.start_sec)}–${cutTime(marker.end_sec)} · ${esc(marker.boundary_source || "automatic proposal")} · ${marker.confidence ? `${Math.round(marker.confidence * 100)}%` : "no confidence"}</span>`).join("");
-  const audio = ui.dialog.querySelector("#cutAudio"); if (audio) { setCutLoading("Loading audio preview", `Preparing playback for slot ${songId}`, 55); audio.src = `/api/cuts/audio/${songId}`; audio.playbackRate = Number(ui.speed?.value || 1); audio.load(); audio.oncanplay = () => setCutLoading("Ready", `Playback ready for slot ${songId}`, 100); audio.onerror = () => setCutLoading("Playback error", "The selected source audio could not be loaded.", 100); }
-  setCutLoading("Rendering waveform", `Rendering complete-session waveform for slot ${songId}`, 70);
+  const audio = ui.dialog.querySelector("#cutAudio"); if (audio) { audio.preload = "metadata"; if (ui.audioSourceFolder !== ui.sourceFolder) { audio.src = `/api/cuts/audio/${songId}`; ui.audioSourceFolder = ui.sourceFolder; } ui.pendingAudioTime = ui.playhead; audio.playbackRate = Number(ui.speed?.value || 1); audio.oncanplay = () => { if (ui.dialog.open) ui.dialog.querySelector("#cutActionLog").textContent = "Playback ready"; }; audio.onerror = () => { if (ui.dialog.open) showToast("Source audio could not be loaded."); }; }
+  setCutLoading("Drawing timeline", "Displaying the source waveform", null);
   drawCutEditor();
-  ui.dialog.showModal();
+  if (!ui.dialog.open) ui.dialog.showModal(); ui.dialog.focus({preventScroll:true});
   setCutLoading("Finished", `Slot ${songId} ready for precise editing`, 100);
   setTimeout(() => clearCutLoading(), 700);
 }
 
 function setCutLoading(label, detail, progress = 0) {
+  if (progress < 100) progress = null;
   const box = $("#loadingStatus");
   if (box) {
     box.hidden = false;
     $("#loadingLabel").textContent = label;
     $("#loadingDetail").textContent = detail || "";
-    $("#loadingProgressFill").style.width = String(Math.max(0, Math.min(100, progress))) + "%";
+    $("#loadingProgressFill").classList.toggle("progress-indeterminate", progress == null);
+    $("#loadingProgressFill").style.width = progress == null ? "35%" : String(Math.max(0, Math.min(100, progress))) + "%";
   }
-  loadingOverlayCut = progress >= 100 ? null : { kind: "cut", label, detail, progress, current_stage: "loading" };
+  loadingOverlayCut = progress >= 100 ? null : { kind: "cut", label, detail, progress, indeterminate: progress == null, phase_index:0, phase_total:1, current_stage: "loading" };
   renderLoadingOverlay();
 }
 function reportCutAction(ui, action, details = {}) {
@@ -985,17 +1076,68 @@ function reportCutAction(ui, action, details = {}) {
   const reason = details.reason ? ` reason=${details.reason}` : "";
   const message = `tool=${tool} pointer=${pointer} time=${cutTime(time)} slot=${ui.songId} cuts_before=${before} action=${action} cuts_after=${after} total_slots=${after}${reason}`;
   const log = ui.dialog?.querySelector("#cutActionLog");
-  if (log) log.textContent = message;
+  if (log) log.textContent = details.error ? (details.reason || "Could not apply edit") : (details.finished ? "Ready" : "");
   console.info("[cut-editor]", message);
-  setCutLoading(details.error ? "Error" : (details.finished ? "Finished" : "Applying cut changes"), message, details.error || details.finished ? 100 : (details.progress || 35));
+  if (["add", "delete", "merge", "move", "undo", "redo", "numbering"].includes(action) && !details.finished) setCutLoading("Saving cut changes", "Updating the timeline", 35);
+  else if (details.error) setCutLoading("Error", details.reason || "Could not apply edit", 100);
 }
 function clearCutLoading() { loadingOverlayCut = null; renderLoadingOverlay(); const box = $("#loadingStatus"); if (box && !document.querySelector("#cutSelectorDialog[open]")) box.hidden = true; }
-function cutIsDirty() { const ui = cutSelector; return Boolean(ui && !ui.savedClean && (Math.abs(ui.startValue - ui.originalStart) > 0.05 || Math.abs(ui.endValue - ui.originalEnd) > 0.05)); }
-function closeCutSelector() { if (!cutIsDirty() || window.confirm("Discard unsaved cut changes?")) { cutSelector.dialog.close("cancel"); clearCutLoading(); } }
+function cutIsDirty() { const ui = cutSelector; return Boolean(ui && (Math.abs(ui.startValue - ui.originalStart) > 0.05 || Math.abs(ui.endValue - ui.originalEnd) > 0.05)); }
+function rememberCutSelection(ui) { ui.localUndo ||= []; ui.localUndo.push([ui.startValue, ui.endValue]); ui.localRedo = []; }
+async function saveCutChanges(ui) {
+  if (ui.saving) return false;
+  ui.saving = true;
+  setCutLoading("Saving cuts", "Writing your timeline to disk", null);
+  const button = ui.dialog.querySelector("#cutApply"); button.disabled = true; button.textContent = "Saving…";
+  try {
+    const response = await fetch(`/api/segment-selection/${ui.songId}`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({start_sec:ui.startValue,end_sec:ui.endValue,source_folder:ui.sourceFolder})});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not save cuts");
+    ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue; ui.localUndo = []; ui.localRedo = [];
+    button.textContent = "Saved"; ui.dialog.querySelector("#cutValidation").textContent = "Changes saved";
+    applySavedEditorState(result); showToast("Cuts saved."); return true;
+  } catch (error) { button.textContent = "Save Changes"; showToast(error.message || error); return false; }
+  finally { ui.saving = false; button.disabled = false; clearCutLoading(); }
+}
+async function resolveUnsavedCuts() {
+  if (!cutIsDirty()) return true;
+  if (await showConfirm("Save changes?", "Yes", "No")) return saveCutChanges(cutSelector);
+  return true;
+}
+function applySavedEditorState(result) {
+  if (!Array.isArray(result.songs)) throw new Error("Saved cuts did not return a song list.");
+  appState.songs = result.songs;
+  appState.candidate_pending = false; appState.segmentation_status = "ready";
+  appState.source_integrity = {...appState.source_integrity, status:"ok", saved_slot_count:result.slot_count, expected_slot_count:result.slot_count, warning:""};
+  appState.slot_audit = {...appState.slot_audit, state_slot_count:result.slot_count, backend_slot_count:result.slot_count, visible_slot_count:result.slot_count, integrity_warning:""};
+  appState.detection_calibration = {...appState.detection_calibration, candidate_pending:false};
+  if (result.overrides) appState.overrides = result.overrides;
+  checkedSongs = new Set([...checkedSongs].filter(id => result.songs.some(song => song.id === id && !song.skipped)));
+  cutSelector.timelineChanged = true;
+  refreshSlotSummary();
+  renderSlotAudit();
+  const review = visibleSongs().filter(song => song.needs_review).length;
+  $("#songCount").textContent = `${result.songs.length} songs in saved cuts${review ? ` · ${review} suggested boundaries to review` : ""}`;
+}
+
+async function closeCutSelector() {
+  if (cutSelector.closing || cutSelector.saving) return;
+  cutSelector.closing = true;
+  try { if (await resolveUnsavedCuts()) {
+    cutSelector.audio?.pause(); cutSelector.dialog.close(); clearCutLoading();
+    if (cutSelector.timelineChanged) {
+      setCutLoading("Updating song list", `${appState.songs.length} saved songs`, null);
+      await Promise.all(Object.keys(previewMixes).map(id => stopPreviewMix(id)));
+      document.querySelectorAll(".fine-tune[open]").forEach(panel => panel.open = false);
+      songListSignature = ""; renderCutTools(); renderSongs(); updateSelectedButton();
+      cutSelector.timelineChanged = false;
+    }
+  } }
+  finally { cutSelector.closing = false; clearCutLoading(); }
+}
 async function editAllCuts() {
   const slots = (appState.songs || []).filter((song) => Number.isFinite(Number(song.id))).map((song) => Number(song.id));
   if (!slots.length) return showToast("No slots available for Edit All.");
-  cutSelector = null;
   const ui = ensureCutSelector();
   ui.editAllQueue = slots.slice(1);
   await openCutSelector(slots[0]);
@@ -1007,7 +1149,7 @@ function movePlayheadTo(ui, seconds, { seek = true, redraw = true } = {}) {
   const next = Math.max(ui.sourceStart ?? 0, Math.min(ui.sourceEnd ?? Number(seconds), Number(seconds)));
   ui.playhead = Number.isFinite(next) ? next : (ui.playhead || ui.sourceStart || 0);
   if (seek && ui.audio) {
-    const local = Math.max(0, ui.playhead - Number(ui.slotWindowStart || 0));
+    const local = Math.max(0, ui.playhead);
     if (Number.isFinite(ui.audio.duration) && ui.audio.readyState >= 1) ui.audio.currentTime = Math.min(local, Math.max(0, ui.audio.duration));
     else ui.pendingAudioTime = local;
   }
@@ -1028,17 +1170,29 @@ function drawCutEditor() {
   const peaks = globalWaveform.peaks || [];
   const visibleStart = ui.viewStart ?? ui.sourceStart ?? 0; const visibleEnd = ui.viewEnd ?? ui.sourceEnd ?? ui.duration; const visibleSpan = Math.max(0.001, visibleEnd - visibleStart);
   ctx.strokeStyle = "#eca35e"; ctx.globalAlpha = .8; ctx.beginPath();
-  peaks.forEach((value, index) => { const seconds = (Number(globalWaveform.window_start_sec || 0) + index / Math.max(1, peaks.length - 1) * Number(globalWaveform.duration_sec || ui.duration)); if (seconds < visibleStart || seconds > visibleEnd) return; const x = (seconds - visibleStart) / visibleSpan * width; const y = height / 2 - Number(value) * (height * .42); ctx.moveTo(x, height / 2 + Number(value) * (height * .42)); ctx.lineTo(x, y); }); ctx.stroke(); ctx.globalAlpha = 1;
+  const pixelPeaks = new Float32Array(width);
+  const waveStart = Number(globalWaveform.window_start_sec || 0), waveDuration = Number(globalWaveform.duration_sec || ui.duration);
+  const firstPeak = Math.max(0, Math.floor((visibleStart - waveStart) / waveDuration * (peaks.length - 1)));
+  const lastPeak = Math.min(peaks.length - 1, Math.ceil((visibleEnd - waveStart) / waveDuration * (peaks.length - 1)));
+  for (let index = firstPeak; index <= lastPeak; index++) {
+    const seconds = waveStart + index / Math.max(1, peaks.length - 1) * waveDuration;
+    const pixel = Math.floor((seconds - visibleStart) / visibleSpan * width);
+    if (pixel >= 0 && pixel < width) pixelPeaks[pixel] = Math.max(pixelPeaks[pixel], Number(peaks[index]));
+  }
+  pixelPeaks.forEach((value, pixel) => { const extent = value * height * .42; ctx.moveTo(pixel, height / 2 + extent); ctx.lineTo(pixel, height / 2 - extent); }); ctx.stroke(); ctx.globalAlpha = 1;
   const x = (seconds) => Math.max(0, Math.min(width, (Number(seconds) - visibleStart) / visibleSpan * width));
   const sx = x(ui.startValue), ex = x(ui.endValue);
   ctx.fillStyle = "rgba(200,111,47,.23)"; ctx.fillRect(sx, 0, Math.max(0, ex - sx), height);
   ctx.strokeStyle = "#ffd08f"; ctx.lineWidth = 2; [sx, ex].forEach((point) => { ctx.beginPath(); ctx.moveTo(point, 0); ctx.lineTo(point, height); ctx.stroke(); });
+  ui.selection.hidden = ui.endValue <= visibleStart || ui.startValue >= visibleEnd;
+  ui.dialog.querySelector(".cut-handle.left").hidden = ui.startValue < visibleStart || ui.startValue > visibleEnd;
+  ui.dialog.querySelector(".cut-handle.right").hidden = ui.endValue < visibleStart || ui.endValue > visibleEnd;
   ui.selection.style.left = `${sx / width * 100}%`; ui.selection.style.width = `${Math.max(0, (ex - sx) / width * 100)}%`;
-  ui.start.value = ui.startValue.toFixed(1); ui.end.value = ui.endValue.toFixed(1);
+  if (document.activeElement !== ui.start) ui.start.value = ui.startValue.toFixed(1); if (document.activeElement !== ui.end) ui.end.value = ui.endValue.toFixed(1);
   const duration = ui.endValue - ui.startValue;
   ui.dialog.querySelector("#cutDuration").textContent = `${duration.toFixed(1)} s (${cutTime(duration)})`;
-  const valid = duration >= 480 && duration <= 780;
-  const validation = ui.dialog.querySelector("#cutValidation"); validation.textContent = valid ? "Valid selection" : "Selection must be between 8:00 and 13:00"; validation.className = `cut-validation ${valid ? "valid" : "invalid"}`;
+  const valid = Number.isFinite(duration) && duration >= 0.1 && ui.startValue >= ui.sourceStart && ui.endValue <= ui.sourceEnd;
+  const validation = ui.dialog.querySelector("#cutValidation"); validation.textContent = valid ? (duration >= 480 && duration <= 780 ? "Valid selection" : "Manual duration — will be preserved") : "Choose a positive range inside the recording"; validation.className = `cut-validation ${valid ? "valid" : "invalid"}`;
   ui.dialog.querySelector("#cutApply").disabled = !valid;
   const markers = ui.dialog.querySelector("#cutMarkers"); markers.innerHTML = (ui.data.markers || []).flatMap((marker) => [[marker.start_sec, marker.song_id === ui.songId ? "selected" : "", marker.song_id], [marker.end_sec, marker.song_id === ui.songId ? "selected" : "", marker.song_id], [marker.comment_start_sec, "comment", marker.song_id]]).filter(([value]) => Number.isFinite(Number(value)) && Number(value) >= visibleStart && Number(value) <= visibleEnd).map(([value, kind, songId]) => `<i class="${kind}" data-boundary="${Number(value)}" data-song="${songId}" style="left:${x(value) / width * 100}%" title="Slot boundary ${cutTime(value)}"></i>`).join("");
   markers.querySelectorAll("i[data-boundary]").forEach((node) => node.addEventListener("click", (event) => {
@@ -1053,16 +1207,16 @@ function drawCutEditor() {
   if (ui.zoom) ui.zoom.value = Math.max(1, Math.min(20, ui.duration / visibleSpan));
   if (ui.playhead == null) ui.playhead = ui.startValue + (ui.endValue - ui.startValue) / 2;
   const playhead = x(ui.playhead); ctx.strokeStyle = "#79d7c4"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(playhead, 0); ctx.lineTo(playhead, height); ctx.stroke();
-  if (ui.playheadLine) ui.playheadLine.style.left = String(playhead / width * 100) + "%";
+  if (ui.playheadLine) { ui.playheadLine.hidden = ui.playhead < visibleStart || ui.playhead > visibleEnd; ui.playheadLine.style.left = String(playhead / width * 100) + "%"; }
   const readout = ui.dialog.querySelector("#cutPlayheadReadout"); if (readout) readout.textContent = `Playhead ${cutTime(ui.playhead)}`;
 }
 
 function installCutDrag(element, mode) {
   element.addEventListener("pointerdown", (event) => {
-    event.preventDefault(); const ui = cutSelector; const rect = ui.canvas.getBoundingClientRect(); const startX = event.clientX; const originalStart = ui.startValue; const originalEnd = ui.endValue; const viewSpan = ui.viewEnd - ui.viewStart;
+    event.preventDefault(); const ui = cutSelector; rememberCutSelection(ui); const rect = ui.canvas.getBoundingClientRect(); const startX = event.clientX; const originalStart = ui.startValue; const originalEnd = ui.endValue; const viewSpan = ui.viewEnd - ui.viewStart;
     ui.capturedPointers.set(event.pointerId, element);
     element.setPointerCapture(event.pointerId);
-    const move = (current) => { const delta = (current.clientX - startX) / rect.width * viewSpan; if (mode === "left") ui.startValue = Math.max(ui.sourceStart, Math.min(originalEnd - 480, originalStart + delta)); else if (mode === "right") ui.endValue = Math.min(ui.sourceEnd, Math.max(originalStart + 480, originalEnd + delta)); else { const span = originalEnd - originalStart; const next = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, originalStart + delta)); ui.startValue = next; ui.endValue = next + span; } drawCutEditor(); };
+    const move = (current) => { const delta = (current.clientX - startX) / rect.width * viewSpan; if (mode === "left") ui.startValue = Math.max(ui.sourceStart, Math.min(originalEnd - 0.1, originalStart + delta)); else if (mode === "right") ui.endValue = Math.min(ui.sourceEnd, Math.max(originalStart + 0.1, originalEnd + delta)); else { const span = originalEnd - originalStart; const next = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, originalStart + delta)); ui.startValue = next; ui.endValue = next + span; } drawCutEditor(); };
     const onMove = (moveEvent) => move(moveEvent); const onUp = () => { try { if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId); } catch (_) {} ui.capturedPointers.delete(event.pointerId); element.removeEventListener("pointermove", onMove); element.removeEventListener("pointerup", onUp); };
     element.addEventListener("pointermove", onMove); element.addEventListener("pointerup", onUp, { once: true });
   });
@@ -1078,7 +1232,7 @@ function releaseCutPointerCaptures(ui) {
 
 function wireCutSelector(ui) {
   installCutDrag(ui.dialog.querySelector(".cut-handle.left"), "left"); installCutDrag(ui.dialog.querySelector(".cut-handle.right"), "right"); installCutDrag(ui.dialog.querySelector(".cut-center"), "center");
-  [ui.start, ui.end].forEach((input) => input.addEventListener("input", () => { ui.startValue = Number(ui.start.value); ui.endValue = Number(ui.end.value); drawCutEditor(); }));
+  [ui.start, ui.end].forEach((input) => input.addEventListener("input", () => { rememberCutSelection(ui); ui.startValue = Number(ui.start.value); ui.endValue = Number(ui.end.value); drawCutEditor(); }));
   ui.zoom.addEventListener("input", () => { const span = ui.duration / Number(ui.zoom.value); const center = (ui.viewStart + ui.viewEnd) / 2; ui.viewStart = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - span, center - span / 2)); ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
   ui.pan.addEventListener("input", () => { const span = ui.viewEnd - ui.viewStart; const max = Math.max(0, ui.duration - span); ui.viewStart = ui.sourceStart + max * Number(ui.pan.value) / 1000; ui.viewEnd = ui.viewStart + span; drawCutEditor(); });
   ui.dialog.querySelector("#cutFit").addEventListener("click", () => { ui.viewStart = ui.slotWindowStart; ui.viewEnd = ui.slotWindowEnd; drawCutEditor(); });
@@ -1094,18 +1248,38 @@ function wireCutSelector(ui) {
   };
   ui.mode.addEventListener("change", () => setMode(ui.mode.value));
   setMode("select");
-  const refreshEditorAfterOperation = async (result, action, before, at, pointer) => { setCutLoading("Validating cuts", `${result.slot_count} slots preserved`, 80); reportCutAction(ui, action, { before, after: result.slot_count, time: at, pointer, finished: true }); await refreshState({ renderLarge: false }); await openCutSelector(Math.min(Number(ui.songId), result.slot_count)); setCutLoading("Finished", `Global editor updated; ${result.slot_count} slots remain`, 100); setTimeout(clearCutLoading, 700); };
+  const refreshEditorAfterOperation = async (result, action, before, at, pointer) => {
+    const view = [ui.viewStart, ui.viewEnd];
+    setCutLoading("Updating editor", "Cuts saved", null);
+    applySavedEditorState(result);
+    const atIndex = (result.segments || []).findIndex(segment => segment.start <= at && at < segment.end);
+    await openCutSelector(atIndex >= 0 ? atIndex + 1 : Math.min(Number(ui.songId), result.slot_count));
+    ui.viewStart = Math.max(ui.sourceStart, view[0]); ui.viewEnd = Math.min(ui.sourceEnd, view[1]);
+    movePlayheadTo(ui, at, {seek:false});
+    reportCutAction(ui,action,{before,after:result.slot_count,time:at,pointer,finished:true});
+    clearCutLoading();
+  };
   const editorOperation = async (operation, extra = {}) => {
+    if (ui.operationPending || ui.saving) return;
+    ui.operationPending = true;
+    try {
+    await prepareOverridesForRender();
+    if (cutIsDirty() && !await saveCutChanges(ui)) return;
     const destructive = ["delete", "merge"].includes(operation);
     const at = extra.at_sec ?? (destructive ? (ui.selectedBoundary ?? ui.playhead) : ui.playhead);
     const before = ui.allSlots?.length || 0;
     const pointer = extra.pointer || "button";
     reportCutAction(ui, operation, { before, time: at, pointer });
-    const response = await fetch("/api/editor-cut-operation", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation, at_sec: at, ...extra }) });
+    const response = await fetch("/api/editor-cut-operation", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation, at_sec: at, source_folder:ui.sourceFolder, ...extra }) });
     const result = await response.json().catch(() => ({}));
     if (!response.ok) { reportCutAction(ui, `${operation} rejected`, { before, time: at, pointer, reason: result.error || "unknown error", error: true }); return showToast(result.error || `Could not ${operation}.`); }
+    await Promise.all(Object.keys(previewMixes).map(id => stopPreviewMix(id)));
+    document.querySelectorAll(".fine-tune[open]").forEach(panel => panel.open = false);
+    Object.keys(livePreviewOverrides).forEach(key => delete livePreviewOverrides[key]);
     ui.selectedBoundary = null;
     await refreshEditorAfterOperation(result, operation, before, at, pointer);
+    } catch (error) { showToast(error.message || error); clearCutLoading(); }
+    finally { ui.operationPending = false; }
   };
   ui.editorOperation = editorOperation;
   const waveformClick = (event) => { const rect = ui.canvas.getBoundingClientRect(); const at = ui.viewStart + Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) * (ui.viewEnd - ui.viewStart); movePlayheadTo(ui, at); const before = ui.allSlots?.length || 0; reportCutAction(ui, "left-click", { before, time: ui.playhead, pointer: "waveform" }); if (ui.mode.value === "cut") editorOperation("add", { pointer: "waveform" }); else if (ui.mode.value === "paste") { if (ui.clipboard) editorOperation("add", { at_sec: ui.playhead, pointer: "waveform-paste" }); else reportCutAction(ui, "paste rejected", { before, time: ui.playhead, pointer: "waveform", reason: "No copied cut or selection", error: true }); } };
@@ -1131,7 +1305,7 @@ function wireCutSelector(ui) {
   });
   waveform.addEventListener("click", (event) => { if (event.target.closest("#cutMarkers, .cut-selection")) return; waveformClick(event); });
   ui.speed.addEventListener("change", () => { if (ui.audio) ui.audio.playbackRate = Number(ui.speed.value); });
-  ui.dialog.querySelector("#cutPlay").addEventListener("click", () => { if (!ui.audio) return; movePlayheadTo(ui, ui.playhead || ui.startValue); ui.audio.play().catch((error) => setCutLoading("Playback error", error.message, 100)); });
+  ui.dialog.querySelector("#cutPlay").addEventListener("click", () => { if (!ui.audio) return; movePlayheadTo(ui, ui.playhead ?? ui.startValue); (window.renderListening?.pause(), ui.audio.play()).catch((error) => setCutLoading("Playback error", error.message, 100)); });
   ui.dialog.querySelector("#cutPause").addEventListener("click", () => ui.audio?.pause());
   ui.dialog.querySelector("#cutStop").addEventListener("click", () => { if (ui.audio) { ui.audio.pause(); ui.audio.currentTime = 0; } });
   ui.dialog.querySelector("#cutBack5").addEventListener("click", () => { if (ui.audio) ui.audio.currentTime = Math.max(0, ui.audio.currentTime - 5); });
@@ -1145,7 +1319,7 @@ function wireCutSelector(ui) {
   });
   ui.audio?.addEventListener("timeupdate", () => {
     if (!Number.isFinite(ui.audio.duration)) return;
-    ui.playhead = Math.max(ui.sourceStart || 0, Math.min(ui.sourceEnd || Infinity, Number(ui.slotWindowStart || 0) + ui.audio.currentTime));
+    ui.playhead = Math.max(ui.sourceStart || 0, Math.min(ui.sourceEnd || Infinity, ui.audio.currentTime));
     drawCutEditor();
   });
   ui.audio?.addEventListener("waiting", () => setCutLoading("Preparing playback", "Loading audio chunk", 70));
@@ -1177,12 +1351,35 @@ function wireCutSelector(ui) {
   contextMenu.querySelectorAll("[data-context-mode]").forEach((button) => button.addEventListener("click", () => { const mode = button.dataset.contextMode; reportCutAction(ui, "menu item selected", { pointer: "contextmenu", time: ui.playhead, finished: true }); closeContextMenu(); setMode(mode); reportCutAction(ui, `selected mode=${mode}`, { pointer: "contextmenu", time: ui.playhead, finished: true }); }));
   contextMenu.querySelectorAll("[data-context-action]").forEach((button) => button.addEventListener("click", () => { const action = button.dataset.contextAction; const before = ui.allSlots?.length || 0; closeContextMenu("context menu closed"); if (action === "copy") { ui.clipboard = { at: ui.selectedBoundary ?? ui.playhead, duration: ui.endValue - ui.startValue }; reportCutAction(ui, "copy", { before, time: ui.playhead, pointer: "contextmenu", finished: true }); } else if (action === "paste") { if (ui.clipboard) editorOperation("add", { at_sec: ui.playhead, pointer: "contextmenu-paste" }); else reportCutAction(ui, "paste rejected", { before, time: ui.playhead, pointer: "contextmenu", reason: "No copied cut or selection", error: true }); } else if (action === "play") ui.dialog.querySelector("#cutPlay").click(); else editorOperation(action === "delete" ? "delete" : "add", { pointer: "contextmenu" }); }));
   ui.dialog.addEventListener("click", (event) => { if (contextMenu.isConnected && !event.target.closest("#cutContextMenu")) closeContextMenu(); });
-  ui.dialog.addEventListener("keydown", (event) => { const command = event.metaKey || event.ctrlKey; if (event.code === "Space") { event.preventDefault(); ui.audio?.paused ? ui.dialog.querySelector("#cutPlay").click() : ui.dialog.querySelector("#cutPause").click(); } else if (command && event.key.toLowerCase() === "z") { event.preventDefault(); editorOperation(event.shiftKey ? "redo" : "undo", { pointer: "keyboard" }); } else if (command && event.key.toLowerCase() === "c") { event.preventDefault(); ui.clipboard = { at: ui.selectedBoundary ?? ui.playhead, duration: ui.endValue - ui.startValue }; reportCutAction(ui, "copy", { pointer: "keyboard", finished: true }); } else if (command && event.key.toLowerCase() === "v") { event.preventDefault(); if (ui.clipboard) editorOperation("add", { at_sec: ui.playhead, pointer: "keyboard" }); } else if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); editorOperation("delete", { pointer: "keyboard" }); } else if (event.key.toLowerCase() === "c") setMode("cut"); else if (event.key.toLowerCase() === "s") setMode("select"); else if (event.key.toLowerCase() === "p") setMode("paste"); else if (event.key.toLowerCase() === "d") setMode("delete"); else if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const amount = event.shiftKey ? 30 : 5; movePlayheadTo(ui, ui.playhead + (event.key === "ArrowLeft" ? -amount : amount)); } });
-  const navigate = async (offset) => { if (cutIsDirty() && !window.confirm("Discard unsaved cut changes before changing slots?")) return; const index = ui.allSlots.indexOf(Number(ui.songId)); const next = ui.allSlots[index + offset]; if (next) await openCutSelector(next); };
+  waveform.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const rect = ui.canvas.getBoundingClientRect(); const span = ui.viewEnd - ui.viewStart;
+    let nextSpan = span, nextStart;
+    if (event.metaKey || event.ctrlKey) nextStart = ui.viewStart + (event.deltaX || event.deltaY) / rect.width * span;
+    else { const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)); nextSpan = Math.max(1, Math.min(ui.duration, span * Math.exp(event.deltaY * .002))); nextStart = ui.viewStart + span * fraction - nextSpan * fraction; }
+    ui.viewStart = Math.max(ui.sourceStart, Math.min(ui.sourceEnd - nextSpan, nextStart)); ui.viewEnd = ui.viewStart + nextSpan; drawCutEditor();
+  }, {passive:false});
+  ui.dialog.querySelector("#cutSongZero").addEventListener("change", async (event) => {
+    if (!await resolveUnsavedCuts()) { event.target.checked = !event.target.checked; return; }
+    await editorOperation("numbering", {first_song_number:event.target.checked ? 0 : 1});
+  });
+  ui.dialog.addEventListener("keydown", (event) => {
+    if (event.target.closest("input, textarea, select, [contenteditable=true]")) return;
+    const command = event.metaKey || event.ctrlKey; const key = event.key.toLowerCase();
+    if (event.code === "Space") { event.preventDefault(); if (!event.repeat) ui.audio?.paused ? ui.dialog.querySelector("#cutPlay").click() : ui.dialog.querySelector("#cutPause").click(); }
+    else if (command && key === "s") { event.preventDefault(); saveCutChanges(ui); }
+    else if (command && key === "z") { event.preventDefault(); const from = event.shiftKey ? ui.localRedo : ui.localUndo; const to = event.shiftKey ? ui.localUndo : ui.localRedo; if (from?.length) { to.push([ui.startValue,ui.endValue]); [ui.startValue,ui.endValue] = from.pop(); drawCutEditor(); } else if (!cutIsDirty()) editorOperation(event.shiftKey ? "redo" : "undo", {pointer:"keyboard"}); }
+    else if (command && key === "c") { event.preventDefault(); ui.clipboard = {at:ui.selectedBoundary ?? ui.playhead, sourceFolder:ui.sourceFolder}; reportCutAction(ui,"copy",{pointer:"keyboard",finished:true}); }
+    else if (command && key === "v") { event.preventDefault(); if (ui.clipboard?.sourceFolder === ui.sourceFolder) editorOperation("add", {at_sec:ui.playhead,pointer:"keyboard"}); }
+    else if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); editorOperation("delete", {pointer:"keyboard"}); }
+    else if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); movePlayheadTo(ui,ui.playhead+(event.key === "ArrowLeft" ? -1 : 1)*(event.shiftKey ? 30 : 5)); }
+    else if (!command && ["c","s","p","d"].includes(key)) setMode({c:"cut",s:"select",p:"paste",d:"delete"}[key]);
+  });
+  const navigate = async (offset) => { if (!await resolveUnsavedCuts()) return; const index = ui.allSlots.indexOf(Number(ui.songId)); const next = ui.allSlots[index + offset]; if (next != null) await openCutSelector(next); };
   ui.dialog.querySelector("#cutPrevious").addEventListener("click", () => navigate(-1));
   ui.dialog.querySelector("#cutNext").addEventListener("click", () => navigate(1));
-  ui.dialog.querySelector("#cutSlotList").addEventListener("change", (event) => { if (cutIsDirty() && !window.confirm("Discard unsaved cut changes before changing slots?")) { event.target.value = String(ui.songId); return; } openCutSelector(Number(event.target.value)); });
-  ui.dialog.querySelector("#cutApply").addEventListener("click", async () => { setCutLoading("Saving changes", `Saving manual override for slot ${ui.songId}`, 60); let response; let result = {}; if (Math.abs(ui.startValue - ui.originalStart) > 0.05 || Math.abs(ui.endValue - ui.originalEnd) > 0.05) { if (Math.abs(ui.startValue - ui.originalStart) > 0.05) { response = await fetch("/api/editor-cut-operation", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation: "move", old_sec: ui.originalStart, new_sec: ui.startValue }) }); result = await response.json().catch(() => ({})); if (!response.ok) return showToast(result.error || "Could not move the start cut."); } if (Math.abs(ui.endValue - ui.originalEnd) > 0.05) { response = await fetch("/api/editor-cut-operation", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation: "move", old_sec: ui.originalEnd, new_sec: ui.endValue }) }); result = await response.json().catch(() => ({})); if (!response.ok) return showToast(result.error || "Could not move the end cut."); } } else { response = await fetch(`/api/segment-selection/${ui.songId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_sec: ui.startValue, end_sec: ui.endValue }) }); result = await response.json().catch(() => ({})); if (!response.ok) { setCutLoading("Error", result.error || "Could not save selection."); return showToast(result.error || "Could not save selection."); } } ui.originalStart = ui.startValue; ui.originalEnd = ui.endValue; ui.savedClean = true; setCutLoading("Finished", `Manual override saved; ${appState.songs.length} slots preserved`, 100); ui.dialog.close("saved"); clearCutLoading(); await refreshState({ renderLarge: false }); if (ui.editAllQueue?.length) { const next = ui.editAllQueue.shift(); await openCutSelector(next); } else setTimeout(clearCutLoading, 700); showToast(`Saved cut ${cutTime(ui.startValue)}–${cutTime(ui.endValue)}.`); });
+  ui.dialog.querySelector("#cutSlotList").addEventListener("change", async (event) => { if (!await resolveUnsavedCuts()) { event.target.value = String(ui.songId); return; } await openCutSelector(Number(event.target.value)); });
+  ui.dialog.querySelector("#cutApply").addEventListener("click", () => saveCutChanges(ui));
 }
 
 function fineTuneHtml(song) {
@@ -1197,10 +1394,10 @@ function fineTuneHtml(song) {
           </label>
           <div data-quick-controls="${song.id}">
           <div class="preview-label"><strong>Full song · approximate</strong> <span class="warn">Dynamics and mastering are approximated.</span></div>
-          <button data-preview-toggle="${song.id}" class="accent" disabled>Loading preview...</button>
+          <button data-preview-toggle="${song.id}" class="accent">Play Preview</button>
           <input data-preview-seek="${song.id}" type="range" min="0" max="0" step="0.1" value="0" disabled>
           <span data-preview-time="${song.id}">00:00:00 / 00:00:00</span>
-          <span class="muted" data-preview-cache="${song.id}">Preview stems not loaded</span>
+          <span class="muted" data-preview-cache="${song.id}">Audio loads when you press Play Preview</span>
           <span class="warn" data-preview-warning="${song.id}" hidden></span>
           </div>
           <div data-real-controls="${song.id}" hidden>
@@ -1238,13 +1435,12 @@ function wireFineTune(root, songIndex) {
     if (details.open) {
       await closeOtherFineTunePanels(details, songIndex);
       await loadActiveStemFaders(root, songIndex);
-      loadFullStemPreview(root, songIndex);
     } else {
       await stopPreviewMix(songIndex);
     }
   });
   if (details.open) {
-    loadActiveStemFaders(root, songIndex).then(() => loadFullStemPreview(root, songIndex));
+    loadActiveStemFaders(root, songIndex);
   }
   wireFineTuneControls(root, songIndex);
 }
@@ -1256,7 +1452,7 @@ async function loadActiveStemFaders(root, songIndex) {
   if (faders.dataset.loaded === "true") return;
   const load = (async () => {
   faders.dataset.loading = "true";
-  faders.innerHTML = '<div class="muted">Loading active tracks...</div>';
+  faders.innerHTML = '<div class="muted">Preparing this song’s balance, gates and effects…</div>';
   try {
     const res = await fetch(`/api/active-stems/${songIndex}`);
     if (!res.ok) throw new Error("active stems unavailable");
@@ -1271,7 +1467,7 @@ async function loadActiveStemFaders(root, songIndex) {
       const reason = balance.guitar_reduction_reason || "no reliable vocal overlap evidence";
       const summary = root.querySelector(`[data-auto-mix-balance="${songIndex}"]`);
       if (summary && Number.isFinite(Number(guitar))) {
-        summary.textContent = `Auto-Mix guitars: original ${Number(original).toFixed(1)} dB · reduction ${Number(guitar).toFixed(1)} dB · ${reason}`;
+        summary.textContent = `Auto-Mix guitars: original ${Number(original).toFixed(1)} dB · balance ${signedDb(guitar)} · ${reason}`;
       }
     }
     renderFaders(root, songIndex);
@@ -1287,6 +1483,18 @@ async function loadActiveStemFaders(root, songIndex) {
   } finally {
     delete activeStemLoadPromises[String(songIndex)];
   }
+}
+
+function automaticFaderLevel(params) {
+  return Number(params?.makeup_gain_db ?? params?.automatic_fader_db ?? params?.computed_gain_db ?? 0);
+}
+
+function displayedFaderLevel(params, userTrimDb) {
+  return automaticFaderLevel(params) + Number(userTrimDb || 0);
+}
+
+function userTrimFromFader(params, displayedDb) {
+  return Number(displayedDb) - automaticFaderLevel(params);
 }
 
 function renderFaders(root, songIndex) {
@@ -1311,6 +1519,10 @@ function renderFaders(root, songIndex) {
       });
     }
     if (params) {
+      if (!ov.gate_user_confirmed && typeof params.gate_enabled === "boolean") {
+        ov.gate_enabled = params.gate_enabled;
+        livePreviewStemOverrides(songIndex, stem.file).gate_enabled = params.gate_enabled;
+      }
       ov.gain_db ??= Number(params.gain_db || 0);
       ov.fader_db ??= Number(params.fader_db || 0);
       ov.pan ??= Number(params.pan || 0);
@@ -1319,13 +1531,19 @@ function renderFaders(root, songIndex) {
       ov.eq_air_gain_db ??= Number(params.eq_air_gain_db);
     }
     const gainDb = stemGainDb(songIndex, stem);
-    const fader = ov.user_confirmed
+    const userFader = ov.user_confirmed
       ? Number(ov.fader_db || 0)
       : Number(params?.user_fader_db ?? 0);
-    const automaticFaderDb = Number(params?.automatic_fader_db ?? params?.computed_gain_db ?? 0);
+    const automaticFaderDb = automaticFaderLevel(params);
+    const fader = displayedFaderLevel(params, userFader);
     if (!Number.isFinite(Number(ov.pan))) ov.pan = defaultPan(stem);
     const pan = Number(ov.pan);
-    const fxEnabled = ov.fx_enabled === true;
+    ov.fx_enabled ??= params?.fx_enabled ?? true;
+    if (!ov.effects_user_confirmed) {
+      ov.space_enabled = Boolean(params?.space_enabled);
+      ov.echo_enabled = Boolean(params?.echo_enabled);
+    }
+    const fxEnabled = ov.fx_enabled !== false;
     const eq = stemEq(songIndex, stem);
     ov.eq_low_cut_hz ??= eq.eq_low_cut_hz;
     ov.eq_mid_gain_db ??= eq.eq_mid_gain_db;
@@ -1338,12 +1556,13 @@ function renderFaders(root, songIndex) {
       <strong class="stem-label">${esc(linkedLabel)}</strong>
       <div class="kind">${stem.role === "vocal" ? "voice" : "instrument"}</div>
       <label class="gain-control">Gain <input data-gain type="range" min="-20" max="20" step="0.5" value="${gainDb}"><span>${signedDb(gainDb)}</span></label>
-      <input data-fader type="range" min="-60" max="12" step="0.5" value="${fader}">
-      <div class="amount">Trim ${amount(fader)} · auto ${signedDb(automaticFaderDb)}</div>
+      <input data-fader type="range" min="${Math.min(-60, automaticFaderDb - 60)}" max="${Math.max(12, automaticFaderDb + 12)}" step="0.5" value="${fader}">
+      <div class="amount">Level ${signedDb(fader)} · auto ${signedDb(automaticFaderDb)}</div>
       <button type="button" class="fx-toggle ${fxEnabled ? "active" : ""}" data-fx-toggle>${fxEnabled ? "FX ON" : "FX OFF"}</button>
       <div class="stem-effects" aria-label="Per-stem effects">
         ${[["gate_enabled", "Gate"], ["space_enabled", "Space"], ["echo_enabled", "Echo"]].map(([key, label]) => `<button type="button" class="effect-dot ${ov[key] === true ? "active" : ""}" data-effect="${key}" title="Toggle ${label}"><span></span>${label}</button>`).join("")}
       </div>
+      <div class="effect-levels" data-effect-levels></div>
       ${linked.length > 1 ? '<div class="pan-control linked-pan-note">Stereo pair · individual L/R panning preserved</div>' : `<label class="pan-control">Pan <input data-pan type="range" min="-1" max="1" step="0.05" value="${pan}"><span>${panText(pan)}</span></label>`}
       <div class="eq-controls">
         <label>Low cut <input data-eq="eq_low_cut_hz" type="range" min="20" max="220" step="5" value="${eq.eq_low_cut_hz}"><span>${Math.round(eq.eq_low_cut_hz)} Hz</span></label>
@@ -1355,6 +1574,11 @@ function renderFaders(root, songIndex) {
         <button class="${ov.solo ? "active" : ""}" data-solo>Solo</button>
       </div>
     `;
+    const updateEffectLabels = () => {
+      const sendLabel = (key, enabled) => ov.fx_enabled === false || !enabled ? "off" : `${signedDb(20 * Math.log10(Math.max(1e-12, previewSendGain(songIndex, stem, key))))}`;
+      strip.querySelector("[data-effect-levels]").textContent = `Space ${sendLabel("reverb_send_db", ov.space_enabled)} · Echo ${sendLabel("delay_send_db", ov.echo_enabled)}`;
+    };
+    updateEffectLabels();
     const slider = strip.querySelector("[data-fader]");
     const label = strip.querySelector(".amount");
     const gainSlider = strip.querySelector("[data-gain]");
@@ -1363,7 +1587,7 @@ function renderFaders(root, songIndex) {
       const liveGainDb = Number(gainSlider.value);
       ov.gain_db = liveGainDb;
       setLinkedOverride(songIndex, linked, "gain_db", liveGainDb);
-      linked.forEach((item) => { stemOverrides(songIndex, item.file).user_confirmed = true; });
+      setLinkedOverride(songIndex, linked, "user_confirmed", true);
       gainLabel.textContent = signedDb(liveGainDb);
       linked.forEach((item) => applyLivePreGain(songIndex, item, liveGainDb, "gain:direct-input"));
       persistPreviewChange(songIndex, `gain:${stem.file}`);
@@ -1387,11 +1611,11 @@ function renderFaders(root, songIndex) {
         feedsNodeId: previewNodeId(liveNode?.__feedsNode),
         currentAudioParamValue: liveNode?.gain ? liveNode.gain.value : null,
       });
-      const liveFaderDb = Number(slider.value);
+      const liveFaderDb = userTrimFromFader(params, slider.value);
       ov.fader_db = liveFaderDb;
       setLinkedOverride(songIndex, linked, "fader_db", liveFaderDb);
-      linked.forEach((item) => { stemOverrides(songIndex, item.file).user_confirmed = true; });
-      label.textContent = `Trim ${amount(ov.fader_db)} · auto ${signedDb(automaticFaderDb)}`;
+      setLinkedOverride(songIndex, linked, "user_confirmed", true);
+      label.textContent = `Level ${signedDb(Number(slider.value))} · auto ${signedDb(automaticFaderDb)}`;
       applyLiveFaderGain(songIndex, stem, liveFaderDb, "fader:direct-input");
       linked.forEach((item) => updatePreviewGains(songIndex, item.file, "fader", { faderDb: liveFaderDb }));
       persistPreviewChange(songIndex, `fader:${stem.file}`);
@@ -1456,6 +1680,7 @@ function renderFaders(root, songIndex) {
       setLinkedOverride(songIndex, linked, "fx_enabled", ov.fx_enabled);
       event.currentTarget.classList.toggle("active", ov.fx_enabled);
       event.currentTarget.textContent = ov.fx_enabled ? "FX ON" : "FX OFF";
+      updateEffectLabels();
       linked.forEach((item) => reconnectPreviewStemFx(previewMixFor(songIndex), songIndex, item, ov.fx_enabled));
       persistPreviewChange(songIndex, `fx:${stem.file}`);
       await flushOverrideSaveVisible(songIndex, `fx:${stem.file}`);
@@ -1465,8 +1690,14 @@ function renderFaders(root, songIndex) {
       button.addEventListener("click", async () => {
         const key = button.dataset.effect;
         ov[key] = !(ov[key] === true);
+        if (key === "gate_enabled") { ov.gate_user_confirmed = true; setLinkedOverride(songIndex, linked, "gate_user_confirmed", true); }
+        if (key === "space_enabled" || key === "echo_enabled") {
+          ov.effects_user_confirmed = true;
+          setLinkedOverride(songIndex, linked, "effects_user_confirmed", true);
+        }
         setLinkedOverride(songIndex, linked, key, ov[key]);
         button.classList.toggle("active", ov[key]);
+        updateEffectLabels();
         linked.forEach((item) => {
           const live = livePreviewStemOverrides(songIndex, item.file);
           live[key] = ov[key];
@@ -1673,6 +1904,7 @@ function disconnectPreviewGraph(mix, reason = "teardown") {
   Object.values(mix.preGains || {}).forEach(disconnectPreviewNode);
   Object.values(mix.faderGains || {}).forEach(disconnectPreviewNode);
   Object.values(mix.vocalExpanders || {}).forEach(disconnectPreviewNode);
+  Object.values(mix.instrumentGates || {}).forEach(disconnectPreviewNode);
   Object.values(mix.gains || {}).forEach(disconnectPreviewNode);
   Object.values(mix.panners || {}).forEach(disconnectPreviewNode);
   Object.values(mix.reverbSends || {}).forEach(disconnectPreviewNode);
@@ -1699,6 +1931,7 @@ function disconnectPreviewGraph(mix, reason = "teardown") {
   mix.preGains = {};
   mix.faderGains = {};
   mix.vocalExpanders = {};
+  mix.instrumentGates = {};
   mix.gains = {};
   mix.panners = {};
   mix.reverbSends = {};
@@ -1708,11 +1941,37 @@ function disconnectPreviewGraph(mix, reason = "teardown") {
 }
 
 function previewFxEnabled(songIndex, stem) {
-  return currentStemOverrides(songIndex, stem.file).fx_enabled === true;
+  return currentStemOverrides(songIndex, stem.file).fx_enabled !== false;
 }
 
 function previewEffectEnabled(songIndex, stem, key) {
   return currentStemOverrides(songIndex, stem.file)[key] === true;
+}
+
+function schedulePreviewSectionGate(mix, songIndex, stem, offset, when) {
+  const node = mix?.instrumentGates?.[stem.file];
+  if (!node) return;
+  const points = previewStemParams(songIndex, stem)?.gate_points || [];
+  const param = node.gain;
+  param.cancelScheduledValues(when);
+  if (!previewFxEnabled(songIndex, stem) || !previewEffectEnabled(songIndex, stem, "gate_enabled") || !points.length) {
+    param.setValueAtTime(1, when);
+    return;
+  }
+  let value = Number(points[0][1]);
+  for (let i = 1; i < points.length; i++) {
+    const [t, gain] = points[i];
+    const [before, previous] = points[i - 1];
+    if (offset <= t) {
+      value = previous + (gain - previous) * Math.max(0, offset - before) / Math.max(1e-9, t - before);
+      break;
+    }
+    value = gain;
+  }
+  param.setValueAtTime(value, when);
+  points.forEach(([t, gain]) => {
+    if (t > offset) param.linearRampToValueAtTime(gain, when + t - offset);
+  });
 }
 
 function reconnectPreviewStemFx(mix, songIndex, stem, enabled) {
@@ -1720,12 +1979,14 @@ function reconnectPreviewStemFx(mix, songIndex, stem, enabled) {
   const fader = faderGainNode(mix, stem.file);
   const eqNodes = Object.values(mix?.eqNodes?.[stem.file] || {}).filter((node) => node && typeof node.connect === "function");
   const expander = mix?.vocalExpanders?.[stem.file];
+  const instrumentGate = mix?.instrumentGates?.[stem.file];
   if (!preGain || !fader) return;
   try { preGain.disconnect(); } catch (_err) {}
   eqNodes.forEach((node) => { try { node.disconnect(); } catch (_err) {} });
   if (expander) { try { expander.disconnect(); } catch (_err) {} }
-  const gateEnabled = enabled && previewEffectEnabled(songIndex, stem, "gate_enabled");
-  const chain = enabled ? [...eqNodes, ...(expander && gateEnabled ? [expander] : []), fader] : [fader];
+  if (instrumentGate) { try { instrumentGate.disconnect(); } catch (_err) {} }
+  const gateEnabled = enabled && (stem.role === "vocal" || previewEffectEnabled(songIndex, stem, "gate_enabled"));
+  const chain = enabled ? [...eqNodes, ...(expander && gateEnabled ? [expander] : []), ...(instrumentGate && gateEnabled ? [instrumentGate] : []), fader] : [fader];
   let from = preGain;
   chain.forEach((to) => { from.connect(to); to.__receivesFromNode = from; from = to; });
   fader.__fedByEqChain = Boolean(enabled && eqNodes.length);
@@ -1736,6 +1997,7 @@ function reconnectPreviewStemFx(mix, songIndex, stem, enabled) {
   if (reverb) reverb.gain.value = enabled && previewEffectEnabled(songIndex, stem, "space_enabled") ? previewSendGain(songIndex, stem, "reverb_send_db") : 0;
   if (delay) delay.gain.value = enabled && previewEffectEnabled(songIndex, stem, "echo_enabled") ? previewSendGain(songIndex, stem, "delay_send_db") : 0;
   preGain.__fxEnabled = enabled;
+  if (instrumentGate) schedulePreviewSectionGate(mix, songIndex, stem, currentPreviewOffset(mix), mix.ctx.currentTime);
 }
 
 function logPreviewGraphIntegrity(songIndex, reason) {
@@ -1798,7 +2060,7 @@ function logPreviewGraphIntegrity(songIndex, reason) {
       if (!panner) errors.push("missing panner node");
       if (fader && fader.__receivesFromNode == null) errors.push("fader has no tracked input node");
       if (stem.role === "vocal" && !mix.vocalExpanders?.[stem.file]) errors.push("missing vocal expander node");
-      if (stem.role === "vocal" && previewFxEnabled(songIndex, stem) && previewEffectEnabled(songIndex, stem, "gate_enabled") && fader && fader.__receivesFromNode !== mix.vocalExpanders?.[stem.file]) errors.push("vocal fader is not fed by expander");
+      if (stem.role === "vocal" && previewFxEnabled(songIndex, stem) && fader && fader.__receivesFromNode !== mix.vocalExpanders?.[stem.file]) errors.push("vocal fader is not fed by expander");
       if (fader && fader.__feedsNode !== panner) errors.push("fader does not feed this stem's panner");
       if (panner && !panner.__inSignalPath) errors.push("panner not marked in signal path");
       return errors.length ? {
@@ -2166,10 +2428,13 @@ function previewSendGain(songIndex, stem, key) {
     ? (key === "reverb_send_db" ? params.reverb_base_db : params.delay_base_db)
     : (key === "reverb_send_db" ? baseReverbSendDb(stem.role) : baseDelaySendDb(stem.role, leadBonusDb));
   if (base == null) return 0;
-  return dbToGain(base + Number(ov[key] || 0));
+  const sceneOffset = Number(params?.[key === "reverb_send_db" ? "reverb_scene_offset_db" : "delay_scene_offset_db"] || 0);
+  return dbToGain(base + sceneOffset + Number(ov[key] || 0));
 }
 
 function updatePreviewSends(songIndex, key) {
+  if (key === "space_enabled") key = "reverb_send_db";
+  if (key === "echo_enabled") key = "delay_send_db";
   const mix = previewMixFor(songIndex);
   if (!mix) return;
   const now = mix.ctx.currentTime;
@@ -2230,32 +2495,40 @@ function updatePreviewBusGains(songIndex, key = "all") {
   logPreviewGraphIntegrity(songIndex, `bus:${key}`);
 }
 
-// The Python master measures integrated loudness after summing and then gains
-// the result to TARGET_LUFS. The browser cannot use pyloudnorm, so estimate
-// the same summed RMS from the decoded buffers after the exact per-stem gains;
-// for music this tracks LUFS closely enough to keep preview/export within the
-// product's 1 LU parity tolerance. The output limiter handles inter-sample
-// peaks introduced by the browser graph.
+// Estimate the summed stereo signal. Averaging powers across stems underestimates
+// the mix by 10*log10(track count), so simply loading more tracks boosts hiss.
+// EQ, dynamics and effects still make this an RMS estimate rather than LUFS.
 function estimatePreviewRmsDb(mix) {
   if (!mix?.loaded || !mix.buffers?.length) return NaN;
-  let sumSquares = 0;
-  let sampleCount = 0;
+  const length = Math.max(...mix.buffers.map(({buffer}) => buffer.length));
+  const stride = Math.max(1, Math.ceil(length / 120000));
+  const count = Math.ceil(length / stride);
+  const left = new Float64Array(count);
+  const right = new Float64Array(count);
   mix.buffers.forEach(({ stem, buffer }) => {
     const pre = Number(mix.preGains?.[stem.file]?.gain?.value ?? 1);
     const fader = Number(mix.faderGains?.[stem.file]?.gain?.value ?? 1);
-    const gain = pre * fader;
-    const stride = Math.max(1, Math.floor(buffer.length / 120000));
-    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      for (let i = 0; i < data.length; i += stride) {
-        const value = data[i] * gain;
-        sumSquares += value * value;
-        sampleCount += 1;
+    const vocal = stem.role === "vocal" ? Number(mix.vocalGain?.gain?.value ?? 1) : 1;
+    const gain = pre * fader * vocal;
+    const pan = Math.max(-1, Math.min(1, Number(mix.panners?.[stem.file]?.pan?.value ?? 0)));
+    const a = buffer.getChannelData(0);
+    const b = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
+    const angle = b ? (pan <= 0 ? pan + 1 : pan) * Math.PI / 2 : (pan + 1) * Math.PI / 4;
+    const c = Math.cos(angle), s = Math.sin(angle);
+    for (let i = 0, n = 0; i < a.length; i += stride, n++) {
+      const x = a[i] * gain;
+      if (!b) {
+        left[n] += x * c; right[n] += x * s;
+      } else {
+        const y = b[i] * gain;
+        left[n] += pan <= 0 ? x + y * c : x * c;
+        right[n] += pan <= 0 ? y * s : y + x * s;
       }
     }
   });
-  if (!sampleCount || !sumSquares) return -120;
-  return 10 * Math.log10(sumSquares / sampleCount);
+  let sumSquares = 0;
+  for (let i = 0; i < count; i++) sumSquares += left[i] ** 2 + right[i] ** 2;
+  return sumSquares > 0 ? 10 * Math.log10(sumSquares / (count * 2)) : NaN;
 }
 
 function previewTimeText(seconds) {
@@ -2337,17 +2610,14 @@ function createPreviewEqChain(ctx, songIndex, stem) {
 }
 
 function createPreviewVocalExpander(ctx, stem) {
-  if (stem.role !== "vocal" || !ctx.createDynamicsCompressor) return null;
-  const node = ctx.createDynamicsCompressor();
-  node.threshold.value = previewVocalExpander.thresholdDb;
-  node.knee.value = previewVocalExpander.kneeDb;
-  node.ratio.value = previewVocalExpander.ratio;
-  node.attack.value = previewVocalExpander.attackSeconds;
-  node.release.value = previewVocalExpander.releaseSeconds;
+  if (stem.role !== "vocal") return null;
+  const node = new AudioWorkletNode(ctx, "zucker-vocal-expander", {
+    processorOptions: previewVocalExpander,
+  });
   node.__stemFile = stem.file;
   node.__inSignalPath = true;
   node.__processing = {
-    type: "per-stem expander: DynamicsCompressorNode",
+    type: "per-stem downward expander: AudioWorkletNode",
     threshold_db: previewVocalExpander.thresholdDb,
     ratio: previewVocalExpander.ratio,
     attack_seconds: previewVocalExpander.attackSeconds,
@@ -2356,6 +2626,17 @@ function createPreviewVocalExpander(ctx, stem) {
     python_max_attenuation_db: previewVocalExpander.maxAttenuationDb,
   };
   return node;
+}
+
+function restorePreviewSourceLevel(buffer, encodingGainDb) {
+  const gainDb = Number(encodingGainDb || 0);
+  if (!Number.isFinite(gainDb) || gainDb === 0) return buffer;
+  const gain = dbToGain(-gainDb);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    const samples = buffer.getChannelData(channel);
+    for (let i = 0; i < samples.length; i += 1) samples[i] *= gain;
+  }
+  return buffer;
 }
 
 async function loadFullStemPreview(root, songIndex) {
@@ -2373,7 +2654,8 @@ async function loadFullStemPreview(root, songIndex) {
   }
   const existingMix = previewMixFor(songIndex);
   if (existingMix?.loaded || existingMix?.loading) {
-    if (status && existingMix.loading) status.textContent = "Loading tracks...";
+    if (existingMix.loaded) updatePreviewTransport(root, songIndex);
+    else if (status) status.textContent = "Loading tracks...";
     return existingMix;
   }
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -2391,6 +2673,7 @@ async function loadFullStemPreview(root, songIndex) {
     preGains: {},
     faderGains: {},
     vocalExpanders: {},
+    instrumentGates: {},
     gains: {},
     panners: {},
     reverbSends: {},
@@ -2416,12 +2699,23 @@ async function loadFullStemPreview(root, songIndex) {
   const previewStems = appState.stems.filter((stem) => activeFiles.has(stem.file));
   let decoded = [];
   try {
+    if (previewStems.some((stem) => stem.role === "vocal")) {
+      await ctx.audioWorklet.addModule("/static/vocal-expander.js");
+    }
+    let loadedTracks = 0;
+    const totalTracks = previewStems.length;
+    if (status) status.textContent = `Preparing preview · 0/${totalTracks} tracks`;
     decoded = await Promise.all(previewStems.map(async (stem) => {
       const res = await fetch(`/stem-full/${songIndex}/${stem.index}`);
       if (!res.ok || res.status === 204) return null;
       const bytes = Number(res.headers.get("X-Preview-Cache-Bytes") || 0);
       const arrayBuffer = await res.arrayBuffer();
       const buffer = await ctx.decodeAudioData(arrayBuffer);
+      restorePreviewSourceLevel(buffer, res.headers.get("X-Preview-Source-Gain-Db"));
+      loadedTracks += 1;
+      if (status && previewMixFor(songIndex) === mix && !mix.closed) {
+        status.textContent = `Preparing preview · ${loadedTracks}/${totalTracks} tracks`;
+      }
       return { stem, buffer, bytes: bytes || arrayBuffer.byteLength };
     }));
   } catch (_err) {
@@ -2501,6 +2795,7 @@ async function loadFullStemPreview(root, songIndex) {
     }, { __inSignalPath: true });
     mix.preGains[stem.file] = preGain;
     if (vocalExpander) mix.vocalExpanders[stem.file] = vocalExpander;
+    if (stem.role !== "vocal") mix.instrumentGates[stem.file] = ctx.createGain();
     mix.faderGains[stem.file] = gain;
     mix.gains[stem.file] = gain;
     mix.panners[stem.file] = panner;
@@ -2524,7 +2819,7 @@ async function loadFullStemPreview(root, songIndex) {
   if (status) status.textContent = mix.buffers.length ? previewCacheText(mix.cacheBytes) : "No active preview audio found for this song.";
   if (playButton) {
     playButton.disabled = !mix.buffers.length;
-    playButton.textContent = mix.buffers.length ? "Mix Preview" : "Preview unavailable";
+    playButton.textContent = mix.buffers.length ? "Play Preview" : "Preview unavailable";
   }
   return mix;
 }
@@ -2532,6 +2827,7 @@ async function loadFullStemPreview(root, songIndex) {
 function startPreviewSources(mix, songIndex, offset) {
   stopPreviewSources(mix);
   const when = mix.ctx.currentTime + 0.03;
+  mix.buffers.forEach(({ stem }) => schedulePreviewSectionGate(mix, songIndex, stem, offset, when));
   mix.sources = mix.buffers.map(({ stem, buffer }) => {
     const source = mix.ctx.createBufferSource();
     source.buffer = buffer;
@@ -2600,6 +2896,7 @@ function currentPreviewOffset(mix) {
 }
 
 async function toggleFullStemPreview(root, songIndex) {
+  window.renderListening?.pause();
   const mix = await loadFullStemPreview(root, songIndex);
   if (!mix || !mix.buffers.length) return;
   if (mix.ctx.state === "suspended") await mix.ctx.resume();
@@ -2629,7 +2926,7 @@ function updatePreviewTransport(root, songIndex) {
   if (!mix) return;
   if (play) play.disabled = !mix.loaded || !mix.buffers.length;
   const offset = currentPreviewOffset(mix);
-  if (play) play.textContent = mix.playing ? "Pause Preview" : "Mix Preview";
+  if (play) play.textContent = mix.playing ? "Pause Preview" : "Play Preview";
   if (seek && document.activeElement !== seek) seek.value = String(offset);
   if (time) time.textContent = `${previewTimeText(offset)} / ${previewTimeText(mix.duration || 0)}`;
   if (mix.timer) clearTimeout(mix.timer);
@@ -2752,12 +3049,26 @@ async function saveSettings(partial) {
   await refreshState();
 }
 
+function preservePreviewMixParams(next, previous) {
+  if (!previous || next.source_folder !== previous.source_folder) return;
+  const oldSongs = new Map((previous.songs || []).map(song => [String(song.id), song]));
+  (next.songs || []).forEach(song => {
+    const old = oldSongs.get(String(song.id));
+    if (!old?.mix_params || song.mix_params) return;
+    if (["start", "end", "render_end", "revision"].every(key => song[key] === old[key])) {
+      song.mix_params = old.mix_params;
+    }
+  });
+}
+
 async function refreshState(options = {}) {
   const renderLarge = options.renderLarge !== false;
-  const res = await fetch("/api/state");
-  const next = await res.json();
+  const rawNext = await fetchStateSnapshot();
+  const next = { songs: [], transitions: [], stems: [], settings: {}, audio_scan: {}, jobs: [], ...rawNext };
+  if (!Array.isArray(next.songs)) next.songs = [];
+  if (next.detection_job && ["queued", "running", "stopping"].includes(next.detection_job.status)) setLoadingOverlayJob(next.detection_job);
   const protectedOverrideSongs = new Set([...pendingOverrideSongs, ...openPreviewSongIds(), ...Object.keys(livePreviewOverrides)]);
-  if (appState?.overrides && (protectedOverrideSongs.size || overrideSaveTimer || overrideWritesInFlight)) {
+  if (next.source_folder === appState?.source_folder && appState?.overrides && (protectedOverrideSongs.size || overrideSaveTimer || overrideWritesInFlight)) {
     next.overrides ||= {};
     next.overrides.songs ||= {};
     protectedOverrideSongs.forEach((songId) => {
@@ -2768,15 +3079,28 @@ async function refreshState(options = {}) {
       }
     });
   }
+  preservePreviewMixParams(next, appState);
+  if (appState?.source_folder && appState.source_folder !== next.source_folder) {
+    if (overrideSaveTimer) { clearTimeout(overrideSaveTimer); overrideSaveTimer = null; }
+    pendingOverrideReasons.clear();
+    await Promise.all(Object.keys(previewMixes).map(id => stopPreviewMix(id)));
+    document.querySelectorAll(".fine-tune[open]").forEach(panel => panel.open = false);
+    document.querySelectorAll("audio").forEach(audio => audio.pause());
+    window.renderListening?.reset();
+    checkedSongs.clear(); Object.keys(livePreviewOverrides).forEach(key => delete livePreviewOverrides[key]); pendingOverrideSongs.clear(); songListSignature = ""; transitionSignature = "";
+    if (cutSelector?.dialog.open) { cutSelector.audio?.pause(); cutSelector.dialog.close(); }
+    if (cutSelector) { cutSelector.clipboard = null; cutSelector.data = null; }
+  }
   appState = next;
+  window.renderListening?.sync();
   refreshSlotSummary();
     renderBuildInfo();
     renderSlotAudit();
   syncOverrideSequenceFromState();
   checkedSongs = new Set([...checkedSongs].filter((id) => appState.songs.some((song) => song.id === id && !song.skipped)));
   const detected = visibleSongs().length;
-  const review = visibleSongs().filter((song) => song.render_valid === false).length;
-  $("#songCount").textContent = `${detected} songs detected / ${renderableSongs().length} songs prepared${review ? ` · ${review} needs review` : ""}`;
+  const review = visibleSongs().filter((song) => song.needs_review).length;
+  $("#songCount").textContent = `${detected} songs${appState.source_integrity?.expected_slot_count === (appState.songs || []).length ? " in saved cuts" : " detected"} / ${renderableSongs().length} ready to render${review ? ` · ${review} suggested boundaries to review` : ""}`;
   if (renderLarge) {
     renderCutTools();
     renderSongs();
@@ -2784,7 +3108,7 @@ async function refreshState(options = {}) {
   renderResults();
   // The state payload is intentionally large and can lag the worker. Always
   // finish with the authoritative, lightweight job snapshot.
-  pollJobs().catch((err) => console.warn("[state jobs refresh failed]", err));
+
 }
 
 function updateSelectedButton() {
@@ -2879,6 +3203,55 @@ function jobErrorText(job) {
   return parts.join("\n\n");
 }
 
+function renderResultSummary(job) {
+  if (!job) return "Ready";
+  if (job.status === "done") return ["render", "mix", "preview"].includes(job.kind || "render") ? "All done. Your renders are ready." : "All done.";
+  if (job.status === "pending_confirmation") return "Songs ready for confirmation.";
+  if (job.status === "pending_review") return "Some songs need review.";
+  if (job.status === "cancelled") return "Render cancelled.";
+  if (/no space left|not enough disk space/i.test(jobErrorText(job))) return "Not enough disk space. Free some space and try again.";
+  if (job.status === "partial_failed") return "Some renders failed. See the report for details.";
+  return "Render failed. See the report for details.";
+}
+
+function jobReportText(job) {
+  return `ZuckerMixer report · ${job.id}\nStatus: ${job.status}\n${renderResultSummary(job)}\n` +
+    (job.batch_summary ? JSON.stringify(job.batch_summary, null, 2) + "\n" : "") +
+    jobErrorText(job);
+}
+
+async function copyJobReport(job, button) {
+  const report = jobReportText(job);
+  try {
+    await navigator.clipboard.writeText(report);
+  } catch (_error) {
+    const text = document.createElement("textarea");
+    text.value = report;
+    text.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+    document.body.appendChild(text);
+    text.select();
+    const copied = document.execCommand("copy");
+    text.remove();
+    if (!copied) {
+      const dialog = document.createElement("dialog");
+      const field = document.createElement("textarea");
+      field.value = report;
+      field.readOnly = true;
+      field.style.cssText = "width:70vw;height:50vh";
+      const close = document.createElement("button");
+      close.textContent = "Close";
+      close.onclick = () => { dialog.close(); dialog.remove(); };
+      dialog.append(field, close);
+      document.body.appendChild(dialog);
+      makeDialogDismissible(dialog, () => { dialog.close(); dialog.remove(); });
+      dialog.showModal();
+      field.select();
+      return;
+    }
+  }
+  button.textContent = "Copied";
+}
+
 async function ensureRenderPlans(songIds) {
   const missing = [];
   for (let index = 0; index < songIds.length; index += 1) {
@@ -2963,16 +3336,15 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
       });
     }
     const singleSong = songs.length === 1 ? songs[0] : null;
-    // Rendering must never start a new detection/mix-parameter analysis. Fine
-    // Tune and Analyze prepare that state explicitly; the worker receives the
-    // current snapshot below and either renders it or reports a visible error.
+    // Render preserves saved cuts and prepares any missing per-song analysis
+    // in its worker before mixing. It never redetects the session.
     const previewEffectiveMix = singleSong != null ? effectiveMixDump(singleSong, "before-render-click") : null;
     const renderTargetDir = await chooseRenderFolder();
     if (renderTargetDir === false) return;
     console.info("RENDER DESTINATION request_target", renderTargetDir);
     await prepareOverridesForRender();
-    // Render takes a light in-memory snapshot. It never waits for or starts
-    // Whisper, thresholds, full-stem analysis, or DSP-plan preparation.
+    // Preparation belongs to the worker, with visible progress; preserve all
+    // requested songs and the current saved mix controls.
     const overridesResponse = await fetch("/api/overrides");
     const overridesSnapshot = overridesResponse.ok
       ? await overridesResponse.json()
@@ -3001,7 +3373,7 @@ async function mixSongs(songs, useBatchMaster = true, isBatchAction = songs.leng
     await waitForRenderJob(jobId);
   } catch (error) {
     console.error("[render] failed", error);
-    const message = error.message || error;
+    const message = /no space left|not enough disk space/i.test(String(error.message || error)) ? "Not enough disk space. Free some space and try again." : "Render failed. See the report for details.";
     showToast(`Render failed: ${message}`);
     const status = document.querySelector("#currentWork");
     if (status) status.textContent = `Render failed: ${message}`;
@@ -3027,6 +3399,21 @@ function mixEverything() {
   mixSongs(songs, true, songs.length > 1, preflight);
 }
 
+async function startOptionalWhisperAnalysis() {
+  const response = await fetch("/api/redetect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ allow_whisper: true }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.id) {
+    showToast(data.error || "Could not start optional Whisper analysis.");
+    return;
+  }
+  setLoadingOverlayJob(data);
+  showToast("Optional Whisper analysis started.");
+  await pollJobs();
+}
 async function runSecondWhisperPass() {
   setCutLoading("Second Whisper pass", "Finding missing commentator presentations in suspicious intervals", 10);
   const response = await fetch("/api/redetect/second-pass", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
@@ -3049,22 +3436,20 @@ function showSecondPassCandidate(candidate) {
 
 function chooseMixSource() {
   const dialog = $("#mixChoiceDialog");
-  if (!dialog) return Promise.resolve(false);
+  if (!dialog) return Promise.resolve(null);
+  makeDialogDismissible(dialog);
   return new Promise((resolve) => {
-    const finish = (value) => {
-      dialog.close();
-      resolve(value);
-    };
-    $("#useAutomaticMixes").onclick = () => finish(false);
-    $("#useSavedMixes").onclick = () => finish(true);
-    dialog.addEventListener("cancel", () => resolve(null), { once: true });
+    let settled = false;
+    const finish = (value) => { if (settled) return; settled = true; resolve(value); };
+    $("#useAutomaticMixes").onclick = () => { finish(false); dialog.close(); };
+    $("#useSavedMixes").onclick = () => { finish(true); dialog.close(); };
+    dialog.addEventListener("close", () => finish(null), { once: true });
     dialog.showModal();
-    $("#useAutomaticMixes").focus();
   });
 }
 
 async function resetSongToAutomatic(songId) {
-  if (!confirm(`Clear saved overrides for Song ${songId} and use the current automatic mix?`)) return;
+  if (!await showConfirm(`Clear saved overrides for Song ${songId} and use the current automatic mix?`)) return;
   const response = await fetch(`/api/reset-automatic/${songId}`, { method: "POST" });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) return showToast(data.error || "Could not reset this song.");
@@ -3073,39 +3458,199 @@ async function resetSongToAutomatic(songId) {
 }
 
 
+
+  const LOADING_MESSAGE_CATALOG = {
+    preparing: [
+      "Opening the original session...", "Keeping every stem aligned...", "Waking the session clock...",
+      "Checking that the band arrived together...", "Unpacking the long take without losing the plot...",
+      "Finding the beginning before finding the songs...", "The tape is long; the coffee is longer...",
+      "Making sure nobody starts on the wrong bar...", "Reading the room before touching the faders...",
+      "Preparing the session map...", "Counting microphones, cables and suspicious silences...",
+      "The original recording is taking a deep breath...", "Setting the compass for a very long jam...",
+      "No song left behind...", "Loading the session with theatrical patience...",
+      "Getting the whole band on the same timeline..."
+    ],
+    scanning: [
+      "Checking the room mics...", "Reading the session clock...", "Looking for audio hiding in the folder...",
+      "Inspecting every stem, even the shy ones...", "Making sure the WAVs are really WAVs...",
+      "Counting channels before they count themselves...", "Checking which microphones actually contain music...",
+      "Scanning the long take from end to end...", "Listening for the first real downbeat...",
+      "Separating signal from cable philosophy...", "Looking for silence that means something...",
+      "Making friends with the external drive...", "Checking offsets so the band stays together...",
+      "The stems are lining up like a very patient choir...",
+      "Searching for the places where the presenter appears...",
+      "No folder left unexamined..."
+    ],
+    "analyzing stems": [
+      "Listening to the drummer...", "Comparing the parallel stems...", "Measuring who is actually playing...",
+      "Finding the musical signal inside the room tone...", "Checking the kick against the bass...",
+      "Looking for the snare's opinion...", "Comparing the two microphones fairly...",
+      "Finding which guitar is trying to run the meeting...", "Checking whether the piano brought too much furniture...",
+      "Listening for brass, flute and other plot twists...", "Measuring the quiet parts without calling them empty...",
+      "Separating musical dynamics from microphone noise...", "Finding the useful peaks...",
+      "Building a level map for the whole band...", "Checking the harmonic crowding...",
+      "The stems are introducing themselves one by one..."
+    ],
+    "reading cached envelopes": [
+      "Reusing the audio map...", "Reading cached activity envelopes...", "Opening yesterday's map without trusting ghosts...",
+      "Checking the saved timeline...", "Finding the quietest safe boundaries...",
+      "Reconstructing the session from its acoustic footprints...", "The cache remembers more than the presenter...",
+      "Reading the envelope trail...", "Comparing the new source signature...",
+      "Making sure this cache belongs to this folder...", "Looking for old cuts that still make sense...",
+      "Turning yesterday's measurements into today's decisions...",
+      "The waveform has left breadcrumbs...", "Checking the cache before doing the long work again...",
+      "Recovering the session's musical geography...", "No stale snapshot gets to run the show..."
+    ],
+    "transcribing speech": [
+      "Listening to the commentator...", "Waiting for the transcript...", "Finding the introductions between the songs...",
+      "Separating presenter from trumpet...", "Reading the stage announcements...", "Looking for names, titles and useful clues...",
+      "Whisper is listening carefully...", "Checking whether this voice starts the next slot...",
+      "Turning speech into song boundaries...", "The microphone is telling us what comes next...",
+      "Finding the human hand in the long recording...", "Checking the presenter against the instruments...",
+      "Not every word is a cut, but every cut needs a reason...",
+      "Listening for the announcement that unlocks the next song...",
+      "Speech first, panic never...", "The presenter is acting as the session's chapter titles..."
+    ],
+    "detecting songs": [
+      "Finding where the MC talks...", "Looking for the next song...", "Following the presenter-led slots...",
+      "Marking beginnings without cutting through music...", "Counting musical chapters...",
+      "Finding the gap that is actually a beginning...", "Checking whether this is one song or two...",
+      "Building the song list from the whole session...", "Protecting the middle of every performance...",
+      "Looking for a clean hand-off...", "The set is becoming a tracklist...",
+      "Finding the next real entrance...", "Separating silence, introduction and music...",
+      "Checking the expected song count without forcing it...",
+      "One boundary at a time...", "The jam is finally giving up its structure..."
+    ],
+    "merging song boundaries": [
+      "Merging boundaries without losing songs...", "Joining evidence from voice and instruments...",
+      "Resolving two timestamps that both think they are right...", "Keeping the safest cut...",
+      "Comparing adjacent candidates...", "Making the timeline agree with itself...",
+      "Checking that no song is swallowed by a merge...", "The boundaries are negotiating...",
+      "Protecting introductions at the front of each slot...", "Removing duplicate cuts, not real songs...",
+      "Looking for the cleanest shared boundary across all stems...",
+      "The timeline is folding itself neatly...", "No musical phrase gets chopped for administrative reasons...",
+      "Merging clues, preserving performances...", "Almost a tracklist...", "Making the final decision at the quiet point..."
+    ],
+    "validating cuts": [
+      "Checking the proposed boundaries...", "Preparing the cuts for review...", "Making sure no instrument is mid-phrase...",
+      "Checking every stem at the edge...", "Confirming the presenter belongs to the next song...",
+      "Testing the boundary against the full session...", "Looking for active instruments at the cut...",
+      "Keeping unsafe cuts visible instead of hiding them...", "Checking duration and musical continuity...",
+      "The cut gate is asking difficult questions...", "No silent drummer gets blamed...",
+      "Verifying that every slot shares the same timeline...", "Checking the first seconds of every song...",
+      "A good cut sounds inevitable...", "Reviewing the edges before rendering...", "The scissors are staying polite..."
+    ],
+    mixing: [
+      "Balancing the band...", "Giving every stem its place...", "Letting the kick lead without swallowing the bass...",
+      "Finding space for the two microphones...", "Taming the guitar before it calls the police...",
+      "Keeping the piano below the vocal spotlight...", "Matching the flute to the trumpet...",
+      "Putting the overheads in the room...", "Checking that quiet tracks are musical, not noisy...",
+      "Building the mix from the rhythm section upward...", "Making room for the voice...",
+      "Keeping the bass present without making mud...", "Finding the song's natural center...",
+      "The faders are having a serious conversation...", "Balancing tone, level and space...",
+      "This is the part where the band becomes a record..."
+    ],
+    mastering: [
+      "Polishing the final bounce...", "Keeping the kick as the peak without clipping...",
+      "Checking loudness and headroom...", "Making the master travel well...",
+      "Preserving the dynamics while controlling the edges...", "Checking the true peak ceiling...",
+      "Keeping the room around the instruments...", "Making sure the master breathes...",
+      "Comparing loudness without flattening the song...", "Finishing the mix with a light touch...",
+      "Checking the low end one last time...", "Making the vocal survive small speakers...",
+      "The final polish is almost dry...", "Mastering, not repainting the whole house...",
+      "Checking that the reverb did not move into the foreground...", "One last pass over the stereo image..."
+    ],
+    encoding: [
+      "Packing the mix for listening...", "Putting the finishing label on it...", "Writing the MP3 without losing the master...",
+      "Checking that the export decodes cleanly...", "Turning the finished song into a portable record...",
+      "Keeping the metadata tidy...", "Making the file easy to find later...",
+      "Checking the final duration...", "Writing the audio at full quality...",
+      "The song is leaving the studio...", "Verifying the last bytes...",
+      "Making a copy that the player will actually understand...",
+      "Almost ready for the headphones...", "Exporting the finished chapter...",
+      "The mix is getting its passport...", "Final file, final check..."
+    ],
+    loading: [
+      "Warming up the tape machine...", "Finding the exact waveform...", "Opening the selected slot...",
+      "Drawing the session at a useful scale...", "Preparing the playhead...",
+      "Making the waveform large enough to see...", "Loading the audio without moving the cut...",
+      "Finding the exact point under the cursor...", "The waveform is stretching its legs...",
+      "Checking the selected song...", "Preparing playback and navigation...",
+      "Keeping the editor responsive...", "One slot, all stems, one timeline...",
+      "Loading the part you actually asked to hear...", "The waveform is nearly on stage...",
+      "Getting ready for a precise cut..."
+    ],
+    cancelling: [
+      "Stopping the worker safely...", "Closing the session without leaving ghosts...",
+      "Asking every process to come back from the coffee break...", "Releasing the audio files...",
+      "Putting the faders down gently...", "Stopping the render queue...",
+      "Closing the loading screen after the worker confirms...", "Cleaning up temporary files...",
+      "Cancelling without touching your saved cuts...", "The band is packing up...",
+      "Waiting for the last process to leave the stage...", "Returning to the start screen...",
+      "No render will be left running backstage...", "Finishing the cancellation safely...",
+      "The session is stopping, not crashing...", "Almost back to the main screen..."
+    ],
+    fallback: [
+      "Keeping the session moving...", "The band is still tuning...", "Checking one more thing...",
+      "Working through the long take...", "The audio map is thinking...", "Patience, but with diagnostics...",
+      "Making progress behind the curtain...", "The next useful detail is on its way...",
+      "No panic: the worker is still alive...", "Counting carefully...", "Listening before deciding...",
+      "The session is larger than it looks...", "One careful step at a time...", "Still working on the good version...",
+      "The machine is thinking in bars...", "Almost a useful answer..."
+    ]
+  };
+
+  function loadingMessagesForState(state) {
+    const value = state || {};
+    const stage = String(value.current_stage || value.stage || value.detail || "").toLowerCase();
+    const song = Number(value.current || value.current_song || value.song_index || 0);
+    const total = Number(value.total_count || value.total || value.song_count || 0);
+    let key = Object.keys(LOADING_MESSAGE_CATALOG).find((name) => name !== "fallback" && stage.includes(name));
+    if (!key && String(value.status || "").toLowerCase() === "stopping") key = "cancelling";
+    if (!key && value.kind === "cut") key = "loading";
+    const base = LOADING_MESSAGE_CATALOG[key || "fallback"];
+    const prefix = song > 0 && total > 0 ? `Song ${song}/${total}: ` : "";
+    const contextual = base.map((message) => prefix + message);
+    if (stage.includes("transcrib") && value.allow_whisper === false) {
+      return [
+        "Whisper is optional here; using the acoustic timeline...",
+        "No presenter transcript required for this pass...",
+        "Checking song boundaries without waiting for Whisper...",
+        "The stems are providing the structure...",
+        "Using the session's musical evidence first..."
+      ];
+    }
+    return contextual;
+  }
+
 function renderLoadingOverlay() {
   const overlay = $("#loadingOverlay");
   if (!overlay) return;
-  // Edit Cuts owns the foreground while its dialog is open. A background\n  // Whisper/render job must not cover or block waveform editing.\n  const cutEditorOpen = Boolean(document.querySelector("#cutSelectorDialog[open]"));\n  const state = cutEditorOpen ? loadingOverlayCut : (loadingOverlayCut || loadingOverlayJob);
-  const busy = Boolean(state);
+  // Edit Cuts owns the foreground while its dialog is open. A background
+  // Whisper/render job must not cover or block waveform editing.
+  const cutEditorOpen = Boolean(document.querySelector("#cutSelectorDialog[open]"));
+  const state = cutEditorOpen ? loadingOverlayCut : (loadingOverlayCut || loadingOverlayJob);
+  const busy = Boolean(state) && !suppressLoadingOverlay;
   overlay.hidden = !busy;
   document.body.classList.toggle("loading-mode", busy);
-  if (!busy) return;
+  const video = $("#loadingStageVideo");
+  if (!busy) {
+    if (window.renderListening?.isPlaying()) window.renderListening.pause();
+    video?.pause();
+    return;
+  }
+  if (video?.paused) video.play().catch(() => {});
   const stage = String(state.current_stage || state.stage || "").toLowerCase();
   const isRenderTask = ["render", "mix"].includes(String(state.kind || "").toLowerCase());
   const title = state.kind === "cut" ? (state.label || "Loading editor") :
-    (state.status === "stopping" ? "Finishing the current task..." :
+    (state.status === "stopping" ? "Canceling…" :
       stage.includes("preparing") || stage === "waiting" ? "Preparing the session..." :
       stage.includes("redetect") || stage.includes("detecting") ? "Finding songs..." : "Working...");
   const detail = state.detail || state.stage_detail || "Please wait...";
   const progress = Number(state.kind === "redetect" ? state.progress : (state.progress ?? state.song_progress ?? 0));
   const renderProgress = Number(state.process_progress ?? state.song_progress ?? 0);
-  const messages = {
-    preparing: ["Opening the original session...", "Keeping every stem aligned..."],
-    scanning: ["Checking the room mics...", "Reading the session clock..."],
-    "analyzing stems": ["Listening to the drummer...", "Comparing the parallel stems..."],
-    "reading cached envelopes": ["Reusing the audio map...", "Reading cached activity envelopes..."],
-    "transcribing speech": ["Listening to the commentator...", "Waiting for Whisper's transcript..."],
-    "detecting songs": ["Finding where the MC talks...", "Looking for the next song..."],
-    "validating cuts": ["Checking the proposed boundaries...", "Preparing the cuts for review..."],
-    mixing: ["Balancing the band...", "Giving every stem its place..."],
-    mastering: ["Making it loud enough for the bar...", "Polishing the final bounce..."],
-    encoding: ["Packing the mix for listening...", "Putting the finishing label on it..."],
-    loading: ["Warming up the tape machine...", "Finding the exact waveform..."],
-  };
-  const messageKey = Object.keys(messages).find((key) => stage.includes(key));
-  const choices = messages[messageKey] || (state.kind === "cut" ? messages.loading : ["Keeping the session moving...", "The band is still tuning..."]);
-  const fun = choices[Math.floor(Date.now() / 5000) % choices.length];
+  const choices = loadingMessagesForState(state);
+  const fun = state.kind === "cut" ? "" : choices[Math.floor(Date.now() / 5000) % choices.length];
   const safeProgress = Math.max(0, Math.min(100, Number.isFinite(progress) ? progress : 0));
   const safeRenderProgress = Math.max(0, Math.min(100, Number.isFinite(renderProgress) ? renderProgress : 0));
   const titleNode = $("#loadingOverlayTitle");
@@ -3122,8 +3667,20 @@ function renderLoadingOverlay() {
   const activityAge = $("#loadingActivityAge");
   const health = $("#loadingOverlayHealth");
   const songStates = $("#loadingSongStates");
+  const cancelNode = $("#cancelLoadingWork");
+  const versionNode = $("#loadingOverlayVersion");
+  const cancellable = state.kind !== "cut" && ["queued", "running", "stopping"].includes(String(state.status || ""));
+  if (cancelNode) {
+    cancelNode.hidden = !cancellable;
+    cancelNode.disabled = String(state.status || "") === "stopping";
+    cancelNode.textContent = String(state.status || "") === "stopping" ? "Canceling…" : "Cancel loading";
+  }
   if (titleNode) titleNode.textContent = title;
   if (detailNode) detailNode.textContent = detail;
+  if (versionNode) {
+    const build = appState?.build || {};
+    versionNode.textContent = build.app_version ? `ZuckerMixer ${build.app_version}` : "";
+  }
   if (timingNode) {
     const elapsed = Number(state.elapsed_seconds || 0);
     const eta = Number(state.eta_seconds || 0);
@@ -3132,8 +3689,9 @@ function renderLoadingOverlay() {
     timingNode.innerHTML = `<span>${esc(elapsedText)}</span><span>${esc(etaText)}</span>`;
   }
   if (funNode) funNode.textContent = fun;
+  if (fillNode) fillNode.classList.toggle("progress-indeterminate", Boolean(state.indeterminate));
   if (fillNode) fillNode.style.width = String(safeProgress) + "%";
-  if (percentNode) percentNode.textContent = String(Math.round(safeProgress)) + "%";
+  if (percentNode) percentNode.textContent = state.indeterminate ? "Working…" : String(Math.round(safeProgress)) + "%";
   const showProcessRow = state.kind !== "cut";
   if (renderRow) renderRow.hidden = !showProcessRow;
   if (renderLabel && showProcessRow) {
@@ -3161,7 +3719,7 @@ function renderLoadingOverlay() {
   }
   if (renderFill) renderFill.style.width = String(safeRenderProgress) + "%";
   if (renderPercent) renderPercent.textContent = String(Math.round(safeRenderProgress)) + "%";
-  const phases = [
+  const phases = isRenderTask ? [["prepare", "Check saved cuts"], ["analyze", "Prepare this song’s mix"], ["mix", "Mix audio blocks"], ["master", "Master"], ["encode", "Encode MP3"], ["save", "Save result"]] : state.kind === "cut" ? [["edit", state.label || "Edit Cuts"]] : [
     ["prepare", "Prepare original session"],
     ["scan", "Scan WAV stems"],
     ["cache", "Read audio envelopes"],
@@ -3170,7 +3728,7 @@ function renderLoadingOverlay() {
     ["merge", "Merge song boundaries"],
     ["review", "Prepare cuts"],
   ];
-  const phaseIndex = Number.isFinite(Number(state.phase_index)) ? Number(state.phase_index) : (
+  const phaseIndex = state.kind === "cut" ? 0 : isRenderTask ? (stage.includes("analyz") ? 1 : stage.includes("mix") ? 2 : stage.includes("master") ? 3 : stage.includes("encod") ? 4 : stage.includes("finish") ? 5 : 0) : Number.isFinite(Number(state.phase_index)) ? Number(state.phase_index) : (
     stage.includes("prepar") || stage === "waiting" ? 0 :
     stage.includes("scanning") ? 1 :
     stage.includes("cached") || stage.includes("envelope") ? 2 :
@@ -3195,29 +3753,40 @@ function renderLoadingOverlay() {
     const queueRows = requested.length
       ? requested.map((number, index) => {
         const numericNumber = Number(number);
-        const summary = summaryByNumber.get(numericNumber);
-        if (summary) return { ...summary, song: number };
-        const isCurrent = numericNumber === Number(state.current);
+        const displayNumber = appState.songs.find(song => Number(song.id) === numericNumber)?.display_number ?? numericNumber;
+        const summary = summaryByNumber.get(Number(displayNumber));
+        if (summary) return { ...summary, song: displayNumber };
+        const isCurrent = numericNumber === Number(state.current_segment_id ?? state.current);
         const isDone = !isCurrent && index < Number(state.done_count || 0);
         return {
-          song: number,
+          song: displayNumber,
           status: isCurrent ? "working" : isDone ? "done" : "queued",
           detail: isCurrent ? "working" : isDone ? "done" : "queued",
         };
       })
       : summaryRows;
     if (queueRows.length) {
-      songStates.innerHTML = queueRows.map((row) => {
+      songStates.innerHTML = queueRows.map((row, rowIndex) => {
         const number = row.song ?? row.index ?? row.id ?? "?";
-        const status = String(row.status || row.state || "queued").toLowerCase();
+        const reportedStatus = String(row.status || row.state || "queued").toLowerCase();
+        const explicitFinished = ["done", "completed", "rendered", "written", "mp3_written", "finished"].includes(reportedStatus);
+        const inferredFinished = !explicitFinished
+          && !reportedStatus.includes("fail")
+          && !reportedStatus.includes("error")
+          && Number(rowIndex) < Number(state.done_count || 0)
+          && Number(number) !== Number(state.current);
+        const finished = explicitFinished || inferredFinished;
+        const status = finished ? "done" : reportedStatus;
         const cls = status.includes("fail") || status.includes("error")
           ? "error"
-          : status === "done" || status === "completed"
+          : finished
             ? "done"
             : Number(number) === Number(state.current)
               ? "active"
               : "";
-        return `<div class="loading-song-state ${cls}"><span>Song ${String(number).padStart(2, "0")}</span><span>${esc(row.detail || row.status || row.state || "queued")}</span></div>`;
+        const mark = finished ? "✓" : status.includes("fail") || status.includes("error") ? "!" : status === "working" || Number(number) === Number(state.current) ? "●" : "○";
+        const detail = finished ? "done" : (row.detail || row.status || row.state || "queued");
+        return `<div class="loading-song-state ${cls}" data-song-status="${esc(status)}" data-song-index="${esc(number)}"><span class="loading-song-label"><span class="loading-song-check" aria-hidden="true">${mark}</span> Song ${String(number).padStart(2, "0")}</span><span>${esc(detail)}</span></div>`;
       }).join("");
     } else {
       const facts = [
@@ -3229,6 +3798,7 @@ function renderLoadingOverlay() {
       songStates.innerHTML = facts.length ? `<div class="loading-song-state"><span>Detection status</span><span>${esc(facts.join(" · "))}</span></div>` : "";
     }
   }
+  window.renderListening?.sync();
   const lastUpdate = Number(state.progress_updated_at || state.heartbeat || state.updated_at || 0) * 1000;
   const age = lastUpdate ? Math.max(0, Math.floor((Date.now() - lastUpdate) / 1000)) : 0;
   if (activityAge) activityAge.textContent = age ? `updated ${age}s ago` : "updating now";
@@ -3242,6 +3812,7 @@ function renderLoadingOverlay() {
 }
 
 function setLoadingOverlayJob(job) {
+  if (job && String(job.id) !== String(loadingOverlayJob?.id)) suppressLoadingOverlay = false;
   loadingOverlayJob = job || null;
   renderLoadingOverlay();
 }
@@ -3253,9 +3824,23 @@ function renderJobs(items) {
   // than a running one (for example after a double click); showing its 0%
   // status made the live analysis bar appear frozen even while the worker
   // was reporting real progress.
-  const active = [...items].reverse().find((job) => ["running", "stopping"].includes(job.status))
-    || [...items].reverse().find((job) => job.status === "queued");
-  setLoadingOverlayJob(active);
+  const currentSource = loadingOverlayJob?.source_folder || appState?.source_folder || appState?.settings?.source_folder;
+  const sourceItems = items.filter((job) => !job.source_folder || !currentSource || job.source_folder === currentSource);
+  const requestedJob = loadingOverlayJob && sourceItems.find((job) => String(job.id) === String(loadingOverlayJob.id));
+  const active = (requestedJob && ["queued", "running", "stopping"].includes(requestedJob.status) ? requestedJob : null) || [...sourceItems].reverse().find((job) => ["running", "stopping"].includes(job.status))
+    || [...sourceItems].reverse().find((job) => job.status === "queued");
+  // Keep the job received from /api/state through the first polling race.
+  // Clear it only when the same job is observed terminal, never merely
+  // because /api/jobs returned an incomplete snapshot for a moment.
+  const trackedOverlay = loadingOverlayJob && items.find((job) => String(job.id) === String(loadingOverlayJob.id));
+  const overlayLive = loadingOverlayJob && ["queued", "running", "stopping"].includes(String(loadingOverlayJob.status || ""));
+  if (active && !suppressLoadingOverlay) {
+    setLoadingOverlayJob(active);
+  } else if (!suppressLoadingOverlay && trackedOverlay && !["queued", "running", "stopping"].includes(String(trackedOverlay.status || ""))) {
+    setLoadingOverlayJob(null);
+  } else if (!suppressLoadingOverlay && !overlayLive) {
+    setLoadingOverlayJob(null);
+  }
   const activeRender = active && ["render", "mix"].includes(active.kind) ? active : null;
   if (!renderInProgress && activeRender) {
     activeRenderJobId = activeRender.id;
@@ -3263,7 +3848,7 @@ function renderJobs(items) {
   }
   const redetectButton = $("#redetectSongs");
   if (redetectButton) {
-    redetectButton.disabled = items.some((job) => job.kind === "redetect" && ["queued", "running", "stopping"].includes(job.status));
+    redetectButton.disabled = sourceItems.some((job) => job.kind === "redetect" && ["queued", "running", "stopping"].includes(job.status));
   }
   const loading = $("#loadingStatus");
   const loadingFill = $("#loadingProgressFill");
@@ -3282,9 +3867,10 @@ function renderJobs(items) {
   }
   $(".progress-box").classList.toggle("working", Boolean(active));
   if (active) {
+    $(".progress-box").classList.remove("success", "warning");
     const current = active.current_item || (active.current ? `Song ${String(active.current).padStart(2, "0")}` : "Waiting");
     const stage = active.current_stage ? ` · ${active.current_stage}` : "";
-    $("#currentWork").textContent = active.status === "stopping" ? "Stopping after this song" : `${current}${stage}`;
+    $("#currentWork").textContent = active.status === "stopping" ? "Canceling…" : `${current}${stage}`;
     const total = active.total_count || active.songs.length;
     const position = active.current ? (active.done_count || 0) + 1 : (active.done_count || 0);
     const elapsed = shortElapsed(active.started);
@@ -3305,16 +3891,8 @@ function renderJobs(items) {
       : "";
     $("#queuePosition").textContent = `${detail}${reviewDetail}${blockedDetail}${reasonDetail} · PID ${workerPid} · ${position} of ${total} · ${active.song_progress || 0}% · ${elapsed || "0:00"} elapsed · ${formatRemaining(active.eta_seconds)}${memoryText}${stallText}`;
     $("#progressFill").style.width = `${active.song_progress || 0}%`;
-    const messages = {
-      scanning: ["Checking the room mics...", "Reading the session clock..."],
-      "analyzing stems": ["Listening to the drummer...", "Counting the groove..."],
-      "detecting songs": ["Finding where the MC talks...", "Looking for the next song..."],
-      mixing: ["Balancing the band...", "Giving every stem its place..."],
-      mastering: ["Making it loud enough for the bar...", "Polishing the final bounce..."],
-      encoding: ["Packing the mix for listening...", "Putting the finishing label on it..."],
-    };
     const fun = $("#progressFun");
-    const choices = messages[String(active.current_stage || "").toLowerCase()] || ["Keeping the session moving..."];
+    const choices = loadingMessagesForState(active);
     if (fun) fun.textContent = choices[Math.floor(Date.now() / 5000) % choices.length];
     const stall = $("#progressStall");
     const updated = Number(active.progress_updated_at || active.heartbeat || Date.now() / 1000) * 1000;
@@ -3324,15 +3902,16 @@ function renderJobs(items) {
       stall.textContent = stale ? `No worker event for ${Math.floor((Date.now() - updated) / 1000)}s — stage: ${active.current_stage || "unknown"}; last event: ${active.last_event || active.stage_detail || "unknown"}. Cancel if it does not resume.` : "";
     }
   } else {
-    const terminal = [...items].reverse().find((job) => ["pending_confirmation", "pending_review", "partial_failed", "error", "cancelled"].includes(job.status));
-    const terminalError = terminal ? jobErrorText(terminal) : "";
+    const terminal = [...sourceItems].reverse().find((job) => ["done", "pending_confirmation", "pending_review", "partial_failed", "error", "cancelled"].includes(job.status));
+    $(".progress-box").classList.toggle("success", terminal?.status === "done");
+    $(".progress-box").classList.toggle("warning", Boolean(terminal && ["error", "partial_failed", "pending_review"].includes(terminal.status)));
+    $("#currentWork").textContent = renderResultSummary(terminal);
+    $("#queuePosition").textContent = "";
     if (terminal) {
-      const label = terminal.status === "pending_confirmation" ? "Re-detect ready for confirmation" : terminal.status === "pending_review" ? "Pending review" : terminal.status === "partial_failed" ? "Render partially failed" : terminal.status === "cancelled" ? "Render cancelled" : "Render failed";
-      $("#currentWork").textContent = `${label} · ${terminal.id}`;
-      $("#queuePosition").textContent = `${terminalError || terminal.stage_detail || "see job details"} · PID ${terminal.child_pid || terminal.pid || terminal.launch_pid || "unknown"}`;
-    } else {
-      $("#currentWork").textContent = "Ready";
-      $("#queuePosition").textContent = "Ready";
+      const copy = document.createElement("button");
+      copy.textContent = "Copy report";
+      copy.onclick = () => copyJobReport(terminal, copy);
+      $("#queuePosition").appendChild(copy);
     }
     $("#progressFill").style.width = "0%";
     $("#progressFun").textContent = "";
@@ -3342,27 +3921,18 @@ function renderJobs(items) {
     const el = document.createElement("div");
     el.className = `job ${["error", "partial_failed"].includes(job.status) ? "error" : ""}`;
     const fullError = jobErrorText(job);
-    const errorText = fullError ? `<pre class="copyable-error">${esc(fullError)}</pre><button class="copy-error" data-copy-error="${esc(job.id)}">Copy error</button>` : "";
+    const errorText = `<button class="copy-error" data-copy-error="${esc(job.id)}">Copy report</button>`;
     el.innerHTML = `
       <div>
         <strong>${friendlyStatus(job)}</strong>
         <p>${job.current ? `Song ${String(job.current).padStart(2, "0")}` : `${job.songs.length} songs`}${job.current_stage ? ` · ${job.current_stage}` : ""}</p>
         ${errorText}
-        <small>PID ${job.child_pid || job.pid || job.launch_pid || "—"}${job.exit_code != null ? ` · exit ${job.exit_code}` : ""}${job.termination ? ` · ${esc(job.termination)}` : ""}</small>
       </div>
       <span>${job.progress || 0}%</span>
     `;
     box.appendChild(el);
     const copyButton = el.querySelector("[data-copy-error]");
-    if (copyButton) copyButton.addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(fullError);
-        copyButton.textContent = "Copied";
-      } catch (_err) {
-        showToast("Could not copy the error text.");
-      }
-    });
-    if (["error", "partial_failed"].includes(job.status)) showToast(`${friendlyStatus(job)} — see details`);
+    if (copyButton) copyButton.addEventListener("click", () => copyJobReport(job, copyButton));
   });
 }
 
@@ -3377,9 +3947,108 @@ function friendlyStatus(job) {
   return "Finished";
 }
 
-async function pollJobs() {
+function hideLoadingOverlayImmediately() {
+  loadingOverlayJob = null;
+  loadingOverlayCut = null;
+  const video = $("#loadingStageVideo");
+  if (video) {
+    video.pause();
+    video.currentTime = 0;
+  }
+  const fallback = $("#loadingStageFallback");
+  if (fallback) fallback.hidden = true;
+  const overlay = $("#loadingOverlay");
+  if (overlay) overlay.hidden = true;
+  document.body.classList.remove("loading-mode");
+  const loading = $("#loadingStatus");
+  if (loading) loading.hidden = true;
+  renderLoadingOverlay();
+}
+
+let cancellationUiPending = false;
+async function cancelActiveWork() {
+  if (!await showConfirm("Are you sure you want to cancel all active work?")) return;
+  const buttons = [$("#cancelLoadingWork"), $("#cancelJob")].filter(Boolean);
+  buttons.forEach((button) => {
+    button.disabled = true;
+    button.textContent = "Canceling…";
+  });
+  cancellationUiPending = true;
+  window.renderListening?.pause();
+  if (loadingOverlayJob) loadingOverlayJob = { ...loadingOverlayJob, status: "stopping", current_stage: "cancelling", stage_detail: "Stopping active processes…" };
+  renderLoadingOverlay();
+  showToast("Canceling… stopping the active processes.");
+  setRenderControlsBusy(true);
+
+  const finishCancellationUi = async (message) => {
+    cancellationUiPending = false;
+    const cutDialog = $("#cutSelectorDialog");
+    if (cutDialog?.open) cutDialog.close("cancel");
+    cutSelector = null;
+    hideLoadingOverlayImmediately();
+    setRenderControlsBusy(false);
+    buttons.forEach((button) => {
+      button.disabled = false;
+      if (button.id === "cancelLoadingWork") button.textContent = "Cancel loading";
+      if (button.id === "cancelJob") button.textContent = "Cancel";
+    });
+    if (message) showToast(message);
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    let response;
+    try {
+      response = await fetch("/api/cancel", { method: "POST", signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.error || "Could not cancel the active work.");
+    }
+  } catch (error) {
+    cancellationUiPending = false;
+    buttons.forEach(button => { button.disabled = false; button.textContent = "Retry cancel"; });
+    showToast(error.name === "AbortError" ? "Could not confirm cancellation yet. Retry cancel." : (error.message || String(error)));
+    return;
+  }
+
+  // Do not make the browser wait for ffmpeg/Whisper. Poll in the background
+  // and restore the normal page only after the backend reports a terminal job.
+  void (async () => {
+    let terminal = false;
+    while (cancellationUiPending) {
+      try {
+        const jobs = await pollJobs();
+        if (!jobs.some((job) => ["queued", "running", "stopping"].includes(String(job.status || "")))) {
+          terminal = true;
+          break;
+        }
+      } catch (_error) {
+        // The cancellation request was acknowledged. A temporary poll error
+        // must not reopen the loading screen or freeze the controls.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+    if (terminal) {
+      await finishCancellationUi("All active work was cancelled. Ready.");
+      await refreshState({ renderLarge: true }).catch(() => {});
+    } else {
+      showToast("Canceling… waiting for process cleanup. Keep this window open or close the application to stop it.");
+    }
+  })();
+}
+let jobsPollPromise = null;
+function pollJobs() {
+  if (!jobsPollPromise) jobsPollPromise = pollJobsOnce().finally(() => { jobsPollPromise = null; });
+  return jobsPollPromise;
+}
+
+async function pollJobsOnce() {
   const res = await fetch("/api/jobs");
-  const jobs = await res.json();
+  const jobs = (await res.json()).map(job => cancellationUiPending && ["queued", "running", "stopping"].includes(job.status) ? {...job, status: "stopping", current_stage: "cancelling", stage_detail: "Stopping active processes…"} : job);
   console.log("[jobs poll]", jobs.map((job) => ({
     id: job.id,
     status: job.status,
@@ -3405,9 +4074,7 @@ async function pollJobs() {
     // Keep the historical terminal set visible for compatibility: if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status))
     // pending_review is an additional successful-but-incomplete terminal state.
     if (tracked && ["done", "partial_failed", "error", "cancelled"].includes(tracked.status) || tracked && tracked.status === "pending_review") {
-      const terminalMessage = tracked.status === "error" || tracked.status === "partial_failed"
-        ? `Render failed: ${tracked.error || "see job details"}`
-        : tracked.status === "pending_review" ? `Rendered approved songs. Pending review: ${tracked.needs_review_songs?.join(", ") || "see details"}.` : tracked.status === "cancelled" ? "Render cancelled." : "Render completed.";
+      const terminalMessage = renderResultSummary(tracked);
       activeRenderJobId = null;
       setRenderControlsBusy(false);
       if (!["done"].includes(tracked.status)) showToast(terminalMessage);
@@ -3415,6 +4082,7 @@ async function pollJobs() {
   }
   appState.jobs = jobs;
   renderJobs(jobs);
+  window.renderListening?.poll(appState.source_folder).catch(error => console.warn("[render previews]", error));
   Object.entries(realPreviewJobs).forEach(([songId, jobId]) => {
     const job = jobs.find((item) => item.id === jobId);
     if (!job) return;
@@ -3451,49 +4119,80 @@ async function pollLogs() {
 async function reviewRedetectCandidate(job) {
   if (!job || redetectPromptedJobId === job.id) return;
   redetectPromptedJobId = job.id;
-  const response = await fetch("/api/redetect/candidate");
+  const response = await fetch(`/api/redetect/candidate?job_id=${encodeURIComponent(job.id)}`);
   const candidate = await response.json().catch(() => ({}));
   if (!candidate.available) return;
   const warning = candidate.warning ? `\nWARNING: ${candidate.warning}` : "";
-  const approve = window.confirm(`Re-detect finished on the complete original session.\n\nCurrent slots: ${candidate.old_count}\nCandidate slots: ${candidate.new_count}\nOriginal stems: ${candidate.source_stem_count || "?"}\nSource duration: ${cutTime(candidate.source_duration_sec || 0)}${warning}\n\nReplace the current list only if this comparison is correct?\nCancel keeps all current and manual cuts.`);
-  const endpoint = approve ? "/api/redetect/commit" : "/api/redetect/discard";
-  const result = await fetch(endpoint, { method: "POST" }).then((r) => r.json().catch(() => ({})));
-  if (!approve) { showToast("Re-detect cancelled; current slots and manual cuts preserved."); return; }
+  const approve = await showConfirm(`Re-detect finished on the complete original session.\n\nCurrent slots: ${candidate.old_count}\nCandidate slots: ${candidate.new_count}\nOriginal stems: ${candidate.source_stem_count || "?"}\nSource duration: ${cutTime(candidate.source_duration_sec || 0)}${warning}\n\nReplace the current list only if this comparison is correct?\nCancel keeps all current and manual cuts.`);
+  if (!approve) { showToast("Comparison closed; current cuts and the detection proposal are preserved."); return; }
+  const endpoint = "/api/redetect/commit";
+  const result = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.id }) }).then((r) => r.json().catch(() => ({})));
   if (!result.ok) return showToast(result.error || "Could not replace the current slot list.");
   await refreshState({ renderLarge: true });
   showToast(`Re-detect confirmed: ${result.count} slots loaded.`);
 }
 
+let toastTimer = null;
 function showToast(text) {
   const toast = $("#toast");
-  toast.textContent = text;
+  clearTimeout(toastTimer);
+  toast.replaceChildren();
+  const message = document.createElement("span"); message.textContent = text;
+  const close = document.createElement("button"); close.type = "button"; close.textContent = "X"; close.setAttribute("aria-label", "Close message");
+  close.onclick = () => toast.classList.remove("show");
+  toast.append(message, close);
   toast.classList.add("show");
-  setTimeout(() => toast.classList.remove("show"), 6000);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 6000);
 }
 
 async function pollingLoop() {
   if (document.visibilityState === "visible") {
+    try {
     await pollLogs();
-    const jobs = await pollJobs();
-    const pendingRedetect = [...(jobs || [])].reverse().find((job) => job.kind === "redetect" && job.status === "pending_confirmation");
+    const jobs = appState?.jobs || [];
+    const pendingRedetect = [...(jobs || [])].reverse().find((job) => job.kind === "redetect" && job.status === "pending_confirmation" && job.source_folder === appState?.source_folder);
     if (pendingRedetect) await reviewRedetectCandidate(pendingRedetect);
     const active = (jobs || []).some((job) => ["queued", "running", "stopping"].includes(job.status));
     await refreshState({ renderLarge: !active });
-    setTimeout(pollingLoop, active ? 3000 : 5000);
+    setTimeout(pollingLoop, active ? 5000 : 15000);
+    } catch (error) { console.warn("[state poll failed]", error); setTimeout(pollingLoop, 5000); }
   } else {
     setTimeout(pollingLoop, 6000);
   }
 }
 
+function setupLoadingMedia() {
+  const video = $("#loadingStageVideo");
+  const fallback = $("#loadingStageFallback");
+  if (!video || !fallback) return;
+  const showFallback = () => { video.hidden = true; if (!fallback.src) fallback.src = fallback.dataset.src; fallback.hidden = false; };
+  const showVideo = () => { video.hidden = false; fallback.hidden = true; };
+  video.addEventListener("loadeddata", showVideo);
+  video.addEventListener("canplay", showVideo);
+  video.addEventListener("error", showFallback);
+
+  if (video.readyState >= 2) showVideo();
+}
+
 if (typeof document !== "undefined") {
+  setupLoadingMedia();
+  setupDismissControls();
+  $("#selectAllSongs")?.addEventListener("click", () => {
+    const available = visibleSongs(); const allSelected = available.length > 0 && available.every(song => checkedSongs.has(song.id));
+    checkedSongs = allSelected ? new Set() : new Set(available.map(song => song.id));
+    document.querySelectorAll(".song-card[data-song-id]").forEach(card => {
+      const checkbox = card.querySelector(".song-main > input[type=checkbox]");
+      if (checkbox) checkbox.checked = checkedSongs.has(Number(card.dataset.songId));
+    });
+    $("#selectAllSongs").textContent = allSelected ? "Select all" : "Deselect all";
+    updateSelectedButton();
+  });
   $("#mixSelected").addEventListener("click", () => mixSongs([...checkedSongs], true, true).catch((error) => showToast(`Render failed: ${error.message || error}`)));
   $("#mixAll").addEventListener("click", () => mixEverything());
   $("#editAllCuts").addEventListener("click", () => editAllCuts().catch((error) => { setCutLoading("Error", error.message || String(error)); showToast(error.message || String(error)); }));
-  $("#secondWhisperPass").addEventListener("click", () => runSecondWhisperPass().catch((error) => { setCutLoading("Error", error.message || String(error), 100); showToast(error.message || String(error)); }));
-  $("#cancelJob").addEventListener("click", () => {
-    if (!window.confirm("Are you sure you want to cancel?")) return;
-    fetch("/api/cancel", { method: "POST" }).then(pollJobs);
-  });
+  $("#secondWhisperPass").addEventListener("click", () => startOptionalWhisperAnalysis().catch((error) => { setCutLoading("Error", error.message || String(error), 100); showToast(error.message || String(error)); }));
+  $("#cancelJob")?.addEventListener("click", () => { cancelActiveWork(); });
+  $("#cancelLoadingWork")?.addEventListener("click", () => { cancelActiveWork(); });
   $("#audioScanMode").addEventListener("change", () => {
     saveSettings({ audio_scan_mode: $("#audioScanMode").value });
   });
@@ -3516,9 +4215,9 @@ if (typeof document !== "undefined") {
     showToast("Matchering reference saved. New renders will use it.");
   });
   $("#redetectSongs").addEventListener("click", async () => {
-    if (!window.confirm("Re-detect the complete original session? Current slots remain until you confirm the comparison.")) return;
+    if (!await showConfirm("Re-detect the complete original session? Current slots remain until you confirm the comparison.")) return;
     setCutLoading("Re-detecting songs", "Preparing full original session", 2);
-    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: true }) });
+    const response = await fetch("/api/redetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allow_whisper: false }) });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       showToast(data.error || "Could not start song detection.");
@@ -3535,7 +4234,7 @@ if (typeof document !== "undefined") {
     // fetch is the authoritative post-Re-detect count/boundary refresh.
     const waitForFreshDetection = async () => {
       const jobs = await pollJobs();
-      const job = [...jobs].reverse().find((item) => item.kind === "redetect");
+      const job = jobs.find((item) => item.id === queuedJob.id);
       if (job?.status === "pending_confirmation") {
         setLoadingOverlayJob(null);
         clearCutLoading();
@@ -3555,7 +4254,8 @@ if (typeof document !== "undefined") {
       } else if (job?.status === "error" || job?.status === "cancelled") {
         setLoadingOverlayJob(null);
         clearCutLoading();
-        showToast(`Re-detect ${job.status}.`);
+        const detail = job.error || job.warning || job.stage_detail || job.last_event || "see job details";
+        showToast(`Re-detect ${job.status}: ${detail}`);
       } else {
         setTimeout(() => waitForFreshDetection().catch((err) => console.warn("[redetect refresh failed]", err)), 1000);
       }
@@ -3585,17 +4285,21 @@ if (typeof document !== "undefined") {
     const detection = await fetch("/api/redetect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allow_whisper: true }),
+      body: JSON.stringify({ allow_whisper: false }),
     });
     if (!detection.ok) {
       showToast("Source folder changed, but automatic detection could not start.");
       return;
     }
+    const detectionJob = await detection.json();
+    setLoadingOverlayJob(detectionJob);
     await pollJobs();
     const waitForSourceDetection = async () => {
       const jobs = await pollJobs();
-      const job = [...jobs].reverse().find((item) => item.kind === "redetect");
-      if (job?.status === "done") {
+      const job = jobs.find((item) => item.id === detectionJob.id);
+      if (job?.status === "pending_confirmation") {
+        await reviewRedetectCandidate(job);
+      } else if (job?.status === "done") {
         await loadState();
         showToast(`${appState.audio_scan?.accepted?.length || 0} WAV/audio files loaded.`);
       } else if (job?.status === "pending_review") {
@@ -3615,11 +4319,15 @@ if (typeof document !== "undefined") {
   // request. This keeps the analysis indicator live even while /api/state is
   // busy scanning and transcribing the source folder.
   pollJobs().catch((err) => console.warn("[initial jobs poll failed]", err));
-  setInterval(() => pollJobs().catch((err) => console.warn("[jobs poll failed]", err)), 1000);
+  const jobLoop = async () => {
+    try { await pollJobs(); } catch (error) { console.warn("[jobs poll failed]", error); }
+    setTimeout(jobLoop, document.visibilityState === "visible" ? 1500 : 6000);
+  };
+  setTimeout(jobLoop, 1500);
   loadState();
   setTimeout(pollingLoop, 2000);
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { parseSplitOffsetSeconds, parseSplitList };
+  module.exports = { parseSplitOffsetSeconds, parseSplitList, renderResultSummary, jobReportText, makeDialogDismissible, showConfirm, chooseMixSource, fetchStateSnapshot, setupDismissControls };
 }
