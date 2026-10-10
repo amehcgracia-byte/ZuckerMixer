@@ -52,7 +52,7 @@ $installer = "$PWD/dist/ZuckerMixer-$version-Windows.exe"
 Set-Content -Path $installer -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
 $testRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
 $testDir = Join-Path $testRoot 'ZuckerMixer-installed-check'
-$process = Start-Process $installer -ArgumentList '/NOLAUNCH', "/D=$testDir" -PassThru
+$process = Start-Process $installer -ArgumentList '/NOLAUNCH', "/D=$testDir" -RedirectStandardOutput "$PWD/build/installer.stdout.log" -RedirectStandardError "$PWD/build/installer.stderr.log" -PassThru
 if (-not $process.WaitForExit(180000)) {
   Stop-Process -Id $process.Id -Force
   throw 'Installer / Windows UI check timed out'
