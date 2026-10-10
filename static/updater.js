@@ -10,6 +10,7 @@
   const notice = (text) => { document.querySelector('#updateNotice').textContent = text; };
   function closeOffer() { if (dialog) { dialog.close(); dialog.remove(); dialog = null; } }
   async function offer(status) {
+    if (window.MixerTutorial?.isOpen()) { window.addEventListener('tutorialclosed', () => offer(status), { once: true }); return; }
     if (promptedVersion === status.version) return;
     promptedVersion = status.version;
     closeOffer();

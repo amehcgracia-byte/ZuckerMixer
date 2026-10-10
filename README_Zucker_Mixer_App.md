@@ -50,8 +50,5 @@ ZUCKER MIXER — READ ME FIRST
    Everything stays on your computer. Settings and diagnostic reports:
      ~/Music/JamMixes/ZuckerMixerState
 
-You can open this guide again at any time with "Read me first" at the
-bottom of the ZuckerMixer window.
-
 Zucker Mixer is free software licensed under the GNU GPL v3.0
 (see LICENSE.txt). Copyright (C) 2026 José Manuel García.

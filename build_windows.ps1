@@ -35,3 +35,28 @@ if (-not $process.WaitForExit(120000)) {
 if ($process.ExitCode -ne 0) { throw 'Frozen windowed self-check failed' }
 Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md dist/ZuckerMixer
 Compress-Archive -Path dist/ZuckerMixer -DestinationPath "dist/ZuckerMixer-$version-Windows.zip" -Force
+
+# Offline, signed Microsoft runtime: end users do not download prerequisites.
+$runtime = "$PWD/build/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124701' -OutFile $runtime
+$signature = Get-AuthenticodeSignature $runtime
+if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+  throw 'WebView2 installer signature is not valid Microsoft code'
+}
+$compiler = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+if (-not $compiler) { $compiler = "${env:ProgramFiles(x86)}/NSIS/makensis.exe" }
+& $compiler "/DVERSION=$version" packaging/windows-installer.nsi
+if ($LASTEXITCODE -ne 0) { throw 'Single executable installer build failed' }
+# Emulate a browser download: only the outer installer has Mark of the Web.
+$installer = "$PWD/dist/ZuckerMixer-$version-Windows.exe"
+Set-Content -Path $installer -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+$testRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+$testDir = Join-Path $testRoot 'ZuckerMixer-installed-check'
+$process = Start-Process $installer -ArgumentList '/NOLAUNCH', "/D=$testDir" -RedirectStandardOutput "$PWD/build/installer.stdout.log" -RedirectStandardError "$PWD/build/installer.stderr.log" -PassThru
+if (-not $process.WaitForExit(180000)) {
+  Stop-Process -Id $process.Id -Force
+  throw 'Installer / Windows UI check timed out'
+}
+if ($process.ExitCode -ne 0) { throw 'Installed Windows UI check failed' }
+$blocked = Get-Item "$testDir/_internal/pythonnet/runtime/Python.Runtime.dll" -Stream Zone.Identifier -ErrorAction SilentlyContinue
+if ($blocked) { throw 'Installed CLR assembly inherited Mark of the Web' }

@@ -391,29 +391,27 @@ def finish_request_timer(response: Response) -> Response:
     return response
 
 
-GUIDE_PATH = RESOURCE_ROOT / "README_Zucker_Mixer_App.md"
-GUIDE_SEEN_PATH = STATE_ROOT / "guide_seen.json"
+TUTORIAL_STATE_PATH = STATE_ROOT / "tutorial.json"
+TUTORIAL_ANSWERS = {"yes", "no"}
 
 
-@app.get("/api/guide")
-def api_guide() -> Response:
-    # The DMG carries this guide, but in-app updates never show the DMG, so
-    # the app opens it once for each newly installed version.
-    version = BUILD_METADATA["app_version"]
-    try:
-        text = GUIDE_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return jsonify({"text": "", "version": version, "unseen": False})
-    seen = load_json(GUIDE_SEEN_PATH, {})
-    seen_version = seen.get("version") if isinstance(seen, dict) else None
-    return jsonify({"text": text, "version": version, "unseen": seen_version != version})
+@app.get("/api/tutorial")
+def api_tutorial() -> Response:
+    # One answer per user profile, kept across versions: the welcome
+    # question is asked once; Help → Tutorial with Einstein replays it.
+    state = load_json(TUTORIAL_STATE_PATH, {})
+    answer = state.get("answer") if isinstance(state, dict) else None
+    return jsonify({"answer": answer if answer in TUTORIAL_ANSWERS else None})
 
 
-@app.post("/api/guide/seen")
-def api_guide_seen() -> Response:
-    version = BUILD_METADATA["app_version"]
-    save_json_atomic(GUIDE_SEEN_PATH, {"version": version, "seen_at": time.time()})
-    return jsonify({"version": version})
+@app.post("/api/tutorial")
+def api_tutorial_answer() -> Response:
+    payload = request.get_json(silent=True) or {}
+    answer = payload.get("answer")
+    if answer not in TUTORIAL_ANSWERS:
+        return jsonify({"error": "answer must be 'yes' or 'no'"}), 400
+    save_json_atomic(TUTORIAL_STATE_PATH, {"answer": answer, "answered_at": time.time()})
+    return jsonify({"answer": answer})
 
 
 CREDITS_PATH = RESOURCE_ROOT / "Credits.html"

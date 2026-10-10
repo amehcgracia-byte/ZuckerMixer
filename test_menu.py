@@ -4,7 +4,7 @@ from pathlib import Path
 import jam_app as app
 import mac_app
 
-SPECIAL_ACTIONS = {'guide', 'about', 'github'}
+SPECIAL_ACTIONS = {'tutorial', 'about', 'github'}
 
 
 def menu_actions():
@@ -16,7 +16,7 @@ def test_every_menu_action_is_a_window_button():
     ids = set(re.findall(r'id="([^"]+)"', html))
     for action in menu_actions():
         assert action in SPECIAL_ACTIONS or action in ids, f'menu action {action!r} has no button in index.html'
-    assert {'checkUpdate', 'guide', 'about'} <= set(menu_actions())
+    assert {'checkUpdate', 'tutorial', 'about'} <= set(menu_actions())
 
 
 def test_menu_items_dispatch_off_the_ui_thread():

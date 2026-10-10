@@ -26,7 +26,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements_app.txt -r requirements_whisper.txt pytest
       - run: python -m pytest -q
-      - run: node test_state_loading.js && node test_render_messages.js && node test_split_time.js && node test_preview_source_gain.js && node test_fader_auto_level.js && node test_fine_tune_render_snapshot.js && node test_vocal_expander.js && node test_preview_normalization.js && node test_preview_gate.js && node test_updater.js && node test_render_listening.js && node test_loading_overlay_dismiss.js && node test_cancel_ui.js && node test_guide.js && node test_menu.js
+      - run: node test_state_loading.js && node test_render_messages.js && node test_split_time.js && node test_preview_source_gain.js && node test_fader_auto_level.js && node test_fine_tune_render_snapshot.js && node test_vocal_expander.js && node test_preview_normalization.js && node test_preview_gate.js && node test_updater.js && node test_render_listening.js && node test_loading_overlay_dismiss.js && node test_cancel_ui.js && node test_menu.js && node test_tutorial.js
   build-dmg:
     needs: test-suite
     runs-on: macos-15-intel
@@ -56,6 +56,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install Windows packaging tool
+        run: choco install nsis --yes --no-progress
       - name: Build and verify Windows
         shell: pwsh
         env:
@@ -64,7 +66,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ZuckerMixer-Windows
-          path: dist/ZuckerMixer-*-Windows.zip
+          path: |
+            dist/ZuckerMixer-*-Windows.zip
+            dist/ZuckerMixer-*-Windows.exe
           if-no-files-found: error
   draft-release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -84,7 +88,7 @@ jobs:
         run: |
           git archive --format=zip --prefix=ZuckerMixer/ -o release/ZuckerMixer-${GITHUB_REF_NAME}-source.zip HEAD
           cd release
-          sha256sum *.dmg *.zip > SHA256SUMS.txt
+          sha256sum *.dmg *.zip *.exe > SHA256SUMS.txt
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "ZuckerMixer $GITHUB_REF_NAME" --notes-file ../CHANGELOG.md ./*
 
   attach-draft:
@@ -108,5 +112,5 @@ jobs:
           VERSION="$(cat VERSION | tr -d '[:space:]')"
           git archive --format=zip --prefix=ZuckerMixer/ -o "release/ZuckerMixer-$VERSION-source.zip" HEAD
           cd release
-          sha256sum *.dmg *.zip > SHA256SUMS.txt
+          sha256sum *.dmg *.zip *.exe > SHA256SUMS.txt
           gh release upload "v$VERSION" --repo "$GITHUB_REPOSITORY" --clobber ./*

@@ -1,3 +1,13 @@
+## 2.8.13
+
+- Add a single Windows executable installer. Opening it installs the complete application into the current user’s LocalAppData, installs the bundled signed offline WebView2 runtime, verifies the native interface and launches ZuckerMixer. The ZIP remains available for portable use and in-app updates.
+- Test the actual frozen Windows interface after running an installer marked as downloaded, and verify that Python.Runtime.dll has no inherited download zone. Earlier build checks only exercised audio imports and missed the CLR/WebView2 startup path.
+
+## 2.8.12
+
+- Add the Einstein guided tutorial from Zucker Editor, rewritten for ZuckerMixer in 17 steps: session folder, input mode, known song count, mastering reference, song cards, naming, per-song actions, Fine-tune, cut editing, re-detection, Whisper, master style, mixing, progress, results and the menus. A new profile is asked once, "Want to learn what ZuckerMixer can do?"; the answer is kept across versions. Replay it from Help → Tutorial with Einstein or the footer. The tour is read-only, scrolls each control clear of the sticky top bar, shows a demo copy of controls that cannot be spotlighted, and delays an update offer until it closes.
+- Remove the in-app "Read me first" guide added in 2.8.10. It only matters before the first launch, so it stays in the DMG as `READ ME FIRST.txt`.
+
 ## 2.8.11
 
 - Fix update checks on macOS. The 2.8.9 and 2.8.10 Mac builds no longer received `certifi` indirectly from other dependencies, and the frozen Python runtime then found no CA certificates, so every check failed with "Could not check for updates". The Mac build now installs `certifi` explicitly, the updater falls back to the macOS system bundle (`/etc/ssl/cert.pem`), and `--self-check` fails the build if the bundle is missing. Mac users on 2.8.9 or 2.8.10 must install 2.8.11 once from the DMG.

@@ -85,6 +85,25 @@ if "--whisper-worker" in sys.argv:
     runpy.run_path(str(worker_path), run_name="__main__")
     raise SystemExit(0)
 
+if "--windows-ui-check" in sys.argv:
+    # Exercise the CLR and WebView2, not just the audio imports. This mode
+    # opens no project, touches no preferences, and exits after a real page load.
+    if sys.platform != "win32":
+        raise SystemExit("The Windows UI check requires Windows")
+    import webview
+    loaded = threading.Event()
+    probe = webview.create_window("ZuckerMixer interface check", html="<html><body>Windows interface ready</body></html>", hidden=True)
+    def ready():
+        loaded.set()
+        probe.destroy()
+    probe.events.loaded += ready
+    def timeout():
+        if not loaded.wait(60):
+            os._exit(1)
+    threading.Thread(target=timeout, daemon=True).start()
+    webview.start(gui="edgechromium")
+    raise SystemExit(0 if loaded.is_set() else 1)
+
 import webview
 
 import jam_app
@@ -95,8 +114,6 @@ if "--self-check" in sys.argv:
     import update_manager
     resources = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     assert (resources / "update_helper.py").is_file()
-    if not (resources / "README_Zucker_Mixer_App.md").is_file():
-        raise SystemExit("ZuckerMixer guide self-check failed: README_Zucker_Mixer_App.md is not bundled")
     # The system fallback hides a missing bundle on build machines; require
     # certifi itself so update checks work on every user's Mac.
     try:
@@ -120,7 +137,7 @@ if "--self-check" in sys.argv:
     print("ZuckerMixer Matchering import self-check: OK", flush=True)
     print("ZuckerMixer frozen import self-check: OK", flush=True)
     print("ZuckerMixer bundled Whisper import self-check: OK", flush=True)
-    print("ZuckerMixer update certificate and guide self-check: OK", flush=True)
+    print("ZuckerMixer update certificate self-check: OK", flush=True)
     raise SystemExit(0)
 
 
@@ -214,7 +231,7 @@ class ZuckerMixerApi:
 REPOSITORY_URL = "https://github.com/amehcgracia-byte/ZuckerMixer"
 
 # Menu bar: each action is the id of a button in templates/index.html, so a
-# menu item does exactly what that button does. "guide", "about" and
+# menu item does exactly what that button does. "tutorial", "about" and
 # "github" are handled by static/menu.js or here.
 MENU_LAYOUT: list[tuple[str, list[tuple[str, str] | None]]] = [
     ("File", [
@@ -237,7 +254,7 @@ MENU_LAYOUT: list[tuple[str, list[tuple[str, str] | None]]] = [
         ("Cancel Current Job", "cancelJob"),
     ]),
     ("Help", [
-        ("Read Me First", "guide"),
+        ("Tutorial with Einstein", "tutorial"),
         ("Check for Updates…", "checkUpdate"),
         None,
         ("About ZuckerMixer", "about"),
