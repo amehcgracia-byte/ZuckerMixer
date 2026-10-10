@@ -85,6 +85,25 @@ if "--whisper-worker" in sys.argv:
     runpy.run_path(str(worker_path), run_name="__main__")
     raise SystemExit(0)
 
+if "--windows-ui-check" in sys.argv:
+    # Exercise the CLR and WebView2, not just the audio imports. This mode
+    # opens no project, touches no preferences, and exits after a real page load.
+    if sys.platform != "win32":
+        raise SystemExit("The Windows UI check requires Windows")
+    import webview
+    loaded = threading.Event()
+    probe = webview.create_window("ZuckerMixer interface check", html="<html><body>Windows interface ready</body></html>", hidden=True)
+    def ready():
+        loaded.set()
+        probe.destroy()
+    probe.events.loaded += ready
+    def timeout():
+        if not loaded.wait(60):
+            os._exit(1)
+    threading.Thread(target=timeout, daemon=True).start()
+    webview.start(gui="edgechromium")
+    raise SystemExit(0 if loaded.is_set() else 1)
+
 import webview
 
 import jam_app
