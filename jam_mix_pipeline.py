@@ -783,7 +783,9 @@ def _audio_for_processing(path: Path) -> Path:
         cached.parent.mkdir(parents=True, exist_ok=True)
         tmp = cached.with_name(f".{cached.name}.tmp")
         subprocess.run(
-            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path), "-vn", "-acodec", "pcm_s16le", str(tmp)],
+            # The cache keeps the source name (e.g. ".Bass.mp3.tmp"), so FFmpeg cannot
+            # infer a container from it: always write WAV explicitly.
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path), "-vn", "-acodec", "pcm_s16le", "-f", "wav", str(tmp)],
             check=True,
         )
         tmp.replace(cached)
