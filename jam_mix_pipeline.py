@@ -5573,7 +5573,12 @@ def empty_noise_stem_names(analysis: dict[str, object]) -> set[str]:
         if (info.get("case") == "B"
             or (float(info.get("rms_dbfs", 0)) <= EMPTY_STEM_RMS_DBFS
                 and float(info.get("level_spread_db", 99)) <= EMPTY_STEM_SPREAD_DB)
-            or (float(value) <= -50 and float(spreads.get(name, 99)) <= 6)
+            # A quiet but compressed track (a bass DI recorded low: about
+            # -54 dBFS, 4-5 dB short-term spread) is still music when its
+            # frames swing well above its own floor; only a flat, quiet
+            # track with no such swing is empty.
+            or (float(value) <= -50 and float(spreads.get(name, 99)) <= 6
+                and float(info.get("level_spread_db", 0)) <= EMPTY_STEM_SPREAD_DB)
             or (float(value) <= -85 and float(peaks.get(name, 0)) <= -75)):
             excluded.add(name)
     return excluded
