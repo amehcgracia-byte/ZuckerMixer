@@ -109,3 +109,12 @@ def test_track_dynamics_preserve_output_across_render_blocks():
         state={}
         chunked=np.concatenate([p.process_track_streaming(part,sr,role,5,state,role) for part in np.array_split(audio,9)])
         np.testing.assert_allclose(chunked,whole,atol=2e-7,rtol=1e-4)
+
+
+def test_quiet_compressed_bass_is_not_dropped_as_empty():
+    # Real case: "Much to me" bass DI, -54 dBFS RMS, 4.5 dB spread, but its frames
+    # swing ~20 dB above the noise floor and the noise scan finds no noise.
+    analysis={'rms_values_db':{'bass':-54.0,'flat':-55.0},'dynamic_spread_db':{'bass':4.5,'flat':3.0},
+              'segment_peaks_db':{'bass':-39.6,'flat':-50.0},
+              'noise_diagnostics':{'bass':{'case':'none','level_spread_db':19.8},'flat':{'case':'none','level_spread_db':2.0}}}
+    assert p.empty_noise_stem_names(analysis)=={'flat'}

@@ -82,7 +82,7 @@ LIFECYCLE_LOG_PATH = STATE_ROOT / "redetect_worker_lifecycle.jsonl"
 RENDER_DIAGNOSTICS_ROOT = STATE_ROOT / "render_diagnostics"
 RENDER_DIAGNOSTICS_ROOT.mkdir(parents=True, exist_ok=True)
 ORPHANED_ACTIVE_JOB_SECONDS = 90.0
-ACTIVE_STEM_DETECTION_VERSION = 5
+ACTIVE_STEM_DETECTION_VERSION = 6  # v6: quiet compressed tracks (bass DI) are not "empty"
 BUILD_METADATA_PATH = RESOURCE_ROOT / "build" / "build_metadata.json"
 HOST = "127.0.0.1"
 DEFAULT_TARGET_LUFS = pipeline.TARGET_LUFS
