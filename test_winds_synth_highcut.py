@@ -57,5 +57,5 @@ class KeysNotBuried(unittest.TestCase):
         self.assertEqual(rhythm["a"]["attenuation_db"], -3.0)
 
     def test_keys_cuts_are_bounded(self):
-        self.assertEqual(pipeline.bounded_harmonic_cut("keys_l", -3.0, -3.0, -4.0), pipeline.MAX_HARMONIC_AUTOMATIC_CUT_DB)
+        self.assertEqual(pipeline.bounded_harmonic_cut("keys_l", -3.0, -3.0, -4.0, -6.0), pipeline.MAX_HARMONIC_AUTOMATIC_CUT_DB)
         self.assertEqual(pipeline.bounded_harmonic_cut("sax", -3.0, -3.0), -6.0)

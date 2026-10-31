@@ -778,7 +778,7 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
         role_norm_db = role_norms_db.get(mix_role)
         active_level = active_levels_db.get(stem.path.name, raw_rms_db)
         computed_gain_before_lift_db = pipeline.per_song_auto_mix_gain_db(mix_role, active_level, accompaniment_reference_db)
-        computed_gain_db = computed_gain_before_lift_db + pipeline.bounded_harmonic_cut(mix_role, rhythm_adjustment_db, priority_adjustment_db) + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db
+        computed_gain_db = computed_gain_before_lift_db + pipeline.bounded_harmonic_cut(mix_role, rhythm_adjustment_db, priority_adjustment_db, role_balance_adjustment_db) + vocal_group_adjustment_db + vocal_pair_adjustment_db
         computed_gain_db = float(np.clip(
             computed_gain_db,
             pipeline.AUTO_MIX_MAX_ATTENUATION_DB,

@@ -6372,9 +6372,9 @@ def per_song_rhythm_harmonic_gains(
 
 
 HARMONIC_ROLES = {"keys", "keys_l", "keys_r", "synth"}
-# Automatic cuts on keys/synth add up (beat grid + key + voice priority). Montara jam 31-10:
-# -3 -3 -4 on top of the balance pinned both keys at -12 dB. Keep their sum bounded.
-MAX_HARMONIC_AUTOMATIC_CUT_DB = -4.0
+# Automatic cuts on keys/synth add up (beat grid + key + voice priority + hierarchy).
+# Montara jam 31-10: they pinned both keys at -12 dB. Keep their sum bounded.
+MAX_HARMONIC_AUTOMATIC_CUT_DB = -5.0
 UNRELIABLE_BEAT_GRID_SHARE = 0.6
 
 
@@ -6583,9 +6583,9 @@ def per_song_role_balance_corrections(
 
     drum_anchor_names = [name for name, role in effective_roles.items() if role == "snare"]
     drum_anchor_level = group_active_level_db(drum_anchor_names, active_levels_db)
-    if drum_anchor_level is None:
-        drum_anchor_names = [name for name, role in effective_roles.items() if role in {"overhead", "hh", "drums"}]
-        drum_anchor_level = group_active_level_db(drum_anchor_names, active_levels_db)
+    # Without a snare there is no reliable kit reference: overhead/hi-hat microphones are room
+    # mics, louder raw than they end up in the mix (they are trimmed later), so holding keys
+    # below them buried the keys (Montara jam 31-10). Skip the hierarchy then.
     harmonic_hierarchy_corrections: dict[str, float] = {}
     if drum_anchor_level is not None:
         harmonic_target = float(drum_anchor_level) - HARMONIC_BELOW_DRUM_REFERENCE_DB
@@ -8234,7 +8234,7 @@ def render_segment(
             gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
             computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
             computed_makeup_gain_db = float(np.clip(
-                computed_makeup_gain_before_lift_db + bounded_harmonic_cut(mix_role, rhythm_adjustment_db, harmonic_adjustment_db, priority_adjustment_db) + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db,
+                computed_makeup_gain_before_lift_db + bounded_harmonic_cut(mix_role, rhythm_adjustment_db, harmonic_adjustment_db, priority_adjustment_db, role_balance_adjustment_db) + vocal_group_adjustment_db + vocal_pair_adjustment_db,
                 AUTO_MIX_MAX_ATTENUATION_DB,
                 AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
             ))
@@ -8327,7 +8327,7 @@ def render_segment(
         gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
         computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
         computed_makeup_gain_db = float(np.clip(
-            computed_makeup_gain_before_lift_db + bounded_harmonic_cut(mix_role, rhythm_adjustment_db, harmonic_adjustment_db, priority_adjustment_db) + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db,
+            computed_makeup_gain_before_lift_db + bounded_harmonic_cut(mix_role, rhythm_adjustment_db, harmonic_adjustment_db, priority_adjustment_db, role_balance_adjustment_db) + vocal_group_adjustment_db + vocal_pair_adjustment_db,
             AUTO_MIX_MAX_ATTENUATION_DB,
             AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
         ))
