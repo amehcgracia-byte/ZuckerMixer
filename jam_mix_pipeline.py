@@ -5827,6 +5827,8 @@ def _cached_sos(sr: int, kind: str, freq: float, q: float, gain_db: float) -> np
     if kind == "highpass":
         return signal.butter(2, freq, btype="highpass", fs=sr, output="sos")
     elif kind == "lowpass":
+        if freq >= 0.45 * sr:  # nothing to cut below Nyquist at this sample rate: pass through
+            return np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]])
         return signal.butter(2, freq, btype="lowpass", fs=sr, output="sos")
     elif kind == "lowshelf":
         return shelf_sos(sr, freq, q, gain_db, high=False)

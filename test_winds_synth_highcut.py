@@ -59,3 +59,13 @@ class KeysNotBuried(unittest.TestCase):
     def test_keys_cuts_are_bounded(self):
         self.assertEqual(pipeline.bounded_harmonic_cut("keys_l", -3.0, -3.0, -4.0, -6.0), pipeline.MAX_HARMONIC_AUTOMATIC_CUT_DB)
         self.assertEqual(pipeline.bounded_harmonic_cut("sax", -3.0, -3.0), -6.0)
+
+
+class HighCutAtLowSampleRates(unittest.TestCase):
+    def test_bass_high_cut_above_nyquist_passes_through(self):
+        import numpy as np
+        x = np.random.default_rng(1).standard_normal(8000).astype(np.float32)
+        y = pipeline.apply_role_eq(x, 8000, "bass")   # 6 kHz high cut at 8 kHz sample rate
+        self.assertTrue(np.all(np.isfinite(y)))
+        sos = pipeline.make_sos(8000, "lowpass", 6000.0)
+        self.assertTrue(np.allclose(sos, [[1, 0, 0, 1, 0, 0]]))
