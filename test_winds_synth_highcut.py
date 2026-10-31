@@ -36,3 +36,26 @@ class WindsSynthHighCut(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeysNotBuried(unittest.TestCase):
+    def test_failed_beat_grid_and_keys_out_of_key_give_no_cuts(self):
+        roles = {"bd": "kick", "bass": "bass", "keys": "keys_r", "sax": "sax"}
+        flagged = {"flagged": True, "attenuation_db": -3.0, "reason": "poor beat-grid alignment"}
+        rhythm = {name: dict(flagged) for name in roles}
+        harmonic = {"keys": {"flagged": True, "attenuation_db": -3.0}, "sax": {"flagged": True, "attenuation_db": -3.0}}
+        rhythm, harmonic = pipeline.trusted_rhythm_harmonic_controls(rhythm, harmonic, roles)
+        self.assertTrue(all(info["attenuation_db"] == 0.0 for info in rhythm.values()))
+        self.assertEqual(harmonic["keys"]["attenuation_db"], 0.0)
+        self.assertEqual(harmonic["sax"]["attenuation_db"], -3.0)  # only harmony instruments are spared
+
+    def test_a_few_off_grid_tracks_keep_their_cut(self):
+        roles = {"a": "kick", "b": "bass", "c": "keys", "d": "sax"}
+        rhythm = {"a": {"flagged": True, "attenuation_db": -3.0}, "b": {"flagged": False, "attenuation_db": 0.0},
+                  "c": {"flagged": False, "attenuation_db": 0.0}, "d": {"flagged": False, "attenuation_db": 0.0}}
+        rhythm, _ = pipeline.trusted_rhythm_harmonic_controls(rhythm, {}, roles)
+        self.assertEqual(rhythm["a"]["attenuation_db"], -3.0)
+
+    def test_keys_cuts_are_bounded(self):
+        self.assertEqual(pipeline.bounded_harmonic_cut("keys_l", -3.0, -3.0, -4.0), pipeline.MAX_HARMONIC_AUTOMATIC_CUT_DB)
+        self.assertEqual(pipeline.bounded_harmonic_cut("sax", -3.0, -3.0), -6.0)

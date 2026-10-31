@@ -6371,6 +6371,37 @@ def per_song_rhythm_harmonic_gains(
             "method": "independent per-song active musical reference, bounded quiet-part recovery, combined kit power ceiling"}
 
 
+HARMONIC_ROLES = {"keys", "keys_l", "keys_r", "synth"}
+# Automatic cuts on keys/synth add up (beat grid + key + voice priority). Montara jam 31-10:
+# -3 -3 -4 on top of the balance pinned both keys at -12 dB. Keep their sum bounded.
+MAX_HARMONIC_AUTOMATIC_CUT_DB = -4.0
+UNRELIABLE_BEAT_GRID_SHARE = 0.6
+
+
+def trusted_rhythm_harmonic_controls(rhythm: dict, harmonic: dict, roles: dict[str, str]) -> tuple[dict, dict]:
+    """Drop automatic cuts that come from an analysis that failed for the whole song.
+
+    - If most tracks are 'off the beat grid', the beat tracker failed (rubato, swing, a
+      wrong tempo), not the players: no rhythmic cuts in that song.
+    - Keys and synths carry the harmony; jazz extensions read as 'out of key'. They get no
+      out-of-key cut.
+    """
+    flagged = [name for name, info in rhythm.items() if isinstance(info, dict) and info.get("flagged")]
+    if rhythm and len(flagged) / len(rhythm) >= UNRELIABLE_BEAT_GRID_SHARE:
+        rhythm = {name: ({**info, "attenuation_db": 0.0, "flagged": False, "reason": "beat grid unreliable for this song"} if isinstance(info, dict) else info)
+                  for name, info in rhythm.items()}
+    harmonic = {name: ({**info, "attenuation_db": 0.0, "reason": "harmony instrument: no out-of-key cut"}
+                       if isinstance(info, dict) and roles.get(name) in HARMONIC_ROLES and info.get("attenuation_db") else info)
+                for name, info in harmonic.items()}
+    return rhythm, harmonic
+
+
+def bounded_harmonic_cut(role: str, *cuts: float) -> float:
+    """Sum of automatic cuts for a track; for keys/synth never below MAX_HARMONIC_AUTOMATIC_CUT_DB."""
+    total = float(sum(cuts))
+    return max(total, MAX_HARMONIC_AUTOMATIC_CUT_DB) if role in HARMONIC_ROLES else total
+
+
 def vocal_pair_key(name: str) -> str:
     """Return a stable logical pair key without changing channel panning."""
     low = re.sub(r"\.[^.]+$", "", str(name or "")).lower()
@@ -7930,6 +7961,7 @@ def analyze_song_mix_controls(
         stem.path.name: analyze_harmonic_consistency(stem, segment, reference, RHYTHM_ANALYSIS_SR, rms_values_db.get(stem.path.name, -120.0))
         for stem in stems
     }
+    rhythm, harmonic = trusted_rhythm_harmonic_controls(rhythm, harmonic, effective_roles)
     active_levels_db = active_levels_db or dict(rms_values_db)
     balance = vocal_harmonic_balance(effective_roles, active_levels_db, segment_envelopes)
     role_balance = per_song_role_balance_corrections(effective_roles, active_levels_db, segment_envelopes)
@@ -8202,7 +8234,7 @@ def render_segment(
             gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
             computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
             computed_makeup_gain_db = float(np.clip(
-                computed_makeup_gain_before_lift_db + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db,
+                computed_makeup_gain_before_lift_db + bounded_harmonic_cut(mix_role, rhythm_adjustment_db, harmonic_adjustment_db, priority_adjustment_db) + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db,
                 AUTO_MIX_MAX_ATTENUATION_DB,
                 AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
             ))
@@ -8295,7 +8327,7 @@ def render_segment(
         gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
         computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
         computed_makeup_gain_db = float(np.clip(
-            computed_makeup_gain_before_lift_db + rhythm_adjustment_db + harmonic_adjustment_db + priority_adjustment_db + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db,
+            computed_makeup_gain_before_lift_db + bounded_harmonic_cut(mix_role, rhythm_adjustment_db, harmonic_adjustment_db, priority_adjustment_db) + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db,
             AUTO_MIX_MAX_ATTENUATION_DB,
             AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(mix_role, AUTO_MIX_MAX_BOOST_DB),
         ))
