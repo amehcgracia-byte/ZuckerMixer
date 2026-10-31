@@ -915,6 +915,7 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
             "eq_low_cut_hz": float(stem_ov.get("eq_low_cut_hz", eq_defaults["eq_low_cut_hz"])),
             "eq_mid_gain_db": float(stem_ov.get("eq_mid_gain_db", eq_defaults["eq_mid_gain_db"])),
             "eq_air_gain_db": float(stem_ov.get("eq_air_gain_db", eq_defaults["eq_air_gain_db"])),
+            "eq_high_cut_hz": float(stem_ov.get("eq_high_cut_hz", eq_defaults["eq_high_cut_hz"])),
             "reverb_base_db": base_reverb,
             "reverb_send_db": float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
             "reverb_total_db": None if base_reverb is None else base_reverb + reverb_scene_offset_db + float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
@@ -3069,7 +3070,7 @@ def apply_overrides_for_song(
     stems = source_song.setdefault("stems", {}) if isinstance(source_song, dict) else {}
     for stem_name, prepared_stem in prepared_mix.get("stems", {}).items():
         settings = stems.setdefault(stem_name, {})
-        for key in ("pan", "eq_low_cut_hz", "eq_mid_gain_db", "eq_air_gain_db", "space_enabled", "echo_enabled", "gate_enabled", "fx_enabled", "reverb_send_db", "delay_send_db"):
+        for key in ("pan", "eq_low_cut_hz", "eq_mid_gain_db", "eq_air_gain_db", "eq_high_cut_hz", "space_enabled", "echo_enabled", "gate_enabled", "fx_enabled", "reverb_send_db", "delay_send_db"):
             settings.setdefault(key, prepared_stem.get(key))
         if not bool(settings.get("effects_user_confirmed", False)):
             for effect in ("space_enabled", "echo_enabled"):
@@ -3180,6 +3181,7 @@ def normalize_overrides(payload: Any) -> dict[str, Any]:
                     "eq_low_cut_hz",
                     "eq_mid_gain_db",
                     "eq_air_gain_db",
+                    "eq_high_cut_hz",
                 ):
                     if key in stem_payload:
                         try:

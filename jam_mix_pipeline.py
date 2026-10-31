@@ -173,6 +173,10 @@ RHYTHM_ONSET_TOLERANCE_BEATS = 0.16
 RHYTHM_INCONSISTENT_ATTENUATION_DB = -3.0
 RHYTHM_SPARSE_ATTENUATION_DB = -2.0
 VOCAL_PRIORITY_MARGIN_DB = 2.0
+# Songs led by a wind instrument (no voice): smaller lead margin, boost and keys cut.
+WIND_PRIORITY_MARGIN_DB = 1.0
+WIND_LEAD_MAX_BOOST_DB = 1.0
+WIND_LEAD_MAX_HARMONIC_CUT_DB = 2.0
 HARMONIC_BELOW_DRUM_REFERENCE_DB = 2.0
 EMPTY_STEM_RMS_DBFS = -72.0
 EMPTY_STEM_SPREAD_DB = 8.0
@@ -722,8 +726,22 @@ def _has_role_synonym(label: str, synonyms: tuple[str, ...]) -> bool:
     )
 
 
+# Synth brands and models are common track names. Checked first, as whole words: "Novation"
+# contains "ov" (overhead) and "Bass Station" contains "bass".
+SYNTH_BRANDS = ("novation", "nord", "moog", "korg", "juno", "jupiter", "prophet", "sequential", "minilogue", "microkorg",
+                "arturia", "microfreak", "minibrute", "mininova", "bass station", "oberheim", "dx7", "op 1", "op1",
+                "eurorack", "modular", "polysynth")
+
+
+def _is_synth_brand(label: str) -> bool:
+    normalized = " " + re.sub(r"[^a-z0-9]+", " ", label.lower()).strip() + " "
+    return any(f" {brand} " in normalized or normalized.strip().startswith(brand.replace(" ", "")) for brand in SYNTH_BRANDS)
+
+
 def classify_role(name: str) -> str:
     low = str(name or "").lower()
+    if _is_synth_brand(low):
+        return "synth"
     # Beatbox is a percussion/room label, not a vocal label; resolve it before
     # the intentionally broad "box" vocal synonym.
     if _has_role_synonym(low, ROLE_SYNONYMS["kick"]):
@@ -6093,6 +6111,9 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
             ("mid", "peaking", 250, 1.0, -2.5),
             ("fixed", "peaking", 850, 1.1, 1.5),
             ("air", "highshelf", 10000, 0.707, 0.0),
+            # A bass recorded with a microphone also picks up cymbals and the room; above
+            # ~6 kHz there is little bass left, so cut it (adjustable per track).
+            ("high", "lowpass", 6000, 0.707, 0.0),
         ]
     elif role == "vocal":
         bands = [("low", "highpass", 115, 0.707, 0.0), ("mid", "peaking", 3000, 0.9, 2.0), ("air", "highshelf", 11000, 0.707, 1.0)]
@@ -6116,6 +6137,9 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
         bands = [("low", "highpass", 80, 0.707, 0.0), ("mid", "peaking", 300, 1.0, 0.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     if not eq_overrides:
         return bands
+    high_cut = eq_overrides.get("eq_high_cut_hz")
+    if high_cut is not None and float(high_cut) < 19999 and not any(band[0] == "high" for band in bands):
+        bands = bands + [("high", "lowpass", float(high_cut), 0.707, 0.0)]
     resolved = []
     for slot, kind, freq, q, gain_db in bands:
         if slot == "low":
@@ -6124,6 +6148,10 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
             gain_db = float(eq_overrides.get("eq_mid_gain_db", gain_db))
         elif slot == "air":
             gain_db = float(eq_overrides.get("eq_air_gain_db", gain_db))
+        elif slot == "high":
+            freq = float(eq_overrides.get("eq_high_cut_hz", freq))
+            if freq >= 19999:
+                continue  # high cut switched off
         resolved.append((slot, kind, freq, q, gain_db))
     return resolved
 
@@ -6133,10 +6161,12 @@ def role_eq_defaults(role: str) -> dict[str, float]:
     low = next((band for band in bands if band[0] == "low"), None)
     mid = next((band for band in bands if band[0] == "mid"), None)
     air = next((band for band in bands if band[0] == "air"), None)
+    high = next((band for band in bands if band[0] == "high"), None)
     return {
         "eq_low_cut_hz": float(low[2] if low else 80.0),
         "eq_mid_gain_db": float(mid[4] if mid else 0.0),
         "eq_air_gain_db": float(air[4] if air else 0.0),
+        "eq_high_cut_hz": float(high[2] if high else 20000.0),
     }
 
 
@@ -6391,7 +6421,13 @@ def vocal_harmonic_balance(
     envelopes: dict[str, np.ndarray] | None = None,
 ) -> dict[str, object]:
     """Measure the per-song vocal-vs-harmonic relationship."""
-    vocal_names = [name for name, role in effective_roles.items() if role in {"vocal", "room", "horn", "sax", "flute"}]
+    # A sung or spoken voice leads when there is one. Winds (sax, horns, flute) lead only in
+    # songs without a voice, and more gently: they share the space with the keys rather than
+    # burying them, and a loud solo instrument is the first thing a master limiter catches.
+    voice_names = [name for name, role in effective_roles.items() if role in {"vocal", "room"}]
+    wind_names = [name for name, role in effective_roles.items() if role in {"horn", "sax", "flute"}]
+    vocal_names = voice_names or wind_names
+    winds_lead = bool(wind_names) and not voice_names
     harmonic_names = [
         name for name, role in effective_roles.items()
         if role in {"keys", "keys_l", "keys_r", "synth"}
@@ -6414,13 +6450,15 @@ def vocal_harmonic_balance(
             overlap = float(np.mean(harmonic_env[:length][voice_mask] > db_to_amp(STEM_INACTIVE_FLOOR_DBFS))) if np.any(voice_mask) else 0.0
     gap = None if vocal_level is None or harmonic_level is None else float(vocal_level - harmonic_level)
     vocal_correction = 0.0
-    if gap is not None and gap < VOCAL_PRIORITY_MARGIN_DB:
-        vocal_correction = float(np.clip((VOCAL_PRIORITY_MARGIN_DB + 0.5) - gap, 0.0, 3.0))
+    margin = WIND_PRIORITY_MARGIN_DB if winds_lead else VOCAL_PRIORITY_MARGIN_DB
+    if gap is not None and gap < margin:
+        vocal_correction = float(np.clip((margin + 0.5) - gap, 0.0, WIND_LEAD_MAX_BOOST_DB if winds_lead else 3.0))
     harmonic_correction = 0.0
-    if gap is not None and gap < VOCAL_PRIORITY_MARGIN_DB and (overlap is None or overlap >= 0.35):
-        harmonic_correction = -float(np.clip(VOCAL_PRIORITY_MARGIN_DB - gap, 2.0, 4.0))
+    if gap is not None and gap < margin and (overlap is None or overlap >= 0.35):
+        harmonic_correction = -float(np.clip(margin - gap, *((1.0, WIND_LEAD_MAX_HARMONIC_CUT_DB) if winds_lead else (2.0, 4.0))))
     return {
         "vocal_names": vocal_names,
+        "winds_lead": winds_lead,
         "harmonic_names": harmonic_names,
         "vocal_group_level_db": vocal_level,
         "harmonic_group_level_db": harmonic_level,
@@ -7061,6 +7099,7 @@ def effective_mix_snapshot(
             "eq_low_cut_hz": override_float(row.get("eq_low_cut_hz"), role_eq_defaults(role)["eq_low_cut_hz"]),
             "eq_mid_gain_db": override_float(row.get("eq_mid_gain_db"), role_eq_defaults(role)["eq_mid_gain_db"]),
             "eq_air_gain_db": override_float(row.get("eq_air_gain_db"), role_eq_defaults(role)["eq_air_gain_db"]),
+            "eq_high_cut_hz": override_float(row.get("eq_high_cut_hz"), role_eq_defaults(role)["eq_high_cut_hz"]),
             "lead_bonus_db": override_float(row.get("lead_bonus_db"), 0.0),
             "reverb_base_db": row.get("reverb_base_db"),
             "reverb_send_db": override_float(row.get("reverb_send_db"), 0.0),
@@ -8177,6 +8216,7 @@ def render_segment(
                 "eq_low_cut_hz": override_float(overrides.get("eq_low_cut_hz"), eq_defaults["eq_low_cut_hz"]),
                 "eq_mid_gain_db": override_float(overrides.get("eq_mid_gain_db"), eq_defaults["eq_mid_gain_db"]),
                 "eq_air_gain_db": override_float(overrides.get("eq_air_gain_db"), eq_defaults["eq_air_gain_db"]),
+                "eq_high_cut_hz": override_float(overrides.get("eq_high_cut_hz"), eq_defaults["eq_high_cut_hz"]),
             }
             trace_row["dsp_applied"] = {
                 "fader_db": override_float(overrides.get("fader_db"), 0.0),
@@ -8299,6 +8339,7 @@ def render_segment(
             "eq_low_cut_hz": override_float(overrides.get("eq_low_cut_hz"), eq_defaults["eq_low_cut_hz"]),
             "eq_mid_gain_db": override_float(overrides.get("eq_mid_gain_db"), eq_defaults["eq_mid_gain_db"]),
             "eq_air_gain_db": override_float(overrides.get("eq_air_gain_db"), eq_defaults["eq_air_gain_db"]),
+            "eq_high_cut_hz": override_float(overrides.get("eq_high_cut_hz"), eq_defaults["eq_high_cut_hz"]),
         }
         track_settings[stem.path.name] = {
             "processing_role": mix_role,
@@ -8575,6 +8616,7 @@ def render_segment(
                             "eq_low_cut_hz": float(settings.get("eq_low_cut_hz", role_eq_defaults(processing_role)["eq_low_cut_hz"])),
                             "eq_mid_gain_db": float(settings.get("eq_mid_gain_db", role_eq_defaults(processing_role)["eq_mid_gain_db"])),
                             "eq_air_gain_db": float(settings.get("eq_air_gain_db", role_eq_defaults(processing_role)["eq_air_gain_db"])),
+                            "eq_high_cut_hz": float(settings.get("eq_high_cut_hz", role_eq_defaults(processing_role)["eq_high_cut_hz"])),
                         }
                         intro_at = segment.speech_intro_start
                         preserve_vocal_speech = (
