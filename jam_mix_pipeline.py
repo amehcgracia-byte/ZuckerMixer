@@ -6852,7 +6852,21 @@ def role_norms_from_detection_cache(stems: list[Stem]) -> dict[str, float]:
     return {role: float(np.median(values)) for role, values in by_role.items() if values}
 
 
+# Stereo recordings arrive as two mono tracks (left and right). The person marks them;
+# both channels go back to their own side, whatever the role. Keys: stem name or file name.
+STEREO_SIDES: dict[str, str] = {}
+STEREO_PAN = 1.0
+
+
+def stereo_side(name: str) -> str:
+    wanted = Path(str(name)).stem.lower()
+    return next((side for key, side in (STEREO_SIDES or {}).items() if Path(str(key)).stem.lower() == wanted), "")
+
+
 def pan_for_role(role: str, name: str) -> float:
+    side = stereo_side(name)
+    if side in {"L", "R"}:
+        return -STEREO_PAN if side == "L" else STEREO_PAN
     # These are invariants of the automatic mix.  Callers must not replace
     # them with a saved per-song pan override: a stereo image that changes
     # sides from song to song is harder to audit and can collapse the guitar
@@ -6876,7 +6890,7 @@ def pan_for_role(role: str, name: str) -> float:
 
 def enforced_pan(role: str, name: str, requested: object = None) -> float:
     """Return a pan while preserving the non-negotiable stereo assignments."""
-    if role in {"guitar", "keys", "keys_l", "keys_r", "synth"}:
+    if role in {"guitar", "keys", "keys_l", "keys_r", "synth"} or stereo_side(name):
         return pan_for_role(role, name)
     try:
         return float(np.clip(float(requested), -1.0, 1.0)) if requested is not None else pan_for_role(role, name)

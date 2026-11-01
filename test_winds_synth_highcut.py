@@ -81,3 +81,15 @@ class NoiseExempt(unittest.TestCase):
             self.assertEqual(pipeline.empty_noise_stem_names(analysis), set())
         finally:
             pipeline.NOISE_EXEMPT_STEMS = set()
+
+
+def test_stereo_sides_pan_hard_left_and_right_for_any_role():
+    import jam_mix_pipeline as pipeline
+    pipeline.STEREO_SIDES = {"Keys L.wav": "L", "Keys R": "R", "Strings 2": "R"}
+    try:
+        assert pipeline.enforced_pan("keys_l", "Keys L") == -1.0
+        assert pipeline.enforced_pan("keys_r", "Keys R") == 1.0
+        assert pipeline.enforced_pan("synth", "Strings 2", 0.0) == 1.0  # a saved pan cannot fold it to the centre
+        assert pipeline.pan_for_role("guitar", "Guitar") == 0.25  # unmarked tracks keep their role pan
+    finally:
+        pipeline.STEREO_SIDES = {}
