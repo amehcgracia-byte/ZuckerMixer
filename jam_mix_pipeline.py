@@ -5830,10 +5830,10 @@ def make_sos(sr: int, kind: str, freq: float, q: float = 0.707, gain_db: float =
 @lru_cache(maxsize=512)
 def _cached_sos(sr: int, kind: str, freq: float, q: float, gain_db: float) -> np.ndarray:
     if kind == "highpass":
-        return signal.butter(2, freq, btype="highpass", fs=sr, output="sos")
+        return signal.butter(2, min(freq, 0.45 * sr), btype="highpass", fs=sr, output="sos")
+    if freq >= 0.45 * sr:  # a band above Nyquist at this sample rate (low-rate files): pass through
+        return np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]])
     elif kind == "lowpass":
-        if freq >= 0.45 * sr:  # nothing to cut below Nyquist at this sample rate: pass through
-            return np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]])
         return signal.butter(2, freq, btype="lowpass", fs=sr, output="sos")
     elif kind == "lowshelf":
         return shelf_sos(sr, freq, q, gain_db, high=False)
@@ -6106,8 +6106,11 @@ def noise_gate_streaming(
     return (x * np.clip(gate, 0.0, 1.0)).astype(np.float32)
 
 
-def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> list[tuple[str, str, float, float, float]]:
-    if role == "kick":
+def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None, name: str | None = None) -> list[tuple[str, str, float, float, float]]:
+    entry = stem_instrument(name)
+    if entry and entry.get("eq"):
+        bands = [tuple(band) for band in entry["eq"]]
+    elif role == "kick":
         bands = [("low", "highpass", 30, 0.707, 0.0), ("fixed", "peaking", 60, 0.9, 2.5), ("mid", "peaking", 350, 1.0, -2.5), ("fixed", "peaking", 3500, 0.9, 2.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role == "bass":
         # Keep the fundamental with the kick, clear mud, and add a controlled
@@ -6163,8 +6166,8 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None) -> li
     return resolved
 
 
-def role_eq_defaults(role: str) -> dict[str, float]:
-    bands = role_eq_bands(role)
+def role_eq_defaults(role: str, name: str | None = None) -> dict[str, float]:
+    bands = role_eq_bands(role, name=name)
     low = next((band for band in bands if band[0] == "low"), None)
     mid = next((band for band in bands if band[0] == "mid"), None)
     air = next((band for band in bands if band[0] == "air"), None)
@@ -6190,8 +6193,9 @@ def apply_role_eq_streaming(
     state: dict[str, np.ndarray],
     key: str,
     eq_overrides: dict[str, float] | None = None,
+    name: str | None = None,
 ) -> np.ndarray:
-    for idx, (slot, kind, freq, q, gain_db) in enumerate(role_eq_bands(role, eq_overrides)):
+    for idx, (slot, kind, freq, q, gain_db) in enumerate(role_eq_bands(role, eq_overrides, name)):
         x = sosfilt_streaming(x, sr, kind, freq, state, f"{key}:role_eq:{idx}:{slot}:{kind}:{freq}", q=q, gain_db=gain_db)
     return x.astype(np.float32)
 
@@ -6207,14 +6211,18 @@ def process_track_streaming(
     preserve_vocal_speech: bool = False,
 ) -> np.ndarray:
     x = (x * db_to_amp(makeup_gain_db)).astype(np.float32)
-    x = apply_role_eq_streaming(x, sr, role, state, key, eq_overrides)
+    name = key.rsplit(":", 1)[0]  # keys are "<file>:<channel>"
+    entry = stem_instrument(name)
+    x = apply_role_eq_streaming(x, sr, role, state, key, eq_overrides, name)
     if role == "vocal":
         if preserve_vocal_speech:
             return x.astype(np.float32)
         x = downward_expander_streaming(x, sr, state, key)
-        return x.astype(np.float32)
+        if not (entry and entry.get("compressor")):
+            return x.astype(np.float32)
+        # Spoken voices and backing vocals: the dictionary adds a compressor after the expander.
 
-    profile = ROLE_COMPRESSOR_PROFILES.get(
+    profile = (entry or {}).get("compressor") or ROLE_COMPRESSOR_PROFILES.get(
         role,
         {"ratio": 2.0, "threshold_db": -22.0, "release_ms": 150.0},
     )
@@ -6321,13 +6329,15 @@ def per_song_auto_mix_gain_db(
     role: str,
     stem_active_level_db: float,
     accompaniment_reference_db: float | None,
+    name: str | None = None,
 ) -> float:
     """Calculate a bounded balance correction for one stem in one song."""
     reference = float(accompaniment_reference_db) if accompaniment_reference_db is not None else TARGET_TRACK_RMS_DBFS
     target = reference + (2.0 if role == "vocal" else 0.5 if role == "bass" else 0.0)
     requested = target - float(stem_active_level_db) + AUTO_MIX_ROLE_TRIMS_DB.get(role, 0.0)
     upper = float(AUTO_MIX_ROLE_BOOST_LIMITS_DB.get(role, AUTO_MIX_MAX_BOOST_DB))
-    return float(np.clip(requested, AUTO_MIX_MAX_ATTENUATION_DB, upper))
+    offset = float(np.clip(float((stem_instrument(name) or {}).get("level_offset_db", 0.0)), -12.0, 3.0))
+    return float(np.clip(requested, AUTO_MIX_MAX_ATTENUATION_DB, upper)) + offset
 
 
 def per_song_rhythm_harmonic_gains(
@@ -6863,10 +6873,41 @@ def stereo_side(name: str) -> str:
     return next((side for key, side in (STEREO_SIDES or {}).items() if Path(str(key)).stem.lower() == wanted), "")
 
 
+# What each track is, beyond its role (instrument_dictionary.py): set by the caller,
+# {file or stem name: instrument key}. Refines EQ, compressor, pan, level and sends.
+STEM_INSTRUMENTS: dict[str, str] = {}
+
+
+def stem_instrument(name: object) -> dict | None:
+    if not name or not STEM_INSTRUMENTS:
+        return None
+    from instrument_dictionary import profile
+    wanted = Path(str(name)).stem.lower()
+    key = next((value for stem, value in STEM_INSTRUMENTS.items() if Path(str(stem)).stem.lower() == wanted), None)
+    return profile(key)
+
+
+def instrument_pan(name: str) -> float | None:
+    """The dictionary's pan for this track; 'alternate' spreads same-instrument tracks left/right."""
+    entry = stem_instrument(name)
+    if not entry or entry.get("pan") is None:
+        return None
+    if entry["pan"] != "alternate":
+        return float(entry["pan"])
+    wanted = Path(str(name)).stem.lower()
+    same = sorted(Path(str(stem)).stem.lower() for stem, value in STEM_INSTRUMENTS.items()
+                  if (stem_instrument(stem) or {}) is entry)
+    index = same.index(wanted) if wanted in same else 0
+    amount = float(entry.get("pan_amount", 0.35))
+    return -amount if index % 2 == 0 else amount
+
+
 def pan_for_role(role: str, name: str) -> float:
     side = stereo_side(name)
     if side in {"L", "R"}:
         return -STEREO_PAN if side == "L" else STEREO_PAN
+    if role not in {"guitar", "keys", "keys_l", "keys_r", "synth"} and (dictionary_pan := instrument_pan(name)) is not None:
+        return dictionary_pan
     # These are invariants of the automatic mix.  Callers must not replace
     # them with a saved per-song pan override: a stereo image that changes
     # sides from song to song is harder to audit and can collapse the guitar
@@ -6998,7 +7039,11 @@ def override_bool(value: object, default: bool = False) -> bool:
     return default
 
 
-def reverb_send_level_db(role: str) -> float | None:
+def reverb_send_level_db(role: str, name: str | None = None) -> float | None:
+    entry = stem_instrument(name)
+    if entry and "reverb_offset_db" in entry:
+        base = reverb_send_level_db(role)
+        return None if entry["reverb_offset_db"] is None or base is None else base + float(entry["reverb_offset_db"])
     return {
         "vocal": -8.0,
         "sax": -12.0,
@@ -7018,7 +7063,11 @@ def reverb_send_level_db(role: str) -> float | None:
     }.get(role)
 
 
-def delay_send_level_db(role: str, lead_bonus: float) -> float | None:
+def delay_send_level_db(role: str, lead_bonus: float, name: str | None = None) -> float | None:
+    entry = stem_instrument(name)
+    if entry and "delay_offset_db" in entry:
+        base = delay_send_level_db(role, lead_bonus)
+        return None if entry["delay_offset_db"] is None or base is None else base + float(entry["delay_offset_db"])
     if role == "vocal":
         return -13.0
     if role in {"sax", "horn", "flute", "guitar"}:
@@ -7148,10 +7197,10 @@ def effective_mix_snapshot(
             "space_enabled": space_enabled,
             "echo_enabled": echo_enabled,
             "pan": override_float(row.get("pan"), 0.0),
-            "eq_low_cut_hz": override_float(row.get("eq_low_cut_hz"), role_eq_defaults(role)["eq_low_cut_hz"]),
-            "eq_mid_gain_db": override_float(row.get("eq_mid_gain_db"), role_eq_defaults(role)["eq_mid_gain_db"]),
-            "eq_air_gain_db": override_float(row.get("eq_air_gain_db"), role_eq_defaults(role)["eq_air_gain_db"]),
-            "eq_high_cut_hz": override_float(row.get("eq_high_cut_hz"), role_eq_defaults(role)["eq_high_cut_hz"]),
+            "eq_low_cut_hz": override_float(row.get("eq_low_cut_hz"), role_eq_defaults(role, name)["eq_low_cut_hz"]),
+            "eq_mid_gain_db": override_float(row.get("eq_mid_gain_db"), role_eq_defaults(role, name)["eq_mid_gain_db"]),
+            "eq_air_gain_db": override_float(row.get("eq_air_gain_db"), role_eq_defaults(role, name)["eq_air_gain_db"]),
+            "eq_high_cut_hz": override_float(row.get("eq_high_cut_hz"), role_eq_defaults(role, name)["eq_high_cut_hz"]),
             "lead_bonus_db": override_float(row.get("lead_bonus_db"), 0.0),
             "reverb_base_db": row.get("reverb_base_db"),
             "reverb_send_db": override_float(row.get("reverb_send_db"), 0.0),
@@ -8248,12 +8297,12 @@ def render_segment(
         if not stem_activity:
             inactive_reasons.append(activity_reason)
         if inactive_reasons:
-            eq_defaults = role_eq_defaults(mix_role)
+            eq_defaults = role_eq_defaults(mix_role, stem.path.name)
             requested_makeup_db = TARGET_TRACK_RMS_DBFS - raw_rms_db
             makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "hh", "overhead", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
             role_norm_db = role_norms_db.get(mix_role)
             gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
-            computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
+            computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db, stem.path.name)
             computed_makeup_gain_db = float(np.clip(
                 computed_makeup_gain_before_lift_db + bounded_harmonic_cut(mix_role, rhythm_adjustment_db, harmonic_adjustment_db, priority_adjustment_db, role_balance_adjustment_db) + vocal_group_adjustment_db + vocal_pair_adjustment_db,
                 AUTO_MIX_MAX_ATTENUATION_DB,
@@ -8346,7 +8395,7 @@ def render_segment(
         makeup_cap_db = MAX_DRUM_MAKEUP_GAIN_DB if mix_role in {"kick", "snare", "hh", "overhead", "drums"} else MAX_TRACK_MAKEUP_GAIN_DB
         role_norm_db = role_norms_db.get(mix_role)
         gain_level_db = active_levels_db.get(stem.path.name, raw_rms_db)
-        computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db)
+        computed_makeup_gain_before_lift_db = per_song_auto_mix_gain_db(mix_role, gain_level_db, accompaniment_reference_db, stem.path.name)
         computed_makeup_gain_db = float(np.clip(
             computed_makeup_gain_before_lift_db + bounded_harmonic_cut(mix_role, rhythm_adjustment_db, harmonic_adjustment_db, priority_adjustment_db, role_balance_adjustment_db) + vocal_group_adjustment_db + vocal_pair_adjustment_db,
             AUTO_MIX_MAX_ATTENUATION_DB,
@@ -8387,7 +8436,7 @@ def render_segment(
         reason = activity_reason
         if requested_makeup_db > makeup_cap_db:
             reason += f"; gain capped at +{makeup_cap_db:.0f} dB"
-        eq_defaults = role_eq_defaults(mix_role)
+        eq_defaults = role_eq_defaults(mix_role, stem.path.name)
         eq_settings = {
             "eq_low_cut_hz": override_float(overrides.get("eq_low_cut_hz"), eq_defaults["eq_low_cut_hz"]),
             "eq_mid_gain_db": override_float(overrides.get("eq_mid_gain_db"), eq_defaults["eq_mid_gain_db"]),
@@ -8666,10 +8715,10 @@ def render_segment(
                         lead_bonus = float(settings.get("lead_bonus_db", 0.0))
                         pan = float(settings.get("pan", pan_for_role(processing_role, stem.name)))
                         eq_overrides = {
-                            "eq_low_cut_hz": float(settings.get("eq_low_cut_hz", role_eq_defaults(processing_role)["eq_low_cut_hz"])),
-                            "eq_mid_gain_db": float(settings.get("eq_mid_gain_db", role_eq_defaults(processing_role)["eq_mid_gain_db"])),
-                            "eq_air_gain_db": float(settings.get("eq_air_gain_db", role_eq_defaults(processing_role)["eq_air_gain_db"])),
-                            "eq_high_cut_hz": float(settings.get("eq_high_cut_hz", role_eq_defaults(processing_role)["eq_high_cut_hz"])),
+                            "eq_low_cut_hz": float(settings.get("eq_low_cut_hz", role_eq_defaults(processing_role, stem.path.name)["eq_low_cut_hz"])),
+                            "eq_mid_gain_db": float(settings.get("eq_mid_gain_db", role_eq_defaults(processing_role, stem.path.name)["eq_mid_gain_db"])),
+                            "eq_air_gain_db": float(settings.get("eq_air_gain_db", role_eq_defaults(processing_role, stem.path.name)["eq_air_gain_db"])),
+                            "eq_high_cut_hz": float(settings.get("eq_high_cut_hz", role_eq_defaults(processing_role, stem.path.name)["eq_high_cut_hz"])),
                         }
                         intro_at = segment.speech_intro_start
                         preserve_vocal_speech = (
@@ -8748,12 +8797,12 @@ def render_segment(
                         chunk_timing["sum_bus_write"] += stem_timing["stem_gain"]
                         t0 = time.perf_counter()
                         meter_stage("post_stem_gain", stereo)
-                        send_db = reverb_send_level_db(processing_role) if fx_enabled and bool(settings.get("space_enabled", False)) else None
+                        send_db = reverb_send_level_db(processing_role, stem.path.name) if fx_enabled and bool(settings.get("space_enabled", False)) else None
                         if send_db is not None:
                             send_db += float(settings.get("reverb_scene_offset_db", 0.0))
                             send_db += float(settings.get("reverb_send_db", 0.0))
                             reverb_send[: len(stereo)] += stereo * db_to_amp(send_db)
-                        delay_db = delay_send_level_db(processing_role, lead_bonus) if fx_enabled and bool(settings.get("echo_enabled", False)) else None
+                        delay_db = delay_send_level_db(processing_role, lead_bonus, stem.path.name) if fx_enabled and bool(settings.get("echo_enabled", False)) else None
                         if delay_db is not None:
                             delay_db += float(settings.get("delay_scene_offset_db", 0.0))
                             delay_db += float(settings.get("delay_send_db", 0.0))

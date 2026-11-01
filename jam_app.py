@@ -773,11 +773,11 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
         vocal_group_adjustment_db = float(mix_controls.get("vocal_group_gain", {}).get(stem.path.name, 0.0))
         role_balance_adjustment_db = float(role_corrections.get(stem.path.name, 0.0))
         vocal_pair_adjustment_db = float(vocal_pair_corrections.get(stem.path.name, 0.0))
-        eq_defaults = pipeline.role_eq_defaults(mix_role)
+        eq_defaults = pipeline.role_eq_defaults(mix_role, stem.path.name)
         raw_rms_db = rms_values_db.get(stem.path.name, -120.0)
         role_norm_db = role_norms_db.get(mix_role)
         active_level = active_levels_db.get(stem.path.name, raw_rms_db)
-        computed_gain_before_lift_db = pipeline.per_song_auto_mix_gain_db(mix_role, active_level, accompaniment_reference_db)
+        computed_gain_before_lift_db = pipeline.per_song_auto_mix_gain_db(mix_role, active_level, accompaniment_reference_db, stem.path.name)
         computed_gain_db = computed_gain_before_lift_db + pipeline.bounded_harmonic_cut(mix_role, rhythm_adjustment_db, priority_adjustment_db, role_balance_adjustment_db) + vocal_group_adjustment_db + vocal_pair_adjustment_db
         computed_gain_db = float(np.clip(
             computed_gain_db,
@@ -856,8 +856,8 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
         fader_db = user_fader_db
         mute = bool(stem_ov.get("mute", False)) or fader_db <= pipeline.FADER_HARD_SILENCE_DB
         solo = bool(stem_ov.get("solo", False))
-        base_reverb = pipeline.reverb_send_level_db(mix_role)
-        base_delay = pipeline.delay_send_level_db(mix_role, lead_bonus)
+        base_reverb = pipeline.reverb_send_level_db(mix_role, stem.path.name)
+        base_delay = pipeline.delay_send_level_db(mix_role, lead_bonus, stem.path.name)
         effect_offsets = effect_role_offsets.get(mix_role, {}) if isinstance(effect_role_offsets, dict) else {}
         reverb_scene_offset_db = float(effect_offsets.get("reverb_db", 0.0) or 0.0)
         delay_scene_offset_db = float(effect_offsets.get("delay_db", 0.0) or 0.0)
