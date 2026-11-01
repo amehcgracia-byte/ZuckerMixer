@@ -69,3 +69,15 @@ class HighCutAtLowSampleRates(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(y)))
         sos = pipeline.make_sos(8000, "lowpass", 6000.0)
         self.assertTrue(np.allclose(sos, [[1, 0, 0, 1, 0, 0]]))
+
+
+class NoiseExempt(unittest.TestCase):
+    def test_tracks_marked_as_music_are_never_muted_as_noise(self):
+        analysis = {"noise_diagnostics": {"Bass.wav": {"case": "B"}}, "rms_values_db": {"Bass.wav": -60.0, "Keys.wav": -20.0},
+                    "dynamic_spread_db": {}, "segment_peaks_db": {}}
+        self.assertEqual(pipeline.empty_noise_stem_names(analysis), {"Bass.wav"})
+        pipeline.NOISE_EXEMPT_STEMS = {"Bass.wav"}
+        try:
+            self.assertEqual(pipeline.empty_noise_stem_names(analysis), set())
+        finally:
+            pipeline.NOISE_EXEMPT_STEMS = set()

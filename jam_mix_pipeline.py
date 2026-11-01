@@ -5579,6 +5579,11 @@ def segment_stem_activity_decision(
     return False, "; ".join(reasons)
 
 
+# Tracks the person explicitly said are music (a host app sets this before analyse/render):
+# never muted as empty or noisy, whatever their level looks like.
+NOISE_EXEMPT_STEMS: set[str] = set()
+
+
 def empty_noise_stem_names(analysis: dict[str, object]) -> set[str]:
     """One safety decision shared by preview and export, before any gain."""
     excluded = set()
@@ -5599,7 +5604,7 @@ def empty_noise_stem_names(analysis: dict[str, object]) -> set[str]:
                 and float(info.get("level_spread_db", 0)) <= EMPTY_STEM_SPREAD_DB)
             or (float(value) <= -85 and float(peaks.get(name, 0)) <= -75)):
             excluded.add(name)
-    return excluded
+    return excluded - set(NOISE_EXEMPT_STEMS)
 
 
 def classify_noise_stems(stems: list[Stem], segment: Segment, sr: int) -> dict[str, dict[str, object]]:
