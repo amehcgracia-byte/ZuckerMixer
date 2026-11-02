@@ -7369,7 +7369,7 @@ def measure_stream_rms_lufs(path: Path, progress_callback=None) -> tuple[float, 
 def master_limiter_envelope(input_path: Path, sr: int, gain_db: float) -> tuple[int, np.ndarray]:
     """Linked stereo gain, with lookahead attack and release in the level envelope.
 
-    One peak per ~1 ms keeps memory small even for long songs. A forward release
+    One 4x-oversampled peak per ~1 ms keeps memory small even for long songs. A forward release
     and backward attack anticipate transients without bending individual waveform
     cycles. Both boundary gains of a frame are at least its required attenuation,
     so interpolation is continuous and cannot overshoot that frame's sample peak.
@@ -7377,19 +7377,39 @@ def master_limiter_envelope(input_path: Path, sr: int, gain_db: float) -> tuple[
     """
     hop = max(1, round(sr * .001))
     peaks = []
-    with sf.SoundFile(str(input_path), "r") as reader:
-        for block in reader.blocks(blocksize=hop * 10000, dtype="float32", always_2d=True):
-            missing = (-len(block)) % hop
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to measure master true peaks")
+    channels = sf.info(str(input_path)).channels
+    level = db_to_amp(gain_db)
+    # Use FFmpeg's continuous reconstruction (also used by the final true-peak
+    # check), not independently padded/resampled chunks. Its filter state crosses
+    # disk blocks and catches intersample peaks that sample-only limiting misses.
+    filters = f"volume={level:.12g}:precision=float"
+    if MASTERING_INTENSITY == "loud":
+        filters += ",aeval=exprs=" + "|".join(f"tanh(val({ch})*1.08)/tanh(1.08)" for ch in range(channels))
+    filters += f",aresample={sr * 4}"
+    command = [ffmpeg, "-v", "error", "-nostdin", "-i", str(input_path), "-vn", "-af", filters,
+               "-c:a", "pcm_f32le", "-f", "f32le", "-"]
+    frame = hop * 4
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        while True:
+            raw = process.stdout.read(frame * channels * 4 * 10000)
+            if not raw:
+                break
+            block = np.frombuffer(raw, dtype=np.float32).reshape(-1, channels)
+            missing = (-len(block)) % frame
             if missing:
                 block = np.pad(block, ((0, missing), (0, 0)))
-            peaks.append(np.max(np.abs(block).reshape(-1, hop, block.shape[1]), axis=(1, 2)))
+            peaks.append(np.max(np.abs(block).reshape(-1, frame, channels), axis=(1, 2)))
+        error = process.stderr.read().decode("utf-8", errors="replace")
+        if process.wait() != 0:
+            raise RuntimeError(f"Master peak analysis failed: {error[-400:]}")
     if not peaks:
         return hop, np.zeros(2, dtype=np.float64)
-    peak = np.concatenate(peaks).astype(np.float64) * db_to_amp(gain_db)
-    if MASTERING_INTENSITY == "loud":
-        peak = np.tanh(peak * 1.08) / np.tanh(1.08)
+    peak = np.concatenate(peaks).astype(np.float64)
     # Numerical margin only; this is not a second loudness target.
-    ceiling = db_to_amp(TRUE_PEAK_CEILING_DBFS - .02)
+    ceiling = db_to_amp(TRUE_PEAK_CEILING_DBFS - .1)
     required = np.maximum(0.0, 20 * np.log10(np.maximum(peak, 1e-12) / ceiling))
     index = np.arange(len(required), dtype=np.float64)
     release_step = 60.0 * hop / sr       # 12 dB returns over 200 ms

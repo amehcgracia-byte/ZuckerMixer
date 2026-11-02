@@ -52,3 +52,14 @@ def test_quiet_pass_stays_linear_and_reports_completion(tmp_path, monkeypatch):
     y,_=sf.read(target)
     np.testing.assert_allclose(y,x*p.db_to_amp(3),atol=2e-7)
     assert progress[-1]['ratio'] == 1
+
+
+def test_limiter_accounts_for_peaks_between_samples(tmp_path, monkeypatch):
+    # At fs/4 with a pi/4 phase, the true peak is ~3 dB above every sample peak.
+    sr=48000; t=np.arange(sr*3)/sr
+    mono=.35*np.sin(2*np.pi*12000*t + np.pi/4)
+    source=tmp_path/'in.wav'; target=tmp_path/'out.wav'
+    sf.write(source,np.column_stack([mono,mono]),sr,subtype='FLOAT')
+    monkeypatch.setattr(p,'MASTERING_INTENSITY','natural')
+    p.apply_master_pass(source,target,sr,18)
+    assert p.measure_true_peak_db(target) <= p.TRUE_PEAK_CEILING_DBFS + .1
