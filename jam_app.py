@@ -82,7 +82,7 @@ LIFECYCLE_LOG_PATH = STATE_ROOT / "redetect_worker_lifecycle.jsonl"
 RENDER_DIAGNOSTICS_ROOT = STATE_ROOT / "render_diagnostics"
 RENDER_DIAGNOSTICS_ROOT.mkdir(parents=True, exist_ok=True)
 ORPHANED_ACTIVE_JOB_SECONDS = 90.0
-ACTIVE_STEM_DETECTION_VERSION = 5
+ACTIVE_STEM_DETECTION_VERSION = 6  # v6: quiet compressed tracks (bass DI) are not "empty"
 BUILD_METADATA_PATH = RESOURCE_ROOT / "build" / "build_metadata.json"
 HOST = "127.0.0.1"
 DEFAULT_TARGET_LUFS = pipeline.TARGET_LUFS
@@ -773,12 +773,12 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
         vocal_group_adjustment_db = float(mix_controls.get("vocal_group_gain", {}).get(stem.path.name, 0.0))
         role_balance_adjustment_db = float(role_corrections.get(stem.path.name, 0.0))
         vocal_pair_adjustment_db = float(vocal_pair_corrections.get(stem.path.name, 0.0))
-        eq_defaults = pipeline.role_eq_defaults(mix_role)
+        eq_defaults = pipeline.role_eq_defaults(mix_role, stem.path.name)
         raw_rms_db = rms_values_db.get(stem.path.name, -120.0)
         role_norm_db = role_norms_db.get(mix_role)
         active_level = active_levels_db.get(stem.path.name, raw_rms_db)
-        computed_gain_before_lift_db = pipeline.per_song_auto_mix_gain_db(mix_role, active_level, accompaniment_reference_db)
-        computed_gain_db = computed_gain_before_lift_db + rhythm_adjustment_db + priority_adjustment_db + vocal_group_adjustment_db + role_balance_adjustment_db + vocal_pair_adjustment_db
+        computed_gain_before_lift_db = pipeline.per_song_auto_mix_gain_db(mix_role, active_level, accompaniment_reference_db, stem.path.name)
+        computed_gain_db = computed_gain_before_lift_db + pipeline.bounded_harmonic_cut(mix_role, rhythm_adjustment_db, priority_adjustment_db, role_balance_adjustment_db) + vocal_group_adjustment_db + vocal_pair_adjustment_db
         computed_gain_db = float(np.clip(
             computed_gain_db,
             pipeline.AUTO_MIX_MAX_ATTENUATION_DB,
@@ -856,8 +856,8 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
         fader_db = user_fader_db
         mute = bool(stem_ov.get("mute", False)) or fader_db <= pipeline.FADER_HARD_SILENCE_DB
         solo = bool(stem_ov.get("solo", False))
-        base_reverb = pipeline.reverb_send_level_db(mix_role)
-        base_delay = pipeline.delay_send_level_db(mix_role, lead_bonus)
+        base_reverb = pipeline.reverb_send_level_db(mix_role, stem.path.name)
+        base_delay = pipeline.delay_send_level_db(mix_role, lead_bonus, stem.path.name)
         effect_offsets = effect_role_offsets.get(mix_role, {}) if isinstance(effect_role_offsets, dict) else {}
         reverb_scene_offset_db = float(effect_offsets.get("reverb_db", 0.0) or 0.0)
         delay_scene_offset_db = float(effect_offsets.get("delay_db", 0.0) or 0.0)
@@ -915,6 +915,7 @@ def canonical_mix_params_for_song(segment_id: int, *, state_snapshot: dict | Non
             "eq_low_cut_hz": float(stem_ov.get("eq_low_cut_hz", eq_defaults["eq_low_cut_hz"])),
             "eq_mid_gain_db": float(stem_ov.get("eq_mid_gain_db", eq_defaults["eq_mid_gain_db"])),
             "eq_air_gain_db": float(stem_ov.get("eq_air_gain_db", eq_defaults["eq_air_gain_db"])),
+            "eq_high_cut_hz": float(stem_ov.get("eq_high_cut_hz", eq_defaults["eq_high_cut_hz"])),
             "reverb_base_db": base_reverb,
             "reverb_send_db": float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
             "reverb_total_db": None if base_reverb is None else base_reverb + reverb_scene_offset_db + float(stem_ov.get("reverb_send_db", 0.0) or 0.0),
@@ -3069,7 +3070,7 @@ def apply_overrides_for_song(
     stems = source_song.setdefault("stems", {}) if isinstance(source_song, dict) else {}
     for stem_name, prepared_stem in prepared_mix.get("stems", {}).items():
         settings = stems.setdefault(stem_name, {})
-        for key in ("pan", "eq_low_cut_hz", "eq_mid_gain_db", "eq_air_gain_db", "space_enabled", "echo_enabled", "gate_enabled", "fx_enabled", "reverb_send_db", "delay_send_db"):
+        for key in ("pan", "eq_low_cut_hz", "eq_mid_gain_db", "eq_air_gain_db", "eq_high_cut_hz", "space_enabled", "echo_enabled", "gate_enabled", "fx_enabled", "reverb_send_db", "delay_send_db"):
             settings.setdefault(key, prepared_stem.get(key))
         if not bool(settings.get("effects_user_confirmed", False)):
             for effect in ("space_enabled", "echo_enabled"):
@@ -3180,6 +3181,7 @@ def normalize_overrides(payload: Any) -> dict[str, Any]:
                     "eq_low_cut_hz",
                     "eq_mid_gain_db",
                     "eq_air_gain_db",
+                    "eq_high_cut_hz",
                 ):
                     if key in stem_payload:
                         try:
