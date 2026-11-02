@@ -7366,8 +7366,46 @@ def measure_stream_rms_lufs(path: Path, progress_callback=None) -> tuple[float, 
     return loudness, amp_to_db(peak)
 
 
+def master_limiter_envelope(input_path: Path, sr: int, gain_db: float) -> tuple[int, np.ndarray]:
+    """Linked stereo gain, with lookahead attack and release in the level envelope.
+
+    One peak per ~1 ms keeps memory small even for long songs. A forward release
+    and backward attack anticipate transients without bending individual waveform
+    cycles. Both boundary gains of a frame are at least its required attenuation,
+    so interpolation is continuous and cannot overshoot that frame's sample peak.
+    The existing post-encode true-peak measurement still handles intersample peaks.
+    """
+    hop = max(1, round(sr * .001))
+    peaks = []
+    with sf.SoundFile(str(input_path), "r") as reader:
+        for block in reader.blocks(blocksize=hop * 10000, dtype="float32", always_2d=True):
+            missing = (-len(block)) % hop
+            if missing:
+                block = np.pad(block, ((0, missing), (0, 0)))
+            peaks.append(np.max(np.abs(block).reshape(-1, hop, block.shape[1]), axis=(1, 2)))
+    if not peaks:
+        return hop, np.zeros(2, dtype=np.float64)
+    peak = np.concatenate(peaks).astype(np.float64) * db_to_amp(gain_db)
+    if MASTERING_INTENSITY == "loud":
+        peak = np.tanh(peak * 1.08) / np.tanh(1.08)
+    # Numerical margin only; this is not a second loudness target.
+    ceiling = db_to_amp(TRUE_PEAK_CEILING_DBFS - .02)
+    required = np.maximum(0.0, 20 * np.log10(np.maximum(peak, 1e-12) / ceiling))
+    index = np.arange(len(required), dtype=np.float64)
+    release_step = 60.0 * hop / sr       # 12 dB returns over 200 ms
+    attack_step = 1000.0 * hop / sr      # anticipate 12 dB over 12 ms
+    released = np.maximum.accumulate(required + index * release_step) - index * release_step
+    ahead = released - index * attack_step
+    envelope = np.maximum.accumulate(ahead[::-1])[::-1] + index * attack_step
+    envelope = np.maximum(envelope, 0.0)
+    boundaries = np.r_[envelope[0], np.maximum(envelope[:-1], envelope[1:]), envelope[-1]]
+    return hop, boundaries
+
+
 def apply_master_pass(input_path: Path, output_path: Path, sr: int, gain_db: float, progress_callback=None, attempt: int = 1) -> tuple[float, float]:
-    ceiling = db_to_amp(TRUE_PEAK_CEILING_DBFS)
+    hop, attenuation = master_limiter_envelope(input_path, sr, gain_db)
+    positions = np.arange(len(attenuation), dtype=np.float64)
+    print(f"  master limiter: linked gain envelope, max reduction {float(np.max(attenuation)):.2f} dB", flush=True)
     final_peak = 0.0
     total_sq = 0.0
     total_count = 0
@@ -7381,21 +7419,10 @@ def apply_master_pass(input_path: Path, output_path: Path, sr: int, gain_db: flo
             y = block * db_to_amp(gain_db)
             if MASTERING_INTENSITY == "loud":
                 y = np.tanh(y * 1.08).astype(np.float32) / np.tanh(np.float32(1.08))
-            peak = float(np.max(np.abs(y)))
-            if peak > ceiling:
-                # Peak clipping alone leaves sparse/dynamic songs far below
-                # the requested LUFS target. Compress only this over-ceiling
-                # path so ordinary mixes remain transparent and the target
-                # remains reachable consistently across songs.
-                threshold = ceiling * db_to_amp(-6.0)
-                magnitude = np.abs(y)
-                over = np.maximum(magnitude / max(threshold, 1e-9), 1.0)
-                compressed = threshold * np.power(over, 0.25)
-                y = np.where(magnitude > threshold, np.sign(y) * compressed, y)
-                peak = float(np.max(np.abs(y)))
-                if peak > ceiling:
-                    y *= ceiling / peak
-            y = np.clip(y, -ceiling, ceiling).astype(np.float32)
+            sample_positions = (frames_read + np.arange(len(block), dtype=np.float64)) / hop
+            reduction = np.interp(sample_positions, positions, attenuation)
+            gain = np.power(10.0, -reduction / 20.0).astype(np.float32)
+            y = (y * gain[:, None]).astype(np.float32)
             writer.write(y)
             final_peak = max(final_peak, float(np.max(np.abs(y))))
             total_sq += float(np.sum(y * y))
