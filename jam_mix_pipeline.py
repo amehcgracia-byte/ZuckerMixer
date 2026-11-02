@@ -7366,8 +7366,66 @@ def measure_stream_rms_lufs(path: Path, progress_callback=None) -> tuple[float, 
     return loudness, amp_to_db(peak)
 
 
+def master_limiter_envelope(input_path: Path, sr: int, gain_db: float) -> tuple[int, np.ndarray]:
+    """Linked stereo gain, with lookahead attack and release in the level envelope.
+
+    One 4x-oversampled peak per ~1 ms keeps memory small even for long songs. A forward release
+    and backward attack anticipate transients without bending individual waveform
+    cycles. Both boundary gains of a frame are at least its required attenuation,
+    so interpolation is continuous and cannot overshoot that frame's sample peak.
+    The existing post-encode true-peak measurement still handles intersample peaks.
+    """
+    hop = max(1, round(sr * .001))
+    peaks = []
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to measure master true peaks")
+    channels = sf.info(str(input_path)).channels
+    level = db_to_amp(gain_db)
+    # Use FFmpeg's continuous reconstruction (also used by the final true-peak
+    # check), not independently padded/resampled chunks. Its filter state crosses
+    # disk blocks and catches intersample peaks that sample-only limiting misses.
+    filters = f"volume={level:.12g}:precision=float"
+    if MASTERING_INTENSITY == "loud":
+        filters += ",aeval=exprs=" + "|".join(f"tanh(val({ch})*1.08)/tanh(1.08)" for ch in range(channels))
+    filters += f",aresample={sr * 4}"
+    command = [ffmpeg, "-v", "error", "-nostdin", "-i", str(input_path), "-vn", "-af", filters,
+               "-c:a", "pcm_f32le", "-f", "f32le", "-"]
+    frame = hop * 4
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        while True:
+            raw = process.stdout.read(frame * channels * 4 * 10000)
+            if not raw:
+                break
+            block = np.frombuffer(raw, dtype=np.float32).reshape(-1, channels)
+            missing = (-len(block)) % frame
+            if missing:
+                block = np.pad(block, ((0, missing), (0, 0)))
+            peaks.append(np.max(np.abs(block).reshape(-1, frame, channels), axis=(1, 2)))
+        error = process.stderr.read().decode("utf-8", errors="replace")
+        if process.wait() != 0:
+            raise RuntimeError(f"Master peak analysis failed: {error[-400:]}")
+    if not peaks:
+        return hop, np.zeros(2, dtype=np.float64)
+    peak = np.concatenate(peaks).astype(np.float64)
+    # Numerical margin only; this is not a second loudness target.
+    ceiling = db_to_amp(TRUE_PEAK_CEILING_DBFS - .1)
+    required = np.maximum(0.0, 20 * np.log10(np.maximum(peak, 1e-12) / ceiling))
+    index = np.arange(len(required), dtype=np.float64)
+    release_step = 60.0 * hop / sr       # 12 dB returns over 200 ms
+    attack_step = 1000.0 * hop / sr      # anticipate 12 dB over 12 ms
+    released = np.maximum.accumulate(required + index * release_step) - index * release_step
+    ahead = released - index * attack_step
+    envelope = np.maximum.accumulate(ahead[::-1])[::-1] + index * attack_step
+    envelope = np.maximum(envelope, 0.0)
+    boundaries = np.r_[envelope[0], np.maximum(envelope[:-1], envelope[1:]), envelope[-1]]
+    return hop, boundaries
+
+
 def apply_master_pass(input_path: Path, output_path: Path, sr: int, gain_db: float, progress_callback=None, attempt: int = 1) -> tuple[float, float]:
-    ceiling = db_to_amp(TRUE_PEAK_CEILING_DBFS)
+    hop, attenuation = master_limiter_envelope(input_path, sr, gain_db)
+    positions = np.arange(len(attenuation), dtype=np.float64)
+    print(f"  master limiter: linked gain envelope, max reduction {float(np.max(attenuation)):.2f} dB", flush=True)
     final_peak = 0.0
     total_sq = 0.0
     total_count = 0
@@ -7381,21 +7439,10 @@ def apply_master_pass(input_path: Path, output_path: Path, sr: int, gain_db: flo
             y = block * db_to_amp(gain_db)
             if MASTERING_INTENSITY == "loud":
                 y = np.tanh(y * 1.08).astype(np.float32) / np.tanh(np.float32(1.08))
-            peak = float(np.max(np.abs(y)))
-            if peak > ceiling:
-                # Peak clipping alone leaves sparse/dynamic songs far below
-                # the requested LUFS target. Compress only this over-ceiling
-                # path so ordinary mixes remain transparent and the target
-                # remains reachable consistently across songs.
-                threshold = ceiling * db_to_amp(-6.0)
-                magnitude = np.abs(y)
-                over = np.maximum(magnitude / max(threshold, 1e-9), 1.0)
-                compressed = threshold * np.power(over, 0.25)
-                y = np.where(magnitude > threshold, np.sign(y) * compressed, y)
-                peak = float(np.max(np.abs(y)))
-                if peak > ceiling:
-                    y *= ceiling / peak
-            y = np.clip(y, -ceiling, ceiling).astype(np.float32)
+            sample_positions = (frames_read + np.arange(len(block), dtype=np.float64)) / hop
+            reduction = np.interp(sample_positions, positions, attenuation)
+            gain = np.power(10.0, -reduction / 20.0).astype(np.float32)
+            y = (y * gain[:, None]).astype(np.float32)
             writer.write(y)
             final_peak = max(final_peak, float(np.max(np.abs(y))))
             total_sq += float(np.sum(y * y))
