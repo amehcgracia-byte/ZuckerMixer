@@ -56,6 +56,17 @@ class KeysNotBuried(unittest.TestCase):
         rhythm, _ = pipeline.trusted_rhythm_harmonic_controls(rhythm, {}, roles)
         self.assertEqual(rhythm["a"]["attenuation_db"], -3.0)
 
+    def test_piano_and_synth_do_not_lose_gain_for_offbeat_phrasing(self):
+        roles = {"piano": "keys", "synth": "synth", "kick": "kick", "bass": "bass", "snare": "snare", "room": "room"}
+        rhythm = {name: {"flagged": name in {"piano", "synth", "kick"},
+                         "attenuation_db": -3.0 if name in {"piano", "synth", "kick"} else 0.0}
+                  for name in roles}
+        revised, _ = pipeline.trusted_rhythm_harmonic_controls(rhythm, {}, roles)
+        self.assertEqual(revised["piano"]["attenuation_db"], 0.0)
+        self.assertEqual(revised["synth"]["attenuation_db"], 0.0)
+        self.assertEqual(revised["kick"]["attenuation_db"], -3.0)
+        self.assertEqual(pipeline.role_eq_defaults("keys", "Piano.wav")["eq_mid_gain_db"], 0.0)
+
     def test_keys_cuts_are_bounded(self):
         self.assertEqual(pipeline.bounded_harmonic_cut("keys_l", -3.0, -3.0, -4.0, -6.0), pipeline.MAX_HARMONIC_AUTOMATIC_CUT_DB)
         self.assertEqual(pipeline.bounded_harmonic_cut("sax", -3.0, -3.0), -6.0)
