@@ -6130,7 +6130,7 @@ def role_eq_bands(role: str, eq_overrides: dict[str, float] | None = None, name:
     elif role == "guitar":
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 250, 1.0, -2.0), ("fixed", "peaking", 2800, 1.0, 0.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role in {"keys", "keys_l", "keys_r"}:
-        bands = [("low", "highpass", 80, 0.707, 0.0), ("mid", "peaking", 320, 1.0, -2.0), ("air", "highshelf", 10000, 0.707, 0.0)]
+        bands = [("low", "highpass", 80, 0.707, 0.0), ("mid", "peaking", 320, 1.0, 0.0), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role in {"sax", "horn", "flute"}:
         bands = [("low", "highpass", 90, 0.707, 0.0), ("mid", "peaking", 2500, 0.9, 1.5), ("air", "highshelf", 10000, 0.707, 0.0)]
     elif role == "synth":
@@ -6407,6 +6407,13 @@ def trusted_rhythm_harmonic_controls(rhythm: dict, harmonic: dict, roles: dict[s
     if rhythm and len(flagged) / len(rhythm) >= UNRELIABLE_BEAT_GRID_SHARE:
         rhythm = {name: ({**info, "attenuation_db": 0.0, "flagged": False, "reason": "beat grid unreliable for this song"} if isinstance(info, dict) else info)
                   for name, info in rhythm.items()}
+    rhythm = {
+        name: ({**info, "attenuation_db": 0.0, "flagged": False,
+                "reason": "harmony instrument: no beat-grid cut"}
+               if isinstance(info, dict) and roles.get(name) in HARMONIC_ROLES and info.get("attenuation_db", 0.0) < 0
+               else info)
+        for name, info in rhythm.items()
+    }
     harmonic = {name: ({**info, "attenuation_db": 0.0, "reason": "harmony instrument: no out-of-key cut"}
                        if isinstance(info, dict) and roles.get(name) in HARMONIC_ROLES and info.get("attenuation_db") else info)
                 for name, info in harmonic.items()}
@@ -6600,25 +6607,18 @@ def per_song_role_balance_corrections(
 
     drum_anchor_names = [name for name, role in effective_roles.items() if role == "snare"]
     drum_anchor_level = group_active_level_db(drum_anchor_names, active_levels_db)
-    # Without a snare there is no reliable kit reference: overhead/hi-hat microphones are room
-    # mics, louder raw than they end up in the mix (they are trimmed later), so holding keys
-    # below them buried the keys (Montara jam 31-10). Skip the hierarchy then.
+    # Retain the guitar hierarchy, but keep piano balance independent of snare level.
     harmonic_hierarchy_corrections: dict[str, float] = {}
-    if drum_anchor_level is not None:
+    guitar_level = role_levels.get("guitar")
+    if drum_anchor_level is not None and guitar_level is not None:
         harmonic_target = float(drum_anchor_level) - HARMONIC_BELOW_DRUM_REFERENCE_DB
-        for role in ("guitar", "keys"):
-            names = role_groups[role]
-            level = role_levels.get(role)
-            if level is None or not names:
-                continue
-            excess = float(level - harmonic_target)
-            if excess <= 0.5:
-                continue
+        excess = float(guitar_level - harmonic_target)
+        if excess > 0.5:
             trim = -float(np.clip(excess, 0.0, 6.0))
-            for name in names:
+            for name in role_groups["guitar"]:
                 harmonic_hierarchy_corrections[name] = trim
                 role_corrections[name] = min(float(role_corrections.get(name, 0.0)), trim)
-                role_reasons[name] = f"{role} held below drum reference"
+                role_reasons[name] = "guitar held below drum reference"
 
     # Equalize competing harmonic instruments without flattening the
     # intentional hierarchy. A piano/guitar that is materially above the
